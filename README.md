@@ -1,5 +1,8 @@
 # claude-retrier
 
+[![test](https://github.com/a0s/claude-retrier/actions/workflows/test.yml/badge.svg)](https://github.com/a0s/claude-retrier/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 Auto-resume Claude Code after a usage limit. One shell script, no tmux, no daemon.
 
 ```sh
@@ -25,6 +28,9 @@ brew install a0s/claude-retrier/claude-retrier
 curl -fsSLO https://raw.githubusercontent.com/a0s/claude-retrier/main/claude-retrier.sh
 chmod +x claude-retrier.sh
 ```
+
+Uninstall is `brew uninstall claude-retrier`, or deleting the file. Nothing else
+was touched: no shell rc edits, no launch agents, no background process.
 
 ## Your claude, not `claude`
 
