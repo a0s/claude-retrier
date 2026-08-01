@@ -67,6 +67,21 @@ Everything after the command is claude's own — `claude-retrier --cmd claude-wo
 --resume` resumes, and a bare prompt stays a prompt. With no `--cmd` at all the
 wrapper finds `claude` the way your shell would.
 
+## Resuming a session
+
+Claude's own flags pass straight through, so whatever you would type after
+`claude` you type after `claude-retrier` instead:
+
+```sh
+claude-retrier --resume deb786e8-3006-4edf-b5e6-2ca73e25620e   # claude --resume <id>
+claude-retrier --continue                                      # the last session here
+claude-retrier --cmd claude-work --resume deb786e8-3006-4edf-b5e6-2ca73e25620e
+```
+
+A resumed session is watched exactly like a fresh one: the wrapper follows the
+transcript claude is already appending to, so a limit hit an hour into the
+resumed conversation is picked up the same way.
+
 ## How it works
 
 `claude-retrier.sh` runs your claude on a pty it owns, so it can both read the output
