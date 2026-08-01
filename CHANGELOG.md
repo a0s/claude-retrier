@@ -7,6 +7,36 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [1.3.0] - 2026-08-02
+
+Two field failures from the same evening, both of them the wrapper reading the
+terminal too literally.
+
+### Fixed
+- A session waited out its reset and then deferred the retry every 15 seconds
+  for three hours, logging `unsent text in the prompt box` while nobody had
+  touched the keyboard. Not everything arriving on our stdin was typed: claude
+  sends `\x1b[>q` at startup and the terminal's XTVERSION reply comes back the
+  same way, where 15 of its bytes were counted as a draft. Only CSI and SS3 end
+  at their first final byte — DCS, OSC, APC, PM and SOS run to a String
+  Terminator, and an X10 mouse report carries three raw coordinate bytes after
+  its `M`. All of them are now consumed whole, including when a read boundary
+  cuts one in half.
+- A draft nobody has touched for `CR_DRAFT_GRACE_SEC` (10 minutes) no longer
+  blocks a retry. Whatever desyncs that counter next, the wait has to end.
+- The retry landed, claude resumed — and the wrapper typed `continue` twice more
+  and painted `cr stopped`. It was watching the footer for `esc to interrupt`,
+  which Claude Code 2.1 no longer prints: the footer is now `✶ Nebulizing… `
+  growing into `✻ Cogitating… 20m 57s · ↓ 6.8k tokens`. Every live session
+  therefore looked idle.
+
+### Added
+- The transcript now confirms a retry as well as reporting a limit. claude
+  writes our message back as a `user` row the moment it accepts it, which is
+  direct proof the retry was submitted rather than left sitting in the input
+  box — the question the verify step was trying to answer by reading pixels.
+- `CR_DRAFT_GRACE_SEC`.
+
 ## [1.2.0] - 2026-08-01
 
 ### Added

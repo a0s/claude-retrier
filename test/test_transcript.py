@@ -31,6 +31,14 @@ def record(text, error="rate_limit", status=429, api_error=True):
 
 ORDINARY = {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}
 
+
+def user_row(text):
+    return {"type": "user", "timestamp": "2026-08-01T18:20:45.715Z",
+            "message": {"role": "user", "content": text}, "sessionId": "s1"}
+
+
+USER_ECHO = user_row("continue")
+
 # Verbatim shape of a real limited turn, minus the fields we don't read.
 REAL = record("You've hit your weekly limit · resets Jul 22 at 6am (Europe/Warsaw)")
 
@@ -158,6 +166,30 @@ class TestWatcher(unittest.TestCase):
         self.append("fresh.jsonl", REAL)
         self.assertEqual(w.poll_now(now=1), [])          # still inside the interval
         self.assertEqual(len(w.poll_now(now=1e9)), 1)
+
+    def test_our_retry_coming_back_is_reported_as_an_echo(self):
+        # The proof a retry was submitted rather than left in the input box.
+        # Watching the footer for it broke silently when Claude Code reworded it;
+        # this row is written by claude itself.
+        w = cr.TranscriptWatcher(self.dir, poll=0, echo="continue")
+        self.append("s.jsonl", USER_ECHO)
+        found = w.poll_now()
+        self.assertEqual([r["kind"] for r in found], ["echo"])
+
+    def test_a_different_prompt_is_not_our_echo(self):
+        w = cr.TranscriptWatcher(self.dir, poll=0, echo="continue")
+        self.append("s.jsonl", user_row("continue the refactor yourself"))
+        self.assertEqual(w.poll_now(), [])
+
+    def test_echoes_are_ignored_when_no_message_is_configured(self):
+        w = cr.TranscriptWatcher(self.dir, poll=0)
+        self.append("s.jsonl", USER_ECHO)
+        self.assertEqual(w.poll_now(), [])
+
+    def test_limit_records_are_still_labelled(self):
+        w = cr.TranscriptWatcher(self.dir, poll=0, echo="continue")
+        self.append("s.jsonl", REAL)
+        self.assertEqual([r["kind"] for r in w.poll_now()], ["limit"])
 
     def test_truncation_is_handled(self):
         self.append("s.jsonl", ORDINARY)

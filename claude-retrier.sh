@@ -24,7 +24,7 @@
 
 set -u
 
-CR_VERSION="1.2.0"
+CR_VERSION="1.3.0"
 
 # =============================================================================
 # SECTION 1 — DETECTION PATTERNS
@@ -106,6 +106,12 @@ CR_RESET_PATTERNS=(
 # mean the session is alive and must not be typed into. The streaming footer is
 # repainted several times a second, so its absence for a few seconds is a solid
 # idle signal — much stronger than the tmux design's foreground-process check.
+# Claude Code 2.1.x dropped "esc to interrupt" from the footer entirely: what it
+# paints now is a pulsing glyph, a gerund, and a running total — "✶ Nebulizing… "
+# growing into "✻ Cogitating… 20m 57s · ↓ 6.8k tokens". Matching only the old
+# wording made every live session look idle, which cost us the one thing the
+# verify step is for: telling "the retry landed" from "the retry vanished". The
+# old wordings stay for older builds.
 CR_WORKING_PATTERNS=(
   "esc to interrupt"
   "\\besc\\b[^\\n]{0,24}\\binterrupt\\b"
@@ -114,6 +120,9 @@ CR_WORKING_PATTERNS=(
   "attempt [0-9]+/[0-9]+"
   "waiting for [0-9]+ background agents? to finish"
   "tokens?\\s*·\\s*esc"
+  "[✢✳✶✷✸✹✺✻✽*][ ]?[a-z]{3,}…"                       # ✶ Nebulizing…
+  "…\\s*[0-9]+(h|m|s)([ 0-9hms]{0,8})\\s*·\\s*↓"       # … 20m 57s · ↓ 6.8k tokens
+  "↓\\s*[0-9.]+k?\\s*tokens"
 )
 
 # The interactive /rate-limit-options selector. If this is on screen a bare Enter
@@ -147,6 +156,7 @@ CR_IGNORE_PATTERNS=(
 : "${CR_FALLBACK_WAIT_SEC:=18000}"     # 5h, used when no reset time can be parsed
 : "${CR_MAX_WAIT_SEC:=691200}"         # 8d hard cap on any single wait
 : "${CR_USER_IDLE_SEC:=20}"            # don't type while the human is typing
+: "${CR_DRAFT_GRACE_SEC:=600}"         # an untouched "draft" this old is not real
 : "${CR_BUSY_IDLE_SEC:=6}"             # no working-footer for this long => idle
 : "${CR_VERIFY_SEC:=60}"               # how long to watch for the retry taking hold
 : "${CR_SCRAPE:=auto}"                 # auto | always | never  (screen-scrape fallback)
@@ -478,6 +488,7 @@ CFG = dict(
     fallback_wait=_env("CR_FALLBACK_WAIT_SEC", 18000, float),
     max_wait=_env("CR_MAX_WAIT_SEC", 691200, float),
     user_idle=_env("CR_USER_IDLE_SEC", 20, float),
+    draft_grace=_env("CR_DRAFT_GRACE_SEC", 600, float),
     busy_idle=_env("CR_BUSY_IDLE_SEC", 6, float),
     verify=_env("CR_VERIFY_SEC", 60, float),
     scrape=_env("CR_SCRAPE", "auto"),
@@ -769,9 +780,17 @@ def project_dir(cwd=None, config_dir=None):
     return os.path.join(config_dir, "projects", slug)
 
 
-def transcript_limit_records(path, offset=0):
-    """Yield (new_offset, [records]) for rate-limit rows appended past `offset`."""
+def transcript_limit_records(path, offset=0, echo=None):
+    """(new_offset, [records]) for rows appended past `offset` that we care about.
+
+    Two kinds: the rate-limit rows, and — when `echo` is the retry message — the
+    user row claude writes when it accepts a prompt. That row is proof the retry
+    was submitted rather than left sitting in the input box, which is the only
+    question the verify step is really asking. Screen-scraping the footer to
+    answer it broke the day Claude Code reworded it.
+    """
     out = []
+    echo_key = ('"%s"' % echo).encode("utf-8", "replace") if echo else None
     try:
         with open(path, "rb") as fh:
             if offset:
@@ -794,19 +813,24 @@ def transcript_limit_records(path, offset=0):
         return offset, out                    # a partial line: re-read it next tick
     new_offset = offset + tail_nl + 1
     for raw in data[:tail_nl].split(b"\n"):
-        if b"rate_limit" not in raw and b"isApiErrorMessage" not in raw:
+        limitish = b"rate_limit" in raw or b"isApiErrorMessage" in raw
+        echoish = bool(echo_key) and echo_key in raw and b'"user"' in raw
+        if not limitish and not echoish:
             continue
         try:
             rec = json.loads(raw.decode("utf-8", "replace"))
         except Exception:
             continue
         if not rec.get("isApiErrorMessage"):
+            if echoish and rec.get("type") == "user" and record_text(rec) == echo:
+                out.append(dict(kind="echo", text=echo, ts=rec.get("timestamp")))
             continue
         err = str(rec.get("error") or "")
         status = rec.get("apiErrorStatus")
         if err != "rate_limit" and status != 429:
             continue
-        out.append(dict(text=record_text(rec), ts=rec.get("timestamp"), error=err))
+        out.append(dict(kind="limit", text=record_text(rec), ts=rec.get("timestamp"),
+                        error=err))
     return new_offset, out
 
 
@@ -828,9 +852,10 @@ class TranscriptWatcher:
     a `--continue` run never replays yesterday's banner.
     """
 
-    def __init__(self, directory, poll=2.0, now=None):
+    def __init__(self, directory, poll=2.0, now=None, echo=None):
         self.dir = directory
         self.poll = poll
+        self.echo = echo
         self.offsets = {}
         self.next_poll = 0.0
         self.seen_any = False
@@ -861,7 +886,7 @@ class TranscriptWatcher:
                 start = 0
             if size > start:
                 self.seen_any = True
-            offset, recs = transcript_limit_records(p, start)
+            offset, recs = transcript_limit_records(p, start, self.echo)
             self.offsets[p] = offset
             found.extend(recs)
         return found
@@ -888,17 +913,62 @@ class Controller:
         self.started = now if now is not None else time.time()
         self.banner_text = None
         self._carry = ""          # overlap so a marker split across two reads still matches
+        self._input_carry = b""   # an escape sequence cut in half by a read boundary
+        self.last_draft_change = now if now is not None else time.time()
 
     # -- inputs ------------------------------------------------------------- #
+    # Not everything arriving on our stdin was typed. The terminal answers
+    # claude's queries down the same pipe — a device attributes report, a cursor
+    # position report, and (claude sends "\x1b[>q" at startup) an XTVERSION reply
+    # such as "\x1bP>|iTerm2 3.5.11\x1b\\". Only CSI and SS3 end at their first
+    # final byte; DCS/OSC/APC/PM/SOS run until a String Terminator, and an X10
+    # mouse report carries three raw coordinate bytes after its final "M". Anything
+    # we mis-parse is counted as characters the human typed, which parks the retry
+    # behind a draft that does not exist.
+    _STRING_OPENERS = (0x50, 0x5d, 0x58, 0x5e, 0x5f)   # DCS  OSC  SOS  PM  APC
+
+    def _skip_escape(self, data, i, n):
+        """Index just past the escape sequence at data[i], or None if truncated."""
+        nxt = data[i + 1]
+        if nxt in (0x5b, 0x4f):                 # CSI "\x1b[" / SS3 "\x1bO"
+            j = i + 2
+            while j < n and 0x20 <= data[j] <= 0x3f:
+                j += 1
+            if j >= n:
+                return None
+            if nxt == 0x5b and j == i + 2 and data[j] == 0x4d:
+                # X10 mouse: "\x1b[M" then button/x/y as raw bytes, each of them
+                # 0x20 or above and so indistinguishable from typed text.
+                return j + 4 if j + 4 <= n else None
+            return j + 1
+        if nxt in self._STRING_OPENERS:
+            j = i + 2
+            while j < n:
+                if data[j] == 0x07:                                     # BEL
+                    return j + 1
+                if data[j] == 0x1b:
+                    if j + 1 >= n:
+                        return None
+                    if data[j + 1] == 0x5c:                             # ST
+                        return j + 2
+                j += 1
+            return None
+        return i + 2                            # Alt+key
+
     def on_user_bytes(self, data, now):
         """Track the human so we never type over a half-written prompt.
 
         Counts printable characters typed since the last submit/clear. Escape
-        SEQUENCES (arrows, function keys, mouse reports) are consumed whole —
-        naively counting their bytes made every cursor movement look like an
-        unsent draft, which would defer the retry indefinitely.
+        SEQUENCES (arrows, function keys, mouse reports, the terminal's replies to
+        claude) are consumed whole — naively counting their bytes made every cursor
+        movement look like an unsent draft, which would defer the retry
+        indefinitely.
         """
         self.last_user_input = now
+        before = self.pending_input_chars
+        if self._input_carry:
+            data = self._input_carry + data
+            self._input_carry = b""
         i, n = 0, len(data)
         while i < n:
             b = data[i]
@@ -909,14 +979,15 @@ class Controller:
                     self.pending_input_chars = 0
                     i += 1
                     continue
-                nxt = data[i + 1]
-                if nxt in (0x5b, 0x4f):         # CSI "\x1b[" / SS3 "\x1bO"
-                    j = i + 2
-                    while j < n and 0x20 <= data[j] <= 0x3f:
-                        j += 1
-                    i = j + 1 if j < n else n   # skip the final byte too
-                else:
-                    i += 2                      # Alt+key
+                j = self._skip_escape(data, i, n)
+                if j is None:
+                    # Cut in half by the read boundary. Finish it next time rather
+                    # than let its tail be mistaken for typing; cap the carry so a
+                    # sequence that never terminates cannot grow without bound.
+                    tail = data[i:]
+                    self._input_carry = tail if len(tail) <= 4096 else b""
+                    break
+                i = j
                 continue
             if b in (0x0d, 0x0a):               # Enter: submitted, box is empty
                 self.pending_input_chars = 0
@@ -928,6 +999,8 @@ class Controller:
             elif b >= 0x20:
                 self.pending_input_chars += 1
             i += 1
+        if self.pending_input_chars != before:
+            self.last_draft_change = now
 
     def on_output(self, text, now):
         # Claude's streaming footer can land split across two reads, so match on a
@@ -941,6 +1014,16 @@ class Controller:
             self.last_working = now
         if is_menu(probe):
             self.menu_open = True
+
+    def on_echo(self, now):
+        """claude wrote our retry into the transcript: it was really submitted."""
+        if self.state != VERIFY:
+            return False
+        self.log("retry accepted (transcript echo)")
+        self.state = IDLE
+        self.attempts = 0
+        self.banner = None
+        return True
 
     def on_limit(self, banner, now, source):
         key = re.sub(r"\s+", " ", banner or "").strip().lower()
@@ -1008,7 +1091,17 @@ class Controller:
         if now - self.last_user_input < self.cfg["user_idle"]:
             return "user is typing"
         if self.pending_input_chars > 0:
-            return "unsent text in the prompt box"
+            if now - self.last_draft_change < self.cfg["draft_grace"]:
+                return "unsent text in the prompt box"
+            # The counter only moves on keystrokes we can see, so anything that
+            # desyncs it — a terminal reply we failed to parse, a box claude
+            # cleared on its own — would otherwise defer the retry forever, which
+            # is the one failure mode this whole wrapper exists to prevent. A
+            # draft nobody has touched for this long is treated as not there.
+            self.log("draft untouched for %.0fs; the input gate looks stale, "
+                     "proceeding" % (now - self.last_draft_change))
+            self.pending_input_chars = 0
+            self.last_draft_change = now
         return None
 
 
@@ -1323,7 +1416,7 @@ def main(argv):
     badge = Badge(CFG)
     if not interactive:
         badge.enabled = False      # nothing to paint on when stdout is a pipe
-    watcher = TranscriptWatcher(project_dir(), CFG["poll"])
+    watcher = TranscriptWatcher(project_dir(), CFG["poll"], echo=CFG["message"])
     scrape_allowed = CFG["scrape"] in ("auto", "always")
     window = ""            # rolling, ansi-stripped view of what claude just drew
     esc_carry = ""         # half-received control sequence from the previous read
@@ -1432,6 +1525,10 @@ def main(argv):
                     write_all(master, data)
 
             for rec in watcher.poll_now(now):
+                if rec.get("kind") == "echo":
+                    if ctl.on_echo(now):
+                        notify("session resumed")
+                    continue
                 text = rec["text"] or "usage limit"
                 pending_scrape = None            # the structured channel wins
                 if ctl.on_limit(text, now, "transcript"):
@@ -1604,6 +1701,7 @@ CR_CLAUDE_ARGV=$(printf '%s\037' "${CR_ARGV[@]}")
 export CR_CLAUDE_RESOLVED CR_CLAUDE_ARGV CLAUDE_RETRIER_ACTIVE=1
 export CR_MESSAGE CR_MARGIN_SEC CR_MAX_ATTEMPTS CR_FALLBACK_WAIT_SEC CR_MAX_WAIT_SEC
 export CR_USER_IDLE_SEC CR_BUSY_IDLE_SEC CR_VERIFY_SEC CR_SCRAPE CR_LOG CR_NOTIFY
+export CR_DRAFT_GRACE_SEC
 export CR_BADGE CR_BADGE_POS CR_BADGE_LABEL
 export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC
 

@@ -106,6 +106,18 @@ class TestWorkingDetection(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(cr.is_working(text))
 
+    def test_the_footer_claude_code_2_1_actually_paints(self):
+        # Captured from claude 2.1.220 in a pty: the wording the older patterns
+        # keyed on ("esc to interrupt") is simply gone. Reading a live session as
+        # idle is what made the wrapper retype `continue` into a session that had
+        # already resumed, and then declare defeat.
+        for text in ["✶ Nebulizing… ",
+                     "✽ Perusing… ",
+                     "✻ Cogitating… 20m 57s · ↓ 6.8k tokens",
+                     "✳ Combobulating… 1m 3s · ↓ 812 tokens"]:
+            with self.subTest(text=text):
+                self.assertTrue(cr.is_working(text))
+
     def test_idle_prompt_is_not_working(self):
         for text in ["╭────╮\n│ >  │\n╰────╯", "⏵⏵ auto mode on", ""]:
             with self.subTest(text=text):

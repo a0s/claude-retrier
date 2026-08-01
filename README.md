@@ -145,6 +145,7 @@ All optional, all environment variables:
 | `CR_MARGIN_SEC` | `45` | extra wait past the stated reset time |
 | `CR_MAX_ATTEMPTS` | `3` | sends per incident before giving up |
 | `CR_USER_IDLE_SEC` | `20` | don't type while you are typing |
+| `CR_DRAFT_GRACE_SEC` | `600` | an untouched draft this old stops blocking |
 | `CR_SCRAPE` | `auto` | `auto` \| `always` \| `never` |
 | `CR_BADGE` | `1` | `0` hides the corner mark |
 | `CR_BADGE_POS` | `bottom-right` | also `bottom-left`, `top-right`, `top-left` |
