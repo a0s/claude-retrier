@@ -1,0 +1,104 @@
+name: release
+
+# Push a tag, get a release. The notes come out of CHANGELOG.md rather than out
+# of the tag message, so what GitHub shows and what the repository says are the
+# same text by construction.
+#
+#   git tag -a v1.2.0 -m 'claude-retrier 1.2.0' && git push origin v1.2.0
+#
+# `workflow_dispatch` backfills a tag that was pushed before this workflow
+# existed: the checkout is the default branch (which is where the changelog and
+# this file live), while the published script is read out of the tag itself.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish a release for (e.g. v1.1.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # tags, so a backfill can read the old file
+
+      - name: Work out the version
+        id: v
+        run: |
+          set -eu
+          tag='${{ github.event.inputs.tag }}'
+          [ -n "$tag" ] || tag='${{ github.ref_name }}'
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
+
+      # The asset is always the script as it was AT the tag, never whatever the
+      # checkout happens to be — a backfilled release must ship its own code.
+      - name: Take the script out of the tag
+        run: |
+          set -eu
+          mkdir -p dist
+          git show '${{ steps.v.outputs.tag }}:claude-retrier.sh' >dist/claude-retrier.sh
+          chmod +x dist/claude-retrier.sh
+
+      # A tag that disagrees with the script or the changelog would ship a
+      # release whose notes describe a different version than the file inside it.
+      - name: The tag, the script and the changelog must agree
+        run: |
+          set -eu
+          version='${{ steps.v.outputs.version }}'
+          in_script=$(./dist/claude-retrier.sh --cr-version | awk '{print $2}')
+          echo "tag=$version script=$in_script"
+          [ "$version" = "$in_script" ] || { echo "::error::tag $version != CR_VERSION $in_script"; exit 1; }
+          grep -q "^## \[$version\]" CHANGELOG.md || {
+            echo "::error::CHANGELOG.md has no section for $version"; exit 1; }
+
+      - name: Install zsh
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      # Nothing is published from a red suite: a release is the one artifact
+      # people install without reading.
+      - name: Run the suite
+        run: ./test/run.sh
+
+      - name: Cut the notes out of the changelog
+        run: |
+          set -eu
+          awk -v v='${{ steps.v.outputs.version }}' '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            /^## \[/ { on = 0 }
+            on { print }
+          ' CHANGELOG.md | sed '/./,$!d' >notes.md
+          {
+            echo ""
+            echo "---"
+            echo "One file, no build step:"
+            echo '```sh'
+            echo "curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${{ steps.v.outputs.tag }}/claude-retrier.sh"
+            echo "chmod +x claude-retrier.sh"
+            echo '```'
+          } >>notes.md
+          cat notes.md
+          [ -s notes.md ]
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          tag='${{ steps.v.outputs.tag }}'
+          title='claude-retrier ${{ steps.v.outputs.version }}'
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" --title "$title" --notes-file notes.md
+            gh release upload "$tag" dist/claude-retrier.sh --clobber
+          else
+            gh release create "$tag" dist/claude-retrier.sh --title "$title" --notes-file notes.md
+          fi
