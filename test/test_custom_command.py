@@ -136,6 +136,30 @@ class CommandShapes(unittest.TestCase):
         r = run(["--cr-cmd", "claude-work", "-p", "hi"], self.rig.env("zsh"))
         self.assertEqual(r.stderr.strip(), "")
 
+    # --- the shape of the launch vector -------------------------------------
+
+    def argv_vector(self, spec, shell="bash"):
+        r = run(["--cr-cmd", spec, "--cr-dump-argv"], self.rig.env(shell))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return r.stdout.splitlines()
+
+    def test_a_file_is_exec_ed_directly(self):
+        self.assertEqual(self.argv_vector(self.rig.claude), [self.rig.claude])
+
+    @unittest.skipUnless(has("zsh") and has("bash"), "needs both shells")
+    def test_no_interactive_shell_is_left_in_the_launch_vector(self):
+        # An interactive shell inside the pty contends for the terminal it was
+        # just handed: on a headless machine (CI, container, cron) it can hang
+        # there, and the session never starts. Aliases and functions are lifted
+        # out of the rc file during resolution precisely so that the thing we
+        # exec is a plain `sh -c`.
+        for shell in ("bash", "zsh"):
+            for spec in ("claude-work", "claude-personal",
+                         "%s --model opus" % self.rig.claude):
+                vec = self.argv_vector(spec, shell)
+                self.assertNotIn("-ic", vec,
+                                 "%s via %s still needs an interactive shell" % (spec, shell))
+
     # --- how it is spelled --------------------------------------------------
 
     def test_the_equals_form(self):

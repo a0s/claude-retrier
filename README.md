@@ -48,7 +48,10 @@ claude-retrier --cr-cmd my-claude-function             # a shell function, likew
 
 An alias or a function exists nowhere except inside an interactive shell that has
 read your rc file, so that is where the wrapper looks when the name is not a file
-it can run directly. Set `CR_CLAUDE_CMD` instead of passing the flag every time:
+it can run directly — once, at startup, lifting out the definition so that the
+session itself runs from a plain shell. `claude-retrier --cr-cmd X --cr-dump-argv`
+prints exactly what will be executed. Set `CR_CLAUDE_CMD` instead of passing the
+flag every time:
 
 ```sh
 alias claude='claude-retrier --cr-cmd claude-work'     # in ~/.zshrc
@@ -121,9 +124,11 @@ reason your session won't start.
   the normal case.
 - A weekly limit stated as a bare `resets Jul 22` with no year is assumed to be
   the next occurrence.
-- A claude that is a *bash* function (not an alias) runs through `bash -i`, which
-  prints one job-control notice to stderr when there is no tty — visible only in
-  `--print` runs. zsh is silent, and so are all the other shapes.
+- An alias or function is read out of your rc file once, at startup, and run from
+  a plain non-interactive shell afterwards. One that calls *another* alias defined
+  in the same rc file will not find it. (bash 3.2, still what macOS ships as
+  `/bin/bash`, cannot be asked for an alias body at all and falls back to running
+  the alias through `bash -i`.)
 - Windows is not supported (no pty).
 
 Prior art: [claude-auto-retry](https://github.com/cheapestinference/claude-auto-retry),

@@ -255,6 +255,19 @@ cr_alias_body() {   # $1 = shell, $2 = name
   printf '%s' "$body"
 }
 
+# The definition of a shell function, for the same reason: asked once, up here,
+# so that the shell we exec later can be a plain non-interactive one. An
+# interactive shell inside the pty is not merely wasteful — on a headless machine
+# (CI, a container, a cron job) it contends for the terminal it has just been
+# handed and can hang there, which is a session that never starts.
+cr_function_def() {   # $1 = shell, $2 = name
+  local def
+  def=$("$1" -ic 'if [ -n "${ZSH_VERSION:-}" ]; then typeset -f -- "$1"
+                  else declare -f -- "$1"; fi' cr-probe "$2" 2>/dev/null) || return 1
+  [ -n "$def" ] || return 1
+  printf '%s' "$def"
+}
+
 # Turns "whatever the user types to start Claude" into an argv vector in CR_ARGV.
 # Four shapes, tried in the order that keeps the common ones cheap and exact:
 #
@@ -292,21 +305,30 @@ cr_resolve_cmd() {
   sh=$(cr_find_shell) || return 1
   if cr_is_bare_word "$spec"; then
     # Not a file, so it can only be an alias or a function — and only an
-    # interactive shell has read the rc file that defines one.
-    local body
+    # interactive shell has read the rc file that defines one. Lift the definition
+    # out of it here, once, and the shell we actually exec can be non-interactive.
+    # "$@" carries the claude arguments through untouched — no re-quoting, no
+    # word-splitting of anything the user did not write themselves.
+    local body def
     if body=$(cr_alias_body "$sh" "$spec"); then
-      # An alias is just text: run its expansion, no interactive shell needed.
-      # "$@" carries the claude arguments through untouched — no re-quoting, no
-      # word-splitting of anything the user did not write themselves.
       CR_ARGV=("$sh" -c "$body \"\$@\"" "$spec")
       return 0
     fi
-    # A function (or a bash 3.2 alias): only the interactive shell has it. Probe
-    # first, so a typo fails here with a clear message instead of inside the pty
-    # as an unreadable shell error.
+    if def=$(cr_function_def "$sh" "$spec"); then
+      CR_ARGV=("$sh" -c "$def
+$spec \"\$@\"" "$spec")
+      return 0
+    fi
+    # Neither, on a shell that could tell us (bash 3.2 has no BASH_ALIASES). Fall
+    # back to letting the interactive shell run it, but probe first so a typo
+    # fails here with a clear message rather than inside the pty.
     "$sh" -ic 'command -v -- "$1" >/dev/null 2>&1' cr-probe "$spec" >/dev/null 2>&1 || return 1
+    CR_ARGV=("$sh" -ic "$spec \"\$@\"" "$spec")
+    return 0
   fi
-  CR_ARGV=("$sh" -ic "$spec \"\$@\"" "$spec")
+  # A command line the user wrote: a shell has to read it, but it needs no rc file
+  # to do so.
+  CR_ARGV=("$sh" -c "$spec \"\$@\"" "$spec")
   return 0
 }
 
@@ -1337,6 +1359,15 @@ cr_resolve_cmd "$CR_CMD_SPEC" || {
   exit 127
 }
 CR_CLAUDE_RESOLVED="${CR_ARGV[0]}"
+
+case "${1:-}" in
+  --cr-dump-argv)
+    # What we would exec, one element per line. Answers "which claude is this
+    # actually going to run" without starting a session, and lets the tests
+    # assert on the shape of the vector rather than on its side effects.
+    printf '%s\n' "${CR_ARGV[@]}"
+    exit 0 ;;
+esac
 
 if [ "${CR_DISABLE:-0}" = "1" ] || [ "${CLAUDE_RETRIER_ACTIVE:-0}" = "1" ]; then
   exec "${CR_ARGV[@]}" "$@"
