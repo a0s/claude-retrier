@@ -36,4 +36,11 @@ jobs:
           echo "sh -> $(readlink -f /bin/sh)"
 
       - name: Run the suite
-        run: ./test/run.sh
+        run: |
+          set -o pipefail
+          ./test/run.sh 2>&1 | tee /tmp/suite.log && exit 0
+          # Surface the failure as an annotation as well as in the log: annotations
+          # are readable from the public API, so a failure here can be diagnosed
+          # without repository admin rights.
+          echo "::error::$(grep -E 'FAIL|Error|Traceback|assert' /tmp/suite.log | head -20 | tr '\n' '§')"
+          exit 1
