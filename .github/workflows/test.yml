@@ -1,0 +1,37 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    # Both, always: the pty and shell behaviour this wrapper depends on is where
+    # macOS and Linux differ, so a green run on one says little about the other.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # zsh ships with macOS but not with the Ubuntu runner, and the alias tests
+      # skip themselves when it is missing — a silent gap in exactly the feature
+      # most users rely on.
+      - name: Install zsh (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
+
+      - name: Versions
+        run: |
+          bash --version | head -1
+          zsh --version
+          python3 --version
+
+      - name: Run the suite
+        run: ./test/run.sh

@@ -1,4 +1,4 @@
-"""End-to-end runs of wrap.sh against a real pty.
+"""End-to-end runs of claude-retrier.sh against a real pty.
 
 Two things are being proven here. First, that the wrapper is invisible during
 ordinary use — keystrokes, exit codes, terminal size and window resizes all pass
@@ -21,7 +21,7 @@ import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WRAP = os.path.join(ROOT, "wrap.sh")
+WRAP = os.path.join(ROOT, "claude-retrier.sh")
 
 
 def _fake_launcher():
@@ -33,7 +33,7 @@ def _fake_launcher():
     tree flat so the exit-status assertions below measure the wrapper, not the
     shim.
     """
-    path = os.path.join(tempfile.mkdtemp(prefix="cw-fake-"), "claude")
+    path = os.path.join(tempfile.mkdtemp(prefix="cr-fake-"), "claude")
     with open(path, "w") as fh:
         fh.write('#!/bin/sh\nexec "%s" "%s" "$@"\n'
                  % (sys.executable, os.path.join(ROOT, "test", "fake_claude.py")))
@@ -45,16 +45,16 @@ FAKE = _fake_launcher()
 
 
 class Session:
-    """Runs wrap.sh on a pty we control, the way a terminal emulator would."""
+    """Runs claude-retrier.sh on a pty we control, the way a terminal emulator would."""
 
     def __init__(self, env=None, args=(), rows=40, cols=120, cwd=None):
         self.master, slave = pty.openpty()
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         full = dict(os.environ)
         full.update({
-            "CW_CLAUDE_BIN": FAKE,
-            "CW_LOG": os.path.join(tempfile.gettempdir(), "cw-pty-test.log"),
-            "CW_NOTIFY": "0",
+            "CR_CLAUDE_BIN": FAKE,
+            "CR_LOG": os.path.join(tempfile.gettempdir(), "cr-pty-test.log"),
+            "CR_NOTIFY": "0",
             "PYTHONUNBUFFERED": "1",
         })
         full.update(env or {})
@@ -190,7 +190,7 @@ class TestTransparency(PtyTestCase):
         self.assertEqual(s.wait(timeout=10), 128 + signal.SIGTERM)
 
     def test_wrapper_is_bypassed_when_disabled(self):
-        s = self.session(env={"CW_DISABLE": "1"})
+        s = self.session(env={"CR_DISABLE": "1"})
         self.assertTrue(s.read_until("ready"))
         s.send("quit\r")
         s.wait()
@@ -200,19 +200,19 @@ class TestScrapeChannel(PtyTestCase):
     """The fallback channel: the banner is only ever seen on screen."""
 
     def setUp(self):
-        self.cfg = tempfile.mkdtemp(prefix="cw-cfg-")
-        self.work = tempfile.mkdtemp(prefix="cw-work-")
+        self.cfg = tempfile.mkdtemp(prefix="cr-cfg-")
+        self.work = tempfile.mkdtemp(prefix="cr-work-")
         self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
 
     def env(self, **over):
         e = {
             "CLAUDE_CONFIG_DIR": self.cfg,
-            "CW_SCRAPE": "always",
-            "CW_WAIT_SCALE": "3600",     # an hour of waiting becomes a second
-            "CW_MARGIN_SEC": "0",
-            "CW_USER_IDLE_SEC": "0",
-            "CW_BUSY_IDLE_SEC": "0.2",
+            "CR_SCRAPE": "always",
+            "CR_WAIT_SCALE": "3600",     # an hour of waiting becomes a second
+            "CR_MARGIN_SEC": "0",
+            "CR_USER_IDLE_SEC": "0",
+            "CR_BUSY_IDLE_SEC": "0.2",
         }
         e.update(over)
         return e
@@ -226,7 +226,7 @@ class TestScrapeChannel(PtyTestCase):
     def test_the_message_is_configurable(self):
         s = self.session(
             env=self.env(FAKE_BANNER="You've hit your session limit - resets in 1 hours",
-                         CW_MESSAGE="please resume"),
+                         CR_MESSAGE="please resume"),
             cwd=self.work)
         self.assertTrue(s.read_until("GOT:please resume", timeout=20))
 
@@ -249,7 +249,7 @@ class TestScrapeChannel(PtyTestCase):
     def test_a_busy_session_is_not_typed_into(self):
         s = self.session(
             env=self.env(FAKE_BANNER="You've hit your session limit - resets in 1 hours",
-                         FAKE_WORKING="1", CW_BUSY_IDLE_SEC="30"),
+                         FAKE_WORKING="1", CR_BUSY_IDLE_SEC="30"),
             cwd=self.work)
         s.read_until("Cogitating")
         s.drain(4)
@@ -258,7 +258,7 @@ class TestScrapeChannel(PtyTestCase):
     def test_an_unsent_draft_defers_the_retry(self):
         s = self.session(
             env=self.env(FAKE_BANNER="You've hit your session limit - resets in 1 hours",
-                         CW_USER_IDLE_SEC="0"),
+                         CR_USER_IDLE_SEC="0"),
             cwd=self.work)
         s.read_until("session limit")
         s.send("half a thought")            # typed, never submitted
@@ -272,19 +272,19 @@ class TestTranscriptChannel(PtyTestCase):
     """The primary channel: nothing is scraped, the JSONL record drives it."""
 
     def setUp(self):
-        self.cfg = tempfile.mkdtemp(prefix="cw-cfg-")
-        self.work = tempfile.mkdtemp(prefix="cw-work-")
+        self.cfg = tempfile.mkdtemp(prefix="cr-cfg-")
+        self.work = tempfile.mkdtemp(prefix="cr-work-")
         self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
         self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
 
     def test_a_rate_limit_record_triggers_a_retry(self):
         s = self.session(env={
             "CLAUDE_CONFIG_DIR": self.cfg,
-            "CW_SCRAPE": "never",            # prove the transcript alone is enough
-            "CW_WAIT_SCALE": "3600",
-            "CW_MARGIN_SEC": "0",
-            "CW_USER_IDLE_SEC": "0",
-            "CW_POLL_SEC": "0.2",
+            "CR_SCRAPE": "never",            # prove the transcript alone is enough
+            "CR_WAIT_SCALE": "3600",
+            "CR_MARGIN_SEC": "0",
+            "CR_USER_IDLE_SEC": "0",
+            "CR_POLL_SEC": "0.2",
             "FAKE_TRANSCRIPT": "You've hit your weekly limit - resets in 2 hours",
         }, cwd=self.work)
         self.assertTrue(s.read_until("GOT:continue", timeout=25))
@@ -295,11 +295,11 @@ class TestTranscriptChannel(PtyTestCase):
         # scraper must stand down rather than double-fire on the render.
         s = self.session(env={
             "CLAUDE_CONFIG_DIR": self.cfg,
-            "CW_SCRAPE": "auto",
-            "CW_WAIT_SCALE": "3600",
-            "CW_MARGIN_SEC": "0",
-            "CW_USER_IDLE_SEC": "0",
-            "CW_POLL_SEC": "0.2",
+            "CR_SCRAPE": "auto",
+            "CR_WAIT_SCALE": "3600",
+            "CR_MARGIN_SEC": "0",
+            "CR_USER_IDLE_SEC": "0",
+            "CR_POLL_SEC": "0.2",
             "FAKE_TRANSCRIPT_PLAIN": "ordinary turn",   # a non-limit record: just growth
             "FAKE_BANNER": "You've hit your session limit - resets in 1 hours",
         }, cwd=self.work)

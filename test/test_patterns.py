@@ -8,7 +8,7 @@ import unittest
 
 from helper import load
 
-cw = load()
+cr = load()
 
 
 LIVE_BANNERS = [
@@ -58,7 +58,7 @@ NOT_LIMITS = [
     # A reset time with no limit line.
     "The cache resets at 3pm every day.",
     # This tool's own source and docs.
-    "CW_LIMIT_PATTERNS=( \"you've hit your session limit\" ) # resets 3pm",
+    "CR_LIMIT_PATTERNS=( \"you've hit your session limit\" ) # resets 3pm",
 ]
 
 
@@ -66,36 +66,36 @@ class TestBannerDetection(unittest.TestCase):
     def test_live_banners_detected(self):
         for text in LIVE_BANNERS:
             with self.subTest(text=text):
-                self.assertIsNotNone(cw.find_limit(text))
+                self.assertIsNotNone(cr.find_limit(text))
 
     def test_multiline_render(self):
-        found = cw.find_limit(MULTILINE)
+        found = cr.find_limit(MULTILINE)
         self.assertIsNotNone(found)
         self.assertIn("resets 3pm", found)
 
     def test_banner_buried_under_a_tall_widget(self):
         # No fixed tail window here: the whole rolling buffer is searched, so the
         # distance between the banner and the bottom of the screen is irrelevant.
-        self.assertIsNotNone(cw.find_limit(BURIED))
+        self.assertIsNotNone(cr.find_limit(BURIED))
 
     def test_non_limits_rejected(self):
         for text in NOT_LIMITS:
             with self.subTest(text=text):
-                self.assertIsNone(cw.find_limit(text))
+                self.assertIsNone(cr.find_limit(text))
 
     def test_freshest_banner_wins(self):
         pane = ("You've hit your session limit · resets 11:30am (UTC)\n"
                 "...work...\n"
                 "You've hit your session limit · resets 4:30pm (UTC)\n")
-        self.assertIn("4:30pm", cw.find_limit(pane))
+        self.assertIn("4:30pm", cr.find_limit(pane))
 
     def test_ansi_is_stripped_before_matching(self):
         colored = "\x1b[1m\x1b[31mYou've hit your session limit\x1b[0m \x1b[2m· resets 3pm (UTC)\x1b[0m"
-        self.assertIsNotNone(cw.find_limit(colored))
+        self.assertIsNotNone(cr.find_limit(colored))
 
     def test_osc_hyperlink_does_not_break_matching(self):
         text = "You've hit your session limit \x1b]8;;https://claude.ai/upgrade\x1b\\· resets 3pm\x1b]8;;\x1b\\"
-        self.assertIsNotNone(cw.find_limit(text))
+        self.assertIsNotNone(cr.find_limit(text))
 
 
 class TestWorkingDetection(unittest.TestCase):
@@ -104,12 +104,12 @@ class TestWorkingDetection(unittest.TestCase):
                      "· Retrying in 5s · attempt 3/10",
                      "Waiting for 2 background agents to finish"]:
             with self.subTest(text=text):
-                self.assertTrue(cw.is_working(text))
+                self.assertTrue(cr.is_working(text))
 
     def test_idle_prompt_is_not_working(self):
         for text in ["╭────╮\n│ >  │\n╰────╯", "⏵⏵ auto mode on", ""]:
             with self.subTest(text=text):
-                self.assertFalse(cw.is_working(text))
+                self.assertFalse(cr.is_working(text))
 
 
 class TestMenuDetection(unittest.TestCase):
@@ -117,22 +117,22 @@ class TestMenuDetection(unittest.TestCase):
         menu = ("What do you want to do?\n"
                 "❯ 1. Upgrade your plan\n"
                 "  2. Stop and wait for limit to reset\n")
-        self.assertTrue(cw.is_menu(menu))
+        self.assertTrue(cr.is_menu(menu))
 
     def test_ordinary_prompt_is_not_a_menu(self):
-        self.assertFalse(cw.is_menu("│ > what do you think? │"))
+        self.assertFalse(cr.is_menu("│ > what do you think? │"))
 
 
 class TestToolEchoMask(unittest.TestCase):
     def test_children_of_a_tool_header_are_masked(self):
         lines = ['● Bash(grep "limit")', '  ⎿  You\'ve hit your limit · resets 3pm', 'back to content']
-        mask = cw.tool_echo_mask(lines)
+        mask = cr.tool_echo_mask(lines)
         self.assertEqual(mask, [True, True, False])
 
     def test_a_plain_bullet_is_not_a_tool_call(self):
         # "● API Error: …" is a real error render, not a Name(...) tool header.
         lines = ["● API Error: 529 overloaded"]
-        self.assertEqual(cw.tool_echo_mask(lines), [False])
+        self.assertEqual(cr.tool_echo_mask(lines), [False])
 
 
 if __name__ == "__main__":

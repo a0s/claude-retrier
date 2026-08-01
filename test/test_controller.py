@@ -13,7 +13,7 @@ import unittest
 
 from helper import load
 
-cw = load()
+cr = load()
 
 CFG = dict(message="continue", margin=0, max_attempts=3, fallback_wait=18000,
            max_wait=691200, user_idle=20, busy_idle=6, verify=60, wait_scale=1)
@@ -25,7 +25,7 @@ def controller(**over):
     cfg = dict(CFG)
     cfg.update(over)
     logs = []
-    ctl = cw.Controller(cfg, logs.append, now=0)
+    ctl = cr.Controller(cfg, logs.append, now=0)
     ctl.log_lines = logs
     return ctl
 
@@ -34,7 +34,7 @@ class TestScheduling(unittest.TestCase):
     def test_a_limit_schedules_a_wake_up_at_the_reset(self):
         ctl = controller()
         self.assertTrue(ctl.on_limit(BANNER, now=1000, source="transcript"))
-        self.assertEqual(ctl.state, cw.WAITING)
+        self.assertEqual(ctl.state, cr.WAITING)
         self.assertAlmostEqual(ctl.wake_at, 1000 + 7200, delta=1)
 
     def test_margin_is_added(self):
@@ -83,7 +83,7 @@ class TestInjection(unittest.TestCase):
         ctl.on_limit(BANNER, now=0, source="transcript")
         action = ctl.tick(7201)
         self.assertEqual(action, ("inject", "continue", False))
-        self.assertEqual(ctl.state, cw.VERIFY)
+        self.assertEqual(ctl.state, cr.VERIFY)
 
     def test_the_menu_is_dismissed_first(self):
         # Upstream #19: Enter into /rate-limit-options confirmed "Upgrade your plan".
@@ -111,7 +111,7 @@ class TestSafetyGates(unittest.TestCase):
     def test_not_while_claude_is_working(self):
         self.ctl.on_output("✻ Cogitating… (esc to interrupt)", now=7200)
         self.assertIsNone(self.ctl.tick(7201))
-        self.assertEqual(self.ctl.state, cw.WAITING)
+        self.assertEqual(self.ctl.state, cr.WAITING)
 
     def test_retries_once_the_session_goes_quiet(self):
         self.ctl.on_output("✻ Cogitating… (esc to interrupt)", now=7200)
@@ -152,7 +152,7 @@ class TestVerifyAndGiveUp(unittest.TestCase):
         ctl.tick(7201)
         ctl.on_output("✻ Thinking… (esc to interrupt)", now=7210)
         ctl.tick(7211)
-        self.assertEqual(ctl.state, cw.IDLE)
+        self.assertEqual(ctl.state, cr.IDLE)
         self.assertEqual(ctl.attempts, 0)
 
     def test_a_retry_that_did_not_take_hold_is_repeated(self):
@@ -170,16 +170,16 @@ class TestVerifyAndGiveUp(unittest.TestCase):
             self.assertIsNotNone(ctl.tick(t))
             t += 61
         self.assertIsNone(ctl.tick(t))
-        self.assertEqual(ctl.state, cw.DONE)
+        self.assertEqual(ctl.state, cr.DONE)
 
     def test_a_new_limit_reactivates_a_given_up_controller(self):
         ctl = controller(max_attempts=1)
         ctl.on_limit(BANNER, now=0, source="transcript")
         ctl.tick(7201)
         ctl.tick(7300)
-        self.assertEqual(ctl.state, cw.DONE)
+        self.assertEqual(ctl.state, cr.DONE)
         ctl.on_limit("resets in 3 hours", now=8000, source="transcript")
-        self.assertEqual(ctl.state, cw.WAITING)
+        self.assertEqual(ctl.state, cr.WAITING)
         self.assertIsNotNone(ctl.tick(8000 + 10801))
 
 

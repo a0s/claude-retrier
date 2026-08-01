@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-wrap — auto-resume Claude Code after a usage limit, without tmux.
+# claude-retrier — auto-resume Claude Code after a usage limit, without tmux.
 #
 # One file. Wraps `claude` in a PTY it owns, so it can BOTH see everything Claude
 # prints AND type into the session — the two capabilities that forced the tmux
@@ -7,15 +7,21 @@
 # monitor, event markers, launchd/systemd reconcilers, shell-function installer)
 # falls out as unnecessary.
 #
-# Usage:  wrap.sh [claude args...]
-#         wrap.sh --cw-dump-python      # print the embedded Python (used by tests)
-#         wrap.sh --cw-version
+# Usage:  claude-retrier.sh [claude args...]
+#         claude-retrier.sh --cr-cmd <your-claude> [claude args...]
+#         claude-retrier.sh --cr-dump-python      # print the embedded Python (used by tests)
+#         claude-retrier.sh --cr-version
 #
-# Set CW_DISABLE=1 to bypass the wrapper entirely.
+# `--cr-cmd` (or CR_CLAUDE_CMD) is whatever YOU type to start Claude: a binary, a
+# script, a name on PATH, an alias or shell function from your ~/.zshrc, or a whole
+# command line. Anything the wrapper cannot exec itself is run through your login
+# shell, so rc-file aliases work exactly as they do when you type them.
+#
+# Set CR_DISABLE=1 to bypass the wrapper entirely.
 
 set -u
 
-CW_VERSION="1.0.0"
+CR_VERSION="1.0.0"
 
 # =============================================================================
 # SECTION 1 — DETECTION PATTERNS
@@ -30,7 +36,7 @@ CW_VERSION="1.0.0"
 #
 # Add your own without touching anything else: append to the array.
 # -----------------------------------------------------------------------------
-CW_LIMIT_PATTERNS=(
+CR_LIMIT_PATTERNS=(
   # --- "You've hit your <qualifier> limit" family (the current TUI wording) ---
   "you'?ve hit your (session|weekly|daily|monthly|hourly|opus|sonnet|usage|[0-9]+-hour|current)?\\s*limit"
   "you have hit your (session|weekly|daily|monthly|hourly|usage|[0-9]+-hour)?\\s*limit"
@@ -78,7 +84,7 @@ CW_LIMIT_PATTERNS=(
 # Lines that say WHEN the quota comes back. One of these must sit near a LIMIT
 # line for the scraper path to fire, and the first one found is what gets parsed
 # into a wall-clock wait.
-CW_RESET_PATTERNS=(
+CR_RESET_PATTERNS=(
   "resets?\\s+(at\\s+)?[0-9]{1,2}(:[0-9]{2})?\\s*(am|pm)?"          # resets 3pm / resets at 3:20am / resets 15:30
   "resets?\\s+(on\\s+)?[a-z]{3,9}\\.?\\s+[0-9]{1,2}"                # resets Jul 22 / resets on July 22
   "resets?\\s+(tomorrow|today|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
@@ -97,7 +103,7 @@ CW_RESET_PATTERNS=(
 # mean the session is alive and must not be typed into. The streaming footer is
 # repainted several times a second, so its absence for a few seconds is a solid
 # idle signal — much stronger than the tmux design's foreground-process check.
-CW_WORKING_PATTERNS=(
+CR_WORKING_PATTERNS=(
   "esc to interrupt"
   "\\besc\\b[^\\n]{0,24}\\binterrupt\\b"
   "ctrl\\+c to (stop|interrupt)"
@@ -110,7 +116,7 @@ CW_WORKING_PATTERNS=(
 # The interactive /rate-limit-options selector. If this is on screen a bare Enter
 # confirms the highlighted default — historically "Upgrade your plan" (upstream
 # issue #19) — so we dismiss it with Escape before typing anything.
-CW_MENU_PATTERNS=(
+CR_MENU_PATTERNS=(
   "what do you want to do\\?"
   "stop and wait for limit to reset"
   "1\\.\\s*upgrade your plan"
@@ -120,51 +126,82 @@ CW_MENU_PATTERNS=(
 # Lines that LOOK like a limit but are not one. Checked first; a matching line is
 # dropped before pairing. Keeps the API-429 "not your usage limit" render and
 # this tool's own docs/logs from parking the session for hours.
-CW_IGNORE_PATTERNS=(
+CR_IGNORE_PATTERNS=(
   "not your usage limit"                       # "Server is temporarily limiting requests (not your usage limit)"
   "temporarily limiting requests"
   "approaching (your )?.{0,16}limit"           # the 90%-warning banner: not a stop
   "you are nearing"
-  "claude-wrap|claude-auto-retry|CW_LIMIT_PATTERNS|CW_RESET_PATTERNS"
+  "claude-retrier|claude-auto-retry|CR_LIMIT_PATTERNS|CR_RESET_PATTERNS"
   "^\\s*[#>]\\s"                               # markdown quote / comment in a rendered doc
 )
 
 # =============================================================================
 # SECTION 2 — configuration (all overridable from the environment)
 # =============================================================================
-: "${CW_MESSAGE:=continue}"            # what to type when the limit lifts
-: "${CW_MARGIN_SEC:=45}"               # extra wait past the stated reset time
-: "${CW_MAX_ATTEMPTS:=3}"              # sends per incident before giving up
-: "${CW_FALLBACK_WAIT_SEC:=18000}"     # 5h, used when no reset time can be parsed
-: "${CW_MAX_WAIT_SEC:=691200}"         # 8d hard cap on any single wait
-: "${CW_USER_IDLE_SEC:=20}"            # don't type while the human is typing
-: "${CW_BUSY_IDLE_SEC:=6}"             # no working-footer for this long => idle
-: "${CW_VERIFY_SEC:=60}"               # how long to watch for the retry taking hold
-: "${CW_SCRAPE:=auto}"                 # auto | always | never  (screen-scrape fallback)
-: "${CW_LOG:=$HOME/.claude-wrap/log}"
-: "${CW_NOTIFY:=1}"                    # print a one-line status note into the terminal
-: "${CW_WAIT_SCALE:=1}"                # divide every wait by this (tests use 3600)
-: "${CW_CLAUDE_BIN:=}"                 # override the claude binary
+: "${CR_MESSAGE:=continue}"            # what to type when the limit lifts
+: "${CR_MARGIN_SEC:=45}"               # extra wait past the stated reset time
+: "${CR_MAX_ATTEMPTS:=3}"              # sends per incident before giving up
+: "${CR_FALLBACK_WAIT_SEC:=18000}"     # 5h, used when no reset time can be parsed
+: "${CR_MAX_WAIT_SEC:=691200}"         # 8d hard cap on any single wait
+: "${CR_USER_IDLE_SEC:=20}"            # don't type while the human is typing
+: "${CR_BUSY_IDLE_SEC:=6}"             # no working-footer for this long => idle
+: "${CR_VERIFY_SEC:=60}"               # how long to watch for the retry taking hold
+: "${CR_SCRAPE:=auto}"                 # auto | always | never  (screen-scrape fallback)
+: "${CR_LOG:=$HOME/.claude-retrier/log}"
+: "${CR_NOTIFY:=1}"                    # print a one-line status note into the terminal
+: "${CR_WAIT_SCALE:=1}"                # divide every wait by this (tests use 3600)
+: "${CR_CLAUDE_BIN:=}"                 # override the claude binary (a file, nothing else)
+: "${CR_CLAUDE_CMD:=}"                 # YOUR claude command: binary, PATH name, alias,
+                                       # shell function, or a full command line
+: "${CR_SHELL:=}"                      # shell that knows your aliases (default: $SHELL)
 # Where to look when `claude` is not on PATH (colon-separated, in order).
-: "${CW_CLAUDE_FALLBACKS:=$HOME/.claude/local/claude:$HOME/.local/bin/claude:/opt/homebrew/bin/claude:/usr/local/bin/claude}"
-: "${CW_POLL_SEC:=2}"                  # transcript poll interval
-: "${CW_SCRAPE_CONFIRM_SEC:=3}"        # a scraped banner must persist this long
+: "${CR_CLAUDE_FALLBACKS:=$HOME/.claude/local/claude:$HOME/.local/bin/claude:/opt/homebrew/bin/claude:/usr/local/bin/claude}"
+: "${CR_POLL_SEC:=2}"                  # transcript poll interval
+: "${CR_SCRAPE_CONFIRM_SEC:=3}"        # a scraped banner must persist this long
 
 # =============================================================================
 # SECTION 3 — argument handling / degradation
 # =============================================================================
 case "${1:-}" in
-  --cw-version) echo "claude-wrap $CW_VERSION"; exit 0 ;;
+  --cr-version) echo "claude-retrier $CR_VERSION"; exit 0 ;;
+  --cr-help|-h|--help-retrier)
+    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0 ;;
 esac
+
+# `--cr-cmd <command>` — the user's own way of starting Claude. Leading position
+# only: everything after it belongs to claude, and claude takes a bare prompt as
+# its first argument, so a positional guess would eat the prompt of anyone typing
+# `claude-retrier.sh "fix the bug"`.
+CR_CMD_SPEC="$CR_CLAUDE_CMD"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cr-cmd)
+      [ "$#" -ge 2 ] || { echo "claude-retrier: --cr-cmd needs a command" >&2; exit 2; }
+      CR_CMD_SPEC="$2"; shift 2 ;;
+    --cr-cmd=*) CR_CMD_SPEC="${1#--cr-cmd=}"; shift ;;
+    *) break ;;
+  esac
+done
+
+# A user command that resolves back to this script would fork-bomb the machine.
+# Every exec below inherits this counter; two levels are legitimate (the wrapper
+# degrading into plain claude), a third means the command points at us.
+CR_DEPTH=$(( ${CR_DEPTH:-0} + 1 ))
+export CR_DEPTH
+if [ "$CR_DEPTH" -gt 3 ]; then
+  echo "claude-retrier: refusing to recurse — does your claude command point back at claude-retrier?" >&2
+  exit 1
+fi
 
 # Never let the wrapper be the reason `claude` stops working (upstream issue #65:
 # an orphaned shell function bricked the command). Any doubt => plain claude.
-cw_find_claude() {
-  if [ -n "$CW_CLAUDE_BIN" ]; then
+cr_find_claude() {
+  if [ -n "$CR_CLAUDE_BIN" ]; then
     # An explicit override that isn't runnable is a configuration mistake, not a
     # reason to silently fall back to some other claude.
-    { [ -f "$CW_CLAUDE_BIN" ] && [ -x "$CW_CLAUDE_BIN" ]; } || return 1
-    printf '%s' "$CW_CLAUDE_BIN"
+    { [ -f "$CR_CLAUDE_BIN" ] && [ -x "$CR_CLAUDE_BIN" ]; } || return 1
+    printf '%s' "$CR_CLAUDE_BIN"
     return 0
   fi
   local p
@@ -174,7 +211,7 @@ cw_find_claude() {
   p=$(type -P claude 2>/dev/null)
   if [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
   local IFS=:
-  for p in $CW_CLAUDE_FALLBACKS; do
+  for p in $CR_CLAUDE_FALLBACKS; do
     # -f as well as -x: a bare -x test also passes for a DIRECTORY (the execute
     # bit means "may traverse"), and exec'ing one fails with a baffling EACCES.
     if [ -f "$p" ] && [ -x "$p" ]; then printf '%s' "$p"; return 0; fi
@@ -182,13 +219,104 @@ cw_find_claude() {
   return 1
 }
 
+# The shell that knows the user's aliases and functions. $SHELL is the one they
+# actually configured; the fallbacks only matter in stripped environments (cron,
+# containers) where no alias can be defined anyway.
+cr_find_shell() {
+  local s
+  for s in ${CR_SHELL:-} ${SHELL:-} bash zsh sh; do
+    [ -n "$s" ] || continue
+    command -v "$s" >/dev/null 2>&1 && { printf '%s' "$s"; return 0; }
+  done
+  return 1
+}
+
+# A word we can hand to `exec` or `type -P` as-is: no whitespace, no character the
+# shell would expand. Anything else is a command LINE and needs a shell to read it.
+cr_is_bare_word() {
+  case "$1" in
+    "") return 1 ;;
+    *[!A-Za-z0-9._/@%+:=-]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# The body of an alias, asked of the shell that defines it. Returning the body
+# rather than running the alias through `sh -i` keeps the interactive shell out of
+# the final exec: one less process between us and claude, and no "no job control
+# in this shell" on stderr when we are running without a tty (`claude -p`).
+# bash 3.2 (the /bin/bash macOS still ships) has no BASH_ALIASES and returns
+# nothing here — the interactive path below covers it.
+cr_alias_body() {   # $1 = shell, $2 = name
+  local body
+  body=$("$1" -ic 'if [ -n "${ZSH_VERSION:-}" ]; then print -r -- "${aliases[$1]:-}"
+                   else printf "%s" "${BASH_ALIASES[$1]:-}"; fi' cr-probe "$2" 2>/dev/null) || return 1
+  [ -n "$body" ] || return 1
+  printf '%s' "$body"
+}
+
+# Turns "whatever the user types to start Claude" into an argv vector in CR_ARGV.
+# Four shapes, tried in the order that keeps the common ones cheap and exact:
+#
+#   /opt/bin/claude-work   a path            -> exec it
+#   claude-work            a name on PATH    -> exec the file
+#   claude-work            an alias/function -> run it through an interactive shell
+#   "claude --model opus"  a command line    -> ditto, shell reads the arguments
+#
+# The interactive shell is what makes rc-file aliases work: they exist nowhere
+# else. It is only reached when the cheap paths miss, so the usual case pays
+# nothing for it.
+CR_ARGV=()
+cr_resolve_cmd() {
+  local spec="$1" p sh
+  CR_ARGV=()
+
+  if [ -z "$spec" ]; then
+    p=$(cr_find_claude) || return 1
+    CR_ARGV=("$p")
+    return 0
+  fi
+
+  if cr_is_bare_word "$spec"; then
+    case "$spec" in
+      */*)
+        # An explicit path that isn't runnable is a mistake worth reporting, not a
+        # reason to go looking for some other claude.
+        { [ -f "$spec" ] && [ -x "$spec" ]; } || return 1
+        CR_ARGV=("$spec"); return 0 ;;
+    esac
+    p=$(type -P -- "$spec" 2>/dev/null)
+    if [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ]; then CR_ARGV=("$p"); return 0; fi
+  fi
+
+  sh=$(cr_find_shell) || return 1
+  if cr_is_bare_word "$spec"; then
+    # Not a file, so it can only be an alias or a function — and only an
+    # interactive shell has read the rc file that defines one.
+    local body
+    if body=$(cr_alias_body "$sh" "$spec"); then
+      # An alias is just text: run its expansion, no interactive shell needed.
+      # "$@" carries the claude arguments through untouched — no re-quoting, no
+      # word-splitting of anything the user did not write themselves.
+      CR_ARGV=("$sh" -c "$body \"\$@\"" "$spec")
+      return 0
+    fi
+    # A function (or a bash 3.2 alias): only the interactive shell has it. Probe
+    # first, so a typo fails here with a clear message instead of inside the pty
+    # as an unreadable shell error.
+    "$sh" -ic 'command -v -- "$1" >/dev/null 2>&1' cr-probe "$spec" >/dev/null 2>&1 || return 1
+  fi
+  CR_ARGV=("$sh" -ic "$spec \"\$@\"" "$spec")
+  return 0
+}
+
 # Colon-separated interpreters to try, in order. Overridable so an unusual
 # install (or a test) can point at a specific one.
-: "${CW_PYTHON_CANDIDATES:=python3:/usr/bin/python3:/usr/local/bin/python3:/opt/homebrew/bin/python3}"
+: "${CR_PYTHON_CANDIDATES:=python3:/usr/bin/python3:/usr/local/bin/python3:/opt/homebrew/bin/python3}"
 
-cw_find_python() {
+cr_find_python() {
   local p real IFS=:
-  for p in ${CW_PYTHON:-} $CW_PYTHON_CANDIDATES; do
+  for p in ${CR_PYTHON:-} $CR_PYTHON_CANDIDATES; do
     [ -z "$p" ] && continue
     command -v "$p" >/dev/null 2>&1 || continue
     # Resolve to the actual interpreter. `python3` on PATH is frequently a
@@ -208,8 +336,8 @@ cw_find_python() {
 # =============================================================================
 # SECTION 4 — the wrapper itself
 # =============================================================================
-IFS= read -r -d '' CW_PY <<'CW_PYTHON_EOF' || true
-"""claude-wrap PTY supervisor.
+IFS= read -r -d '' CR_PY <<'CR_PYTHON_EOF' || true
+"""claude-retrier PTY supervisor.
 
 Runs claude on a pty we own, forwards bytes both ways untouched, and watches two
 independent channels for "the session stopped because the quota ran out":
@@ -256,20 +384,20 @@ def _env(name, default, cast=str):
 
 
 CFG = dict(
-    message=_env("CW_MESSAGE", "continue"),
-    margin=_env("CW_MARGIN_SEC", 45, float),
-    max_attempts=_env("CW_MAX_ATTEMPTS", 3, int),
-    fallback_wait=_env("CW_FALLBACK_WAIT_SEC", 18000, float),
-    max_wait=_env("CW_MAX_WAIT_SEC", 691200, float),
-    user_idle=_env("CW_USER_IDLE_SEC", 20, float),
-    busy_idle=_env("CW_BUSY_IDLE_SEC", 6, float),
-    verify=_env("CW_VERIFY_SEC", 60, float),
-    scrape=_env("CW_SCRAPE", "auto"),
-    log=_env("CW_LOG", os.path.expanduser("~/.claude-wrap/log")),
-    notify=_env("CW_NOTIFY", "1") == "1",
-    wait_scale=max(1e-6, _env("CW_WAIT_SCALE", 1.0, float)),
-    poll=_env("CW_POLL_SEC", 2.0, float),
-    scrape_confirm=_env("CW_SCRAPE_CONFIRM_SEC", 3.0, float),
+    message=_env("CR_MESSAGE", "continue"),
+    margin=_env("CR_MARGIN_SEC", 45, float),
+    max_attempts=_env("CR_MAX_ATTEMPTS", 3, int),
+    fallback_wait=_env("CR_FALLBACK_WAIT_SEC", 18000, float),
+    max_wait=_env("CR_MAX_WAIT_SEC", 691200, float),
+    user_idle=_env("CR_USER_IDLE_SEC", 20, float),
+    busy_idle=_env("CR_BUSY_IDLE_SEC", 6, float),
+    verify=_env("CR_VERIFY_SEC", 60, float),
+    scrape=_env("CR_SCRAPE", "auto"),
+    log=_env("CR_LOG", os.path.expanduser("~/.claude-retrier/log")),
+    notify=_env("CR_NOTIFY", "1") == "1",
+    wait_scale=max(1e-6, _env("CR_WAIT_SCALE", 1.0, float)),
+    poll=_env("CR_POLL_SEC", 2.0, float),
+    scrape_confirm=_env("CR_SCRAPE_CONFIRM_SEC", 3.0, float),
 )
 
 
@@ -288,11 +416,11 @@ def _patterns(var):
 
 
 PAT = {
-    "limit": _patterns("CW_PAT_LIMIT"),
-    "reset": _patterns("CW_PAT_RESET"),
-    "working": _patterns("CW_PAT_WORKING"),
-    "menu": _patterns("CW_PAT_MENU"),
-    "ignore": _patterns("CW_PAT_IGNORE"),
+    "limit": _patterns("CR_PAT_LIMIT"),
+    "reset": _patterns("CR_PAT_RESET"),
+    "working": _patterns("CR_PAT_WORKING"),
+    "menu": _patterns("CR_PAT_MENU"),
+    "ignore": _patterns("CR_PAT_IGNORE"),
 }
 
 
@@ -912,10 +1040,25 @@ class Logger:
                 pass
 
 
+def launch_vector():
+    """How to start Claude, as an argv prefix the shell layer already resolved.
+
+    Usually one element (the binary). For an alias or a command line it is a
+    shell invocation instead; either way we just exec it with the user's
+    arguments appended, so nothing here needs to know which shape it got.
+    """
+    raw = os.environ.get("CR_CLAUDE_ARGV") or ""
+    vec = raw.split("\x1f")
+    if vec and vec[-1] == "":
+        vec.pop()                      # trailing separator from printf
+    return vec or [os.environ.get("CR_CLAUDE_RESOLVED") or "claude"]
+
+
 def main(argv):
-    claude = os.environ.get("CW_CLAUDE_RESOLVED") or "claude"
+    launch = launch_vector()
+    claude = launch[0]
     log = Logger(CFG["log"])
-    log("start: %s %s" % (claude, " ".join(argv)))
+    log("start: %s %s" % (" ".join(launch), " ".join(argv)))
 
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
@@ -925,9 +1068,9 @@ def main(argv):
     pid, master = fork_pty(rows, cols)
     if pid == 0:
         try:
-            os.execvp(claude, [claude] + argv)
+            os.execvp(launch[0], launch + argv)
         except Exception as exc:
-            sys.stderr.write("claude-wrap: cannot exec %s: %s\n" % (claude, exc))
+            sys.stderr.write("claude-retrier: cannot exec %s: %s\n" % (claude, exc))
             os._exit(127)
 
     old_attr = None
@@ -987,7 +1130,7 @@ def main(argv):
         if not CFG["notify"] or not interactive:
             return
         try:
-            os.write(stdout_fd, ("\r\x1b[2m[claude-wrap] %s\x1b[0m\r\n" % msg).encode())
+            os.write(stdout_fd, ("\r\x1b[2m[claude-retrier] %s\x1b[0m\r\n" % msg).encode())
         except Exception:
             pass
 
@@ -1161,51 +1304,60 @@ if __name__ == "__main__":
     # waitstatus_to_exitcode reports a signal death as a negative number, which
     # sys.exit would turn into 255. Report it the way a shell does.
     sys.exit(128 - code if code < 0 else code)
-CW_PYTHON_EOF
+CR_PYTHON_EOF
 
-CW_PAT_LIMIT=$(printf '%s\n' "${CW_LIMIT_PATTERNS[@]}")
-CW_PAT_RESET=$(printf '%s\n' "${CW_RESET_PATTERNS[@]}")
-CW_PAT_WORKING=$(printf '%s\n' "${CW_WORKING_PATTERNS[@]}")
-CW_PAT_MENU=$(printf '%s\n' "${CW_MENU_PATTERNS[@]}")
-CW_PAT_IGNORE=$(printf '%s\n' "${CW_IGNORE_PATTERNS[@]}")
-export CW_PAT_LIMIT CW_PAT_RESET CW_PAT_WORKING CW_PAT_MENU CW_PAT_IGNORE
+CR_PAT_LIMIT=$(printf '%s\n' "${CR_LIMIT_PATTERNS[@]}")
+CR_PAT_RESET=$(printf '%s\n' "${CR_RESET_PATTERNS[@]}")
+CR_PAT_WORKING=$(printf '%s\n' "${CR_WORKING_PATTERNS[@]}")
+CR_PAT_MENU=$(printf '%s\n' "${CR_MENU_PATTERNS[@]}")
+CR_PAT_IGNORE=$(printf '%s\n' "${CR_IGNORE_PATTERNS[@]}")
+export CR_PAT_LIMIT CR_PAT_RESET CR_PAT_WORKING CR_PAT_MENU CR_PAT_IGNORE
 
 case "${1:-}" in
-  --cw-dump-python)
-    printf '%s\n' "$CW_PY"
+  --cr-dump-python)
+    printf '%s\n' "$CR_PY"
     exit 0 ;;
-  --cw-dump-patterns)
+  --cr-dump-patterns)
     # The test suite reads the pattern arrays from here rather than re-declaring
     # them, so a pattern can never be tested in a form the wrapper doesn't use.
     for _n in LIMIT RESET WORKING MENU IGNORE; do
-      eval "printf '### CW_PAT_%s\n%s\n' \"\$_n\" \"\$CW_PAT_$_n\""
+      eval "printf '### CR_PAT_%s\n%s\n' \"\$_n\" \"\$CR_PAT_$_n\""
     done
     exit 0 ;;
 esac
 
 # ---- degrade paths: any of these and we run claude untouched -----------------
-CW_CLAUDE_RESOLVED=$(cw_find_claude) || {
-  echo "claude-wrap: claude not found on PATH" >&2
+cr_resolve_cmd "$CR_CMD_SPEC" || {
+  if [ -n "$CR_CMD_SPEC" ]; then
+    echo "claude-retrier: cannot run '$CR_CMD_SPEC' — not a runnable file, and your" >&2
+    echo "shell does not know it as a command, alias or function" >&2
+  else
+    echo "claude-retrier: claude not found on PATH" >&2
+  fi
   exit 127
 }
+CR_CLAUDE_RESOLVED="${CR_ARGV[0]}"
 
-if [ "${CW_DISABLE:-0}" = "1" ] || [ "${CLAUDE_WRAP_ACTIVE:-0}" = "1" ]; then
-  exec "$CW_CLAUDE_RESOLVED" "$@"
+if [ "${CR_DISABLE:-0}" = "1" ] || [ "${CLAUDE_RETRIER_ACTIVE:-0}" = "1" ]; then
+  exec "${CR_ARGV[@]}" "$@"
 fi
 
-CW_PYTHON_BIN=$(cw_find_python) || exec "$CW_CLAUDE_RESOLVED" "$@"
+CR_PYTHON_BIN=$(cr_find_python) || exec "${CR_ARGV[@]}" "$@"
 
 # `claude -p` is a batch run: no TUI to type into, and the exit code already
 # tells the caller what happened. Nothing to supervise.
 for arg in "$@"; do
   case "$arg" in
-    -p|--print) exec "$CW_CLAUDE_RESOLVED" "$@" ;;
+    -p|--print) exec "${CR_ARGV[@]}" "$@" ;;
   esac
 done
 
-export CW_CLAUDE_RESOLVED CLAUDE_WRAP_ACTIVE=1
-export CW_MESSAGE CW_MARGIN_SEC CW_MAX_ATTEMPTS CW_FALLBACK_WAIT_SEC CW_MAX_WAIT_SEC
-export CW_USER_IDLE_SEC CW_BUSY_IDLE_SEC CW_VERIFY_SEC CW_SCRAPE CW_LOG CW_NOTIFY
-export CW_WAIT_SCALE CW_POLL_SEC CW_SCRAPE_CONFIRM_SEC
+# \037 (unit separator) rather than a newline: it cannot occur in a path, a
+# command name, or anything a shell would accept as one.
+CR_CLAUDE_ARGV=$(printf '%s\037' "${CR_ARGV[@]}")
+export CR_CLAUDE_RESOLVED CR_CLAUDE_ARGV CLAUDE_RETRIER_ACTIVE=1
+export CR_MESSAGE CR_MARGIN_SEC CR_MAX_ATTEMPTS CR_FALLBACK_WAIT_SEC CR_MAX_WAIT_SEC
+export CR_USER_IDLE_SEC CR_BUSY_IDLE_SEC CR_VERIFY_SEC CR_SCRAPE CR_LOG CR_NOTIFY
+export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC
 
-exec "$CW_PYTHON_BIN" -c "$CW_PY" "$@"
+exec "$CR_PYTHON_BIN" -c "$CR_PY" "$@"
