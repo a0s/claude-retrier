@@ -24,12 +24,20 @@ if [ "${#files[@]}" -eq 0 ]; then
          test_degrade.py test_custom_command.py test_pty.py)
 fi
 
+out=$(mktemp)
+trap 'rm -f "$out"' EXIT
+
 for f in "${files[@]}"; do
   echo "=== $f"
-  "$PY" "$f" 2>&1 | tail -3
-  # tail hides the exit status, so ask the pipeline for the first command's one.
-  status=${PIPESTATUS[0]}
-  [ "$status" -eq 0 ] || fail=1
+  if "$PY" "$f" >"$out" 2>&1; then
+    tail -3 "$out"
+  else
+    # A summary is enough when everything passes; when something fails, the whole
+    # output is the only thing that matters — especially on a CI runner, where
+    # there is no second chance to reproduce it interactively.
+    cat "$out"
+    fail=1
+  fi
 done
 
 if [ "$fail" -eq 0 ]; then

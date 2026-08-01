@@ -32,6 +32,8 @@ jobs:
           bash --version | head -1
           zsh --version
           python3 --version
+          echo "SHELL=${SHELL:-unset} HOME=$HOME TERM=${TERM:-unset}"
+          echo "sh -> $(readlink -f /bin/sh)"
 
       - name: Run the suite
         run: ./test/run.sh
