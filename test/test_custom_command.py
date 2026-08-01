@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -221,6 +222,24 @@ class CommandShapes(unittest.TestCase):
         open(dud, "w").close()
         r = run(["--cmd", dud, "-p", "hi"], self.rig.env())
         self.assertEqual(r.returncode, 127)
+
+    @unittest.skipUnless(has("zsh"), "no zsh")
+    def test_an_rc_file_that_blocks_does_not_take_the_session_with_it(self):
+        # zsh's compinit stops on "insecure directories … [y/n]?" and reads the
+        # answer from /dev/tty — the terminal the user is sitting at. Waiting on
+        # that forever is a session that never starts, which is the one failure
+        # this wrapper is not allowed to have.
+        with open(os.path.join(self.rig.zdotdir, ".zshrc"), "a") as fh:
+            fh.write("sleep 60\n")
+        start = time.monotonic()
+        r = run(["--cmd", "claude-work", "-p", "hi"],
+                self.rig.env("zsh", CR_PROBE_TIMEOUT_SEC="2"), timeout=45)
+        elapsed = time.monotonic() - start
+
+        self.assertEqual(r.returncode, 127)
+        self.assertIn("did not answer", r.stderr)
+        # One probe's worth of waiting, not one per question asked.
+        self.assertLess(elapsed, 20, "took %.1fs: %s" % (elapsed, r.stderr))
 
     def test_the_flag_needs_an_argument(self):
         r = run(["--cmd"], self.rig.env())

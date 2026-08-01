@@ -246,6 +246,44 @@ cr_is_bare_word() {
   esac
 }
 
+# An rc file is arbitrary code, and some of it asks questions: zsh's compinit
+# stops on "insecure directories … [y/n]?" and reads the answer straight from
+# /dev/tty, which is the terminal our caller is sitting at. Inheriting that hang
+# would mean a session that never starts — the one failure this wrapper must not
+# have — so every probe runs detached from stdin and on a leash.
+: "${CR_PROBE_TIMEOUT_SEC:=5}"
+
+cr_probe() {
+  local tmp rc pid waited=0 limit=$((CR_PROBE_TIMEOUT_SEC * 10))
+  tmp=$(mktemp 2>/dev/null) || return 1
+  "$@" >"$tmp" 2>/dev/null </dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$limit" ]; then
+      kill -9 "$pid" 2>/dev/null
+      wait "$pid" 2>/dev/null
+      rm -f "$tmp"
+      return 124
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  wait "$pid"; rc=$?
+  cat "$tmp"
+  rm -f "$tmp"
+  return "$rc"
+}
+
+# Skip the system-wide rc when asking zsh about a name. On a stock Ubuntu (and on
+# GitHub's runners) /etc/zsh/zshrc is where compinit lives, while the alias we are
+# asking about is by definition in the user's own file. bash has no equivalent
+# switch, but also no equivalent prompt.
+cr_probe_flags() {
+  case "${1##*/}" in
+    zsh) printf '%s' '--no-globalrcs' ;;
+  esac
+}
+
 # The body of an alias, asked of the shell that defines it. Returning the body
 # rather than running the alias through `sh -i` keeps the interactive shell out of
 # the final exec: one less process between us and claude, and no "no job control
@@ -253,9 +291,15 @@ cr_is_bare_word() {
 # bash 3.2 (the /bin/bash macOS still ships) has no BASH_ALIASES and returns
 # nothing here — the interactive path below covers it.
 cr_alias_body() {   # $1 = shell, $2 = name
-  local body
-  body=$("$1" -ic 'if [ -n "${ZSH_VERSION:-}" ]; then print -r -- "${aliases[$1]:-}"
-                   else printf "%s" "${BASH_ALIASES[$1]:-}"; fi' cr-probe "$2" 2>/dev/null) || return 1
+  local body flags rc
+  flags=$(cr_probe_flags "$1")
+  body=$(cr_probe "$1" ${flags:+$flags} -ic \
+         'if [ -n "${ZSH_VERSION:-}" ]; then print -r -- "${aliases[$1]:-}"
+          else printf "%s" "${BASH_ALIASES[$1]:-}"; fi' cr-probe "$2")
+  rc=$?
+  # 124 (the probe timed out) has to survive: it means the shell is stuck, which
+  # the caller handles differently from "this name is not an alias".
+  [ "$rc" -eq 0 ] || return "$rc"
   [ -n "$body" ] || return 1
   printf '%s' "$body"
 }
@@ -266,9 +310,11 @@ cr_alias_body() {   # $1 = shell, $2 = name
 # (CI, a container, a cron job) it contends for the terminal it has just been
 # handed and can hang there, which is a session that never starts.
 cr_function_def() {   # $1 = shell, $2 = name
-  local def
-  def=$("$1" -ic 'if [ -n "${ZSH_VERSION:-}" ]; then typeset -f -- "$1"
-                  else declare -f -- "$1"; fi' cr-probe "$2" 2>/dev/null) || return 1
+  local def flags
+  flags=$(cr_probe_flags "$1")
+  def=$(cr_probe "$1" ${flags:+$flags} -ic \
+        'if [ -n "${ZSH_VERSION:-}" ]; then typeset -f -- "$1"
+         else declare -f -- "$1"; fi' cr-probe "$2") || return 1
   [ -n "$def" ] || return 1
   printf '%s' "$def"
 }
@@ -285,9 +331,11 @@ cr_function_def() {   # $1 = shell, $2 = name
 # else. It is only reached when the cheap paths miss, so the usual case pays
 # nothing for it.
 CR_ARGV=()
+CR_RESOLVE_ERR=""        # "timeout" when the shell never answered
 cr_resolve_cmd() {
   local spec="$1" p sh
   CR_ARGV=()
+  CR_RESOLVE_ERR=""
 
   if [ -z "$spec" ]; then
     p=$(cr_find_claude) || return 1
@@ -314,11 +362,15 @@ cr_resolve_cmd() {
     # out of it here, once, and the shell we actually exec can be non-interactive.
     # "$@" carries the claude arguments through untouched — no re-quoting, no
     # word-splitting of anything the user did not write themselves.
-    local body def
-    if body=$(cr_alias_body "$sh" "$spec"); then
+    local body def rc
+    body=$(cr_alias_body "$sh" "$spec"); rc=$?
+    if [ "$rc" -eq 0 ]; then
       CR_ARGV=("$sh" -c "$body \"\$@\"" "$spec")
       return 0
     fi
+    # A shell that did not answer the first question will not answer the next two
+    # either; asking anyway just multiplies the wait the user sits through.
+    if [ "$rc" -eq 124 ]; then CR_RESOLVE_ERR="timeout"; return 1; fi
     if def=$(cr_function_def "$sh" "$spec"); then
       CR_ARGV=("$sh" -c "$def
 $spec \"\$@\"" "$spec")
@@ -327,7 +379,10 @@ $spec \"\$@\"" "$spec")
     # Neither, on a shell that could tell us (bash 3.2 has no BASH_ALIASES). Fall
     # back to letting the interactive shell run it, but probe first so a typo
     # fails here with a clear message rather than inside the pty.
-    "$sh" -ic 'command -v -- "$1" >/dev/null 2>&1' cr-probe "$spec" >/dev/null 2>&1 || return 1
+    local flags
+    flags=$(cr_probe_flags "$sh")
+    cr_probe "$sh" ${flags:+$flags} -ic 'command -v -- "$1" >/dev/null 2>&1' \
+             cr-probe "$spec" >/dev/null || return 1
     CR_ARGV=("$sh" -ic "$spec \"\$@\"" "$spec")
     return 0
   fi
@@ -1355,7 +1410,12 @@ esac
 
 # ---- degrade paths: any of these and we run claude untouched -----------------
 cr_resolve_cmd "$CR_CMD_SPEC" || {
-  if [ -n "$CR_CMD_SPEC" ]; then
+  if [ "$CR_RESOLVE_ERR" = "timeout" ]; then
+    echo "claude-retrier: your shell did not answer within ${CR_PROBE_TIMEOUT_SEC}s when asked" >&2
+    echo "about '$CR_CMD_SPEC'. An rc file that prompts (zsh's compinit asks about insecure" >&2
+    echo "directories) will do that. Name a path or a full command line instead, or raise" >&2
+    echo "CR_PROBE_TIMEOUT_SEC." >&2
+  elif [ -n "$CR_CMD_SPEC" ]; then
     echo "claude-retrier: cannot run '$CR_CMD_SPEC' — not a runnable file, and your" >&2
     echo "shell does not know it as a command, alias or function" >&2
   else

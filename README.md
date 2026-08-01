@@ -110,7 +110,7 @@ reason your session won't start.
 ## Tests
 
 ```sh
-./test/run.sh              # 127 tests: patterns, time parsing, transcript, state
+./test/run.sh              # 129 tests: patterns, time parsing, transcript, state
                            # machine, custom commands, degradation, and end-to-end
                            # runs on a real pty
 ./test/run.sh --docker     # the same suite on Linux, from anywhere with docker
