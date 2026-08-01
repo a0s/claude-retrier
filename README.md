@@ -1,3 +1,8 @@
+<p align="center">
+  <img src="docs/banner.webp" width="900"
+       alt="A laptop at night showing 'limit reached - resets 3pm', and below it the wrapper typing 'continue'">
+</p>
+
 # claude-retrier
 
 [![test](https://github.com/a0s/claude-retrier/actions/workflows/test.yml/badge.svg)](https://github.com/a0s/claude-retrier/actions/workflows/test.yml)
