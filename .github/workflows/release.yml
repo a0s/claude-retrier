@@ -96,9 +96,14 @@ jobs:
           set -eu
           tag='${{ steps.v.outputs.tag }}'
           title='claude-retrier ${{ steps.v.outputs.version }}'
+          # gh marks whatever it publishes last as "Latest", so backfilling an
+          # old tag would otherwise present 1.0.0 as the current version.
+          latest='--latest'
+          [ -z '${{ github.event.inputs.tag }}' ] || latest='--latest=false'
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release edit "$tag" --title "$title" --notes-file notes.md
+            gh release edit "$tag" --title "$title" --notes-file notes.md $latest
             gh release upload "$tag" dist/claude-retrier.sh --clobber
           else
-            gh release create "$tag" dist/claude-retrier.sh --title "$title" --notes-file notes.md
+            gh release create "$tag" dist/claude-retrier.sh --title "$title" \
+              --notes-file notes.md $latest
           fi
