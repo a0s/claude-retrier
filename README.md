@@ -36,30 +36,30 @@ was touched: no shell rc edits, no launch agents, no background process.
 
 Most people do not run stock `claude` for long. There is a `claude-work` and a
 `claude-personal`, or an alias in `~/.zshrc` that pins a model, or a function that
-sets a settings file first. Name yours with `--cr-cmd` and the wrapper runs it:
+sets a settings file first. Name yours with `--cmd` and the wrapper runs it:
 
 ```sh
-claude-retrier --cr-cmd claude-work                    # binary, or a name on PATH
-claude-retrier --cr-cmd ~/bin/claude-personal          # a path to anything runnable
-claude-retrier --cr-cmd 'claude --model opus'          # a whole command line
-claude-retrier --cr-cmd my-claude-alias                # an alias from your ~/.zshrc
-claude-retrier --cr-cmd my-claude-function             # a shell function, likewise
+claude-retrier --cmd claude-work                    # binary, or a name on PATH
+claude-retrier --cmd ~/bin/claude-personal          # a path to anything runnable
+claude-retrier --cmd 'claude --model opus'          # a whole command line
+claude-retrier --cmd my-claude-alias                # an alias from your ~/.zshrc
+claude-retrier --cmd my-claude-function             # a shell function, likewise
 ```
 
 An alias or a function exists nowhere except inside an interactive shell that has
 read your rc file, so that is where the wrapper looks when the name is not a file
 it can run directly — once, at startup, lifting out the definition so that the
-session itself runs from a plain shell. `claude-retrier --cr-cmd X --cr-dump-argv`
+session itself runs from a plain shell. `claude-retrier --cmd X --cr-dump-argv`
 prints exactly what will be executed. Set `CR_CLAUDE_CMD` instead of passing the
 flag every time:
 
 ```sh
-alias claude='claude-retrier --cr-cmd claude-work'     # in ~/.zshrc
-export CR_CLAUDE_CMD=claude-work                       # or, once, in your env
+alias claude='claude-retrier --cmd claude-work'     # in ~/.zshrc
+export CR_CLAUDE_CMD=claude-work                    # or, once, in your env
 ```
 
-Everything after the command is claude's own — `claude-retrier --cr-cmd claude-work
---resume` resumes, and a bare prompt stays a prompt. With no `--cr-cmd` at all the
+Everything after the command is claude's own — `claude-retrier --cmd claude-work
+--resume` resumes, and a bare prompt stays a prompt. With no `--cmd` at all the
 wrapper finds `claude` the way your shell would.
 
 ## How it works
@@ -88,7 +88,7 @@ All optional, all environment variables:
 
 | variable | default | |
 |---|---|---|
-| `CR_CLAUDE_CMD` | | your claude command (same as `--cr-cmd`) |
+| `CR_CLAUDE_CMD` | | your claude command (same as `--cmd`) |
 | `CR_MESSAGE` | `continue` | what to type when the limit lifts |
 | `CR_MARGIN_SEC` | `45` | extra wait past the stated reset time |
 | `CR_MAX_ATTEMPTS` | `3` | sends per incident before giving up |
@@ -110,7 +110,7 @@ reason your session won't start.
 ## Tests
 
 ```sh
-./test/run.sh              # 124 tests: patterns, time parsing, transcript, state
+./test/run.sh              # 127 tests: patterns, time parsing, transcript, state
                            # machine, custom commands, degradation, and end-to-end
                            # runs on a real pty
 ./test/run.sh --docker     # the same suite on Linux, from anywhere with docker

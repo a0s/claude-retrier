@@ -8,11 +8,11 @@
 # falls out as unnecessary.
 #
 # Usage:  claude-retrier.sh [claude args...]
-#         claude-retrier.sh --cr-cmd <your-claude> [claude args...]
+#         claude-retrier.sh --cmd <your-claude> [claude args...]
 #         claude-retrier.sh --cr-dump-python      # print the embedded Python (used by tests)
 #         claude-retrier.sh --cr-version
 #
-# `--cr-cmd` (or CR_CLAUDE_CMD) is whatever YOU type to start Claude: a binary, a
+# `--cmd` (or CR_CLAUDE_CMD) is whatever YOU type to start Claude: a binary, a
 # script, a name on PATH, an alias or shell function from your ~/.zshrc, or a whole
 # command line. Anything the wrapper cannot exec itself is run through your login
 # shell, so rc-file aliases work exactly as they do when you type them.
@@ -169,16 +169,21 @@ case "${1:-}" in
     exit 0 ;;
 esac
 
-# `--cr-cmd <command>` — the user's own way of starting Claude. Leading position
+# `--cmd <command>` — the user's own way of starting Claude. Leading position
 # only: everything after it belongs to claude, and claude takes a bare prompt as
 # its first argument, so a positional guess would eat the prompt of anyone typing
 # `claude-retrier.sh "fix the bug"`.
+#
+# `--cr-cmd` is the same flag under the prefix every other wrapper option carries.
+# It stays because it is the unambiguous spelling: should claude ever grow a
+# `--cmd` of its own, that one is still reachable through the prefixed form.
 CR_CMD_SPEC="$CR_CLAUDE_CMD"
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --cr-cmd)
-      [ "$#" -ge 2 ] || { echo "claude-retrier: --cr-cmd needs a command" >&2; exit 2; }
+    --cmd|--cr-cmd)
+      [ "$#" -ge 2 ] || { echo "claude-retrier: $1 needs a command" >&2; exit 2; }
       CR_CMD_SPEC="$2"; shift 2 ;;
+    --cmd=*) CR_CMD_SPEC="${1#--cmd=}"; shift ;;
     --cr-cmd=*) CR_CMD_SPEC="${1#--cr-cmd=}"; shift ;;
     *) break ;;
   esac
