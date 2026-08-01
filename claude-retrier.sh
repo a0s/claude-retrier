@@ -17,11 +17,14 @@
 # command line. Anything the wrapper cannot exec itself is run through your login
 # shell, so rc-file aliases work exactly as they do when you type them.
 #
+# While it runs there is a dim `◆ cr` in a corner of the screen — the wrapper's
+# only visible output. CR_BADGE=0 removes it.
+#
 # Set CR_DISABLE=1 to bypass the wrapper entirely.
 
 set -u
 
-CR_VERSION="1.1.0"
+CR_VERSION="1.2.0"
 
 # =============================================================================
 # SECTION 1 — DETECTION PATTERNS
@@ -149,6 +152,9 @@ CR_IGNORE_PATTERNS=(
 : "${CR_SCRAPE:=auto}"                 # auto | always | never  (screen-scrape fallback)
 : "${CR_LOG:=$HOME/.claude-retrier/log}"
 : "${CR_NOTIFY:=1}"                    # print a one-line status note into the terminal
+: "${CR_BADGE:=1}"                     # dim marker in a screen corner: "we are here"
+: "${CR_BADGE_POS:=bottom-right}"      # bottom-right | bottom-left | top-right | top-left
+: "${CR_BADGE_LABEL:=cr}"              # the word drawn next to the mark
 : "${CR_WAIT_SCALE:=1}"                # divide every wait by this (tests use 3600)
 : "${CR_CLAUDE_BIN:=}"                 # override the claude binary (a file, nothing else)
 : "${CR_CLAUDE_CMD:=}"                 # YOUR claude command: binary, PATH name, alias,
@@ -477,6 +483,9 @@ CFG = dict(
     scrape=_env("CR_SCRAPE", "auto"),
     log=_env("CR_LOG", os.path.expanduser("~/.claude-retrier/log")),
     notify=_env("CR_NOTIFY", "1") == "1",
+    badge=_env("CR_BADGE", "1") == "1",
+    badge_pos=_env("CR_BADGE_POS", "bottom-right"),
+    badge_label=_env("CR_BADGE_LABEL", "cr"),
     wait_scale=max(1e-6, _env("CR_WAIT_SCALE", 1.0, float)),
     poll=_env("CR_POLL_SEC", 2.0, float),
     scrape_confirm=_env("CR_SCRAPE_CONFIRM_SEC", 3.0, float),
@@ -1004,6 +1013,123 @@ class Controller:
 
 
 # --------------------------------------------------------------------------- #
+# status badge — a dim mark in a corner, the wrapper's only visible pixel
+# --------------------------------------------------------------------------- #
+# Claude Code owns the screen and repaints it several times a second, so nothing
+# can be reserved from it: no scroll region (the TUI does not know about one and
+# would lay out against the wrong height), no extra line (it would scroll away).
+# What is left is to paint OVER the finished frame and let it be overwritten —
+# the badge is re-drawn a moment after every repaint, which costs ~40 bytes and
+# never touches the byte stream Claude reads.
+#
+# Two rules keep it from corrupting the render:
+#   * only in the quiet gap after Claude stopped writing (QUIET), and never while
+#     a control sequence of Claude's is still half-received;
+#   * cursor saved and restored around the write, and the rightmost column left
+#     empty so that a character in the last cell can never trigger a scroll.
+def human_left(secs):
+    """Coarse on purpose: a countdown that ticks every second is a distraction."""
+    secs = max(0, int(secs + 0.5))
+    if secs >= 3600:
+        return "%dh%02dm" % (secs // 3600, (secs % 3600) // 60)
+    if secs >= 60:
+        return "%dm" % (secs // 60)
+    return "%ds" % secs
+
+
+BADGE_POSITIONS = ("bottom-right", "bottom-left", "top-right", "top-left")
+
+
+class Badge:
+    MARK = "◆"
+    MARK_ALT = "◇"
+    PULSE = 1.6            # seconds per half-blink while waiting
+    QUIET = 0.12           # output has to have stopped for this long
+    MIN_INTERVAL = 0.15    # hard floor on repaint rate
+
+    def __init__(self, cfg):
+        self.enabled = bool(cfg["badge"])
+        self.pos = cfg["badge_pos"] if cfg["badge_pos"] in BADGE_POSITIONS else "bottom-right"
+        self.label = cfg["badge_label"]
+        self.last_output = 0.0
+        self.last_paint = -1e9
+        self.painted = None      # text currently on screen, None when nothing is
+        self.pending = True      # claude drew something since we last painted
+
+    # -- what it says ------------------------------------------------------- #
+    def frame(self, state, remaining, attempts, max_attempts, now):
+        """(text, sgr) for a controller state. Pure, so the tests can drive it."""
+        mark = self.MARK
+        if state == WAITING:
+            # A blink is the difference between "waiting" and "dead", and it is
+            # the only motion the badge ever has.
+            if int(now / self.PULSE) % 2:
+                mark = self.MARK_ALT
+            return ("%s %s %s" % (mark, self.label, human_left(remaining)), "2;33")
+        if state == VERIFY:
+            return ("%s %s %d/%d" % (mark, self.label, attempts, max_attempts), "2;36")
+        if state == DONE:
+            return ("%s %s stopped" % (mark, self.label), "2;31")
+        return ("%s %s" % (mark, self.label), "2")
+
+    # -- when it says it ---------------------------------------------------- #
+    def note_output(self, now):
+        self.last_output = now
+        self.pending = True
+
+    def due(self, text, now, blocked=False):
+        if not self.enabled or blocked:
+            return False
+        if now - self.last_paint < self.MIN_INTERVAL:
+            return False
+        if now - self.last_output < self.QUIET:
+            return False       # claude is mid-frame; painting now could split it
+        return self.pending or text != self.painted
+
+    # -- where it goes ------------------------------------------------------ #
+    def place(self, rows, cols, width):
+        """(row, col), 1-based, or None if the terminal is too small to bother."""
+        if rows < 2 or cols < width + 2:
+            return None
+        row = rows if self.pos.startswith("bottom") else 1
+        # cols - width leaves the last cell untouched: writing into it is what
+        # makes a terminal wrap and scroll the whole screen by one line.
+        col = (cols - width) if self.pos.endswith("right") else 1
+        return (row, max(1, col))
+
+    def sequence(self, rows, cols, text, sgr):
+        spot = self.place(rows, cols, len(text))
+        if spot is None:
+            return None
+        row, col = spot
+        # DECSC/DECRC rather than CSI s/u: it saves the SGR state too, so the
+        # colour used here cannot leak into whatever claude draws next.
+        return ("\x1b7\x1b[%d;%dH\x1b[%sm%s\x1b[0m\x1b8" % (row, col, sgr, text)).encode()
+
+    def paint(self, fd, rows, cols, state, remaining, attempts, max_attempts, now,
+              blocked=False):
+        text, sgr = self.frame(state, remaining, attempts, max_attempts, now)
+        if not self.due(text, now, blocked):
+            return False
+        seq = self.sequence(rows, cols, text, sgr)
+        if seq is None:
+            return False
+        self.last_paint = now
+        self.pending = False
+        self.painted = text
+        return write_all(fd, seq)
+
+    def erase(self, fd, rows, cols):
+        """Take it back off the screen on the way out."""
+        if not self.enabled or not self.painted:
+            return
+        seq = self.sequence(rows, cols, " " * len(self.painted), "0")
+        if seq:
+            write_all(fd, seq)
+        self.painted = None
+
+
+# --------------------------------------------------------------------------- #
 # pty plumbing
 # --------------------------------------------------------------------------- #
 def write_all(fd, data):
@@ -1194,6 +1320,9 @@ def main(argv):
             pass
 
     ctl = Controller(CFG, log)
+    badge = Badge(CFG)
+    if not interactive:
+        badge.enabled = False      # nothing to paint on when stdout is a pipe
     watcher = TranscriptWatcher(project_dir(), CFG["poll"])
     scrape_allowed = CFG["scrape"] in ("auto", "always")
     window = ""            # rolling, ansi-stripped view of what claude just drew
@@ -1215,6 +1344,7 @@ def main(argv):
             os.write(stdout_fd, ("\r\x1b[2m[claude-retrier] %s\x1b[0m\r\n" % msg).encode())
         except Exception:
             pass
+        badge.pending = True       # the line just scrolled the badge away
 
     def schedule_injection(text, dismiss_menu, now):
         """Type like a human, not like a paste.
@@ -1236,12 +1366,19 @@ def main(argv):
         while True:
             if resized[0]:
                 resized[0] = False
-                set_winsize(master, *get_winsize(stdout_fd))
+                rows, cols = get_winsize(stdout_fd)
+                set_winsize(master, rows, cols)
+                badge.painted = None       # the corner it lived in has moved
+                badge.pending = True
 
             now = time.time()
             timeout = 0.25
             for due, _ in pending:
                 timeout = min(timeout, max(0.0, due - now))
+            if badge.enabled:
+                # Wake up for the badge too, or a session that goes quiet keeps a
+                # stale countdown on screen until claude happens to print again.
+                timeout = min(timeout, badge.QUIET)
 
             rlist = [master] + ([stdin_fd] if watch_stdin else [])
             try:
@@ -1262,6 +1399,7 @@ def main(argv):
                 if not data:
                     break
                 write_all(stdout_fd, data)
+                badge.note_output(now)
                 text, esc_carry = split_escape_tail(
                     esc_carry + data.decode("utf-8", "replace"))
                 chunk = strip_ansi(text)
@@ -1326,6 +1464,14 @@ def main(argv):
                         stay.append((due, payload))
                 pending = stay
 
+            if badge.enabled:
+                badge.paint(stdout_fd, rows, cols, ctl.state,
+                            max(0.0, ctl.wake_at - now), ctl.attempts,
+                            CFG["max_attempts"], now,
+                            # A half-received sequence of claude's is already in
+                            # the terminal; anything written now lands inside it.
+                            blocked=bool(esc_carry))
+
             try:
                 done, status = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
@@ -1347,6 +1493,10 @@ def main(argv):
                     pass
                 break
     finally:
+        try:
+            badge.erase(stdout_fd, rows, cols)
+        except Exception:
+            pass
         try:
             signal.signal(signal.SIGWINCH, old_winch)
         except Exception:
@@ -1454,6 +1604,7 @@ CR_CLAUDE_ARGV=$(printf '%s\037' "${CR_ARGV[@]}")
 export CR_CLAUDE_RESOLVED CR_CLAUDE_ARGV CLAUDE_RETRIER_ACTIVE=1
 export CR_MESSAGE CR_MARGIN_SEC CR_MAX_ATTEMPTS CR_FALLBACK_WAIT_SEC CR_MAX_WAIT_SEC
 export CR_USER_IDLE_SEC CR_BUSY_IDLE_SEC CR_VERIFY_SEC CR_SCRAPE CR_LOG CR_NOTIFY
+export CR_BADGE CR_BADGE_POS CR_BADGE_LABEL
 export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC
 
 exec "$CR_PYTHON_BIN" -c "$CR_PY" "$@"

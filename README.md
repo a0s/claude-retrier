@@ -34,6 +34,10 @@ curl -fsSLO https://raw.githubusercontent.com/a0s/claude-retrier/main/claude-ret
 chmod +x claude-retrier.sh
 ```
 
+Every version is also attached to a
+[release](https://github.com/a0s/claude-retrier/releases), with the notes for it
+in [CHANGELOG.md](CHANGELOG.md).
+
 Uninstall is `brew uninstall claude-retrier`, or deleting the file. Nothing else
 was touched: no shell rc edits, no launch agents, no background process.
 
@@ -102,6 +106,34 @@ is never overwritten.
 Nothing is installed into your shell, no background process is left behind, and the
 only thing written under your home directory is the log.
 
+## A sign of life
+
+A wrapper you cannot see is indistinguishable from a wrapper that died an hour
+ago. So there is one mark, dim, in a corner of the screen: `◆ cr` while it is
+watching, and the time left while it is waiting out a limit.
+
+<p align="center">
+  <img src="docs/badge.svg" width="620"
+       alt="Two terminal frames: an idle session with a dim '◆ cr' in the bottom-right corner, and the same session after a limit, showing '◆ cr 1h59m'">
+</p>
+
+Nothing is reserved from Claude: the badge is painted over the finished frame in
+the gaps between repaints, cursor saved and restored around it, and the last
+column is left empty so it can never wrap the screen. Claude paints over it, it
+comes back a moment later — about forty bytes, a few times a second at most, and
+never a byte into the session itself.
+
+```sh
+CR_BADGE=0 claude-retrier                  # off
+CR_BADGE_POS=top-right claude-retrier      # any of the four corners
+CR_BADGE_LABEL=retrier claude-retrier      # your own word next to the mark
+```
+
+The picture above is not a mockup: `python3 docs/badge-shot.py` runs the real
+wrapper over a stand-in that prints one Claude-shaped frame, replays what the
+wrapper wrote through the terminal emulator the tests use, and renders the
+screen that came out.
+
 ## Configuration
 
 All optional, all environment variables:
@@ -114,6 +146,9 @@ All optional, all environment variables:
 | `CR_MAX_ATTEMPTS` | `3` | sends per incident before giving up |
 | `CR_USER_IDLE_SEC` | `20` | don't type while you are typing |
 | `CR_SCRAPE` | `auto` | `auto` \| `always` \| `never` |
+| `CR_BADGE` | `1` | `0` hides the corner mark |
+| `CR_BADGE_POS` | `bottom-right` | also `bottom-left`, `top-right`, `top-left` |
+| `CR_BADGE_LABEL` | `cr` | the word next to the mark |
 | `CR_SHELL` | `$SHELL` | shell that knows your aliases |
 | `CR_LOG` | `~/.claude-retrier/log` | |
 | `CR_DISABLE` | | `1` runs plain claude |
@@ -130,9 +165,10 @@ reason your session won't start.
 ## Tests
 
 ```sh
-./test/run.sh              # 129 tests: patterns, time parsing, transcript, state
-                           # machine, custom commands, degradation, and end-to-end
-                           # runs on a real pty
+./test/run.sh              # 161 tests: patterns, time parsing, transcript, state
+                           # machine, the badge, custom commands, degradation, and
+                           # end-to-end runs on a real pty (rendered through a
+                           # terminal emulator, so "what the user sees" is asserted)
 ./test/run.sh --docker     # the same suite on Linux, from anywhere with docker
 ./test/run.sh test_time.py # just one file
 ```

@@ -21,7 +21,7 @@ fail=0
 files=("$@")
 if [ "${#files[@]}" -eq 0 ]; then
   files=(test_patterns.py test_time.py test_transcript.py test_controller.py
-         test_degrade.py test_custom_command.py test_pty.py)
+         test_badge.py test_degrade.py test_custom_command.py test_pty.py)
 fi
 
 out=$(mktemp)

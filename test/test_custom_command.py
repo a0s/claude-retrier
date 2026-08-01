@@ -82,7 +82,10 @@ class Rig:
 
 
 def run(args, env, timeout=30):
-    full = dict(os.environ)
+    # CR_* and CLAUDE_RETRIER_ACTIVE from a wrapped caller would configure the
+    # very wrapper under test; start from a clean environment.
+    full = {k: v for k, v in os.environ.items()
+            if not k.startswith("CR_") and k != "CLAUDE_RETRIER_ACTIVE"}
     full.update(env)
     return subprocess.run([WRAP, *args], env=full, stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, timeout=timeout)

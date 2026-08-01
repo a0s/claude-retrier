@@ -23,8 +23,22 @@ def launcher(dirpath, body=None):
     return path
 
 
+def clean_env():
+    """os.environ minus anything a wrapped session would have exported.
+
+    Running the suite from inside a claude-retrier session leaves
+    CLAUDE_RETRIER_ACTIVE=1 in the environment, which is a legitimate instruction
+    to the wrapper — degrade, do not stack a second supervisor. Every wrapper
+    started here would obey it, and the tests would be measuring the caller's
+    session instead of the code.
+    """
+    return {k: v for k, v in os.environ.items()
+            if not k.startswith("CR_")
+            and k not in ("CLAUDE_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+
+
 def run(args=(), env=None, stdin=subprocess.DEVNULL, timeout=30):
-    full = dict(os.environ)
+    full = clean_env()
     full.setdefault("CR_NOTIFY", "0")
     full.update(env or {})
     return subprocess.run([WRAP, *args], env=full, stdin=stdin,
@@ -47,6 +61,15 @@ class TestCli(unittest.TestCase):
 
     def test_shell_syntax_is_valid_under_bash(self):
         self.assertEqual(subprocess.run(["bash", "-n", WRAP]).returncode, 0)
+
+    def test_the_version_matches_the_changelog(self):
+        # The release workflow refuses a tag that disagrees with either of these,
+        # so a mismatch is a release that cannot be cut — better found here.
+        import re
+        version = run(["--cr-version"]).stdout.split()[-1]
+        with open(os.path.join(ROOT, "CHANGELOG.md")) as fh:
+            newest = re.search(r"^## \[(\d+\.\d+\.\d+)\]", fh.read(), re.M).group(1)
+        self.assertEqual(version, newest)
 
 
 class TestDegradation(unittest.TestCase):
@@ -115,7 +138,7 @@ class TestDegradation(unittest.TestCase):
 
     def test_it_works_without_a_tty_at_all(self):
         # Piped stdin/stdout: the supervisor still runs, just with no raw mode.
-        r = subprocess.run([WRAP], env={**os.environ, **self.env(), "CR_NOTIFY": "0"},
+        r = subprocess.run([WRAP], env={**clean_env(), **self.env(), "CR_NOTIFY": "0"},
                            input="quit\n", capture_output=True, text=True, timeout=25)
         self.assertIn("fake-claude ready", r.stdout)
         self.assertTrue(self.supervised())

@@ -31,7 +31,15 @@ def pattern_env():
 
 
 def load(**overrides):
-    """Import the embedded Python as a module, with config from the environment."""
+    """Import the embedded Python as a module, with config from the environment.
+
+    Inherited CR_* settings are dropped first: a suite run from inside a wrapped
+    session would otherwise be testing the caller's tuning (and its
+    CLAUDE_RETRIER_ACTIVE) rather than the defaults that ship.
+    """
+    for k in [k for k in os.environ if k.startswith("CR_")]:
+        del os.environ[k]
+    os.environ.pop("CLAUDE_RETRIER_ACTIVE", None)
     for k, v in pattern_env().items():
         os.environ[k] = v
     for k, v in overrides.items():

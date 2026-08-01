@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="590" height="622" viewBox="0 0 590 622" font-family="ui-monospace,SFMono-Regular,Menlo,Consolas,monospace" font-size="14">
+<rect width="100%" height="100%" fill="#0d1117"/>
+<rect x="6" y="8.0" width="578.4" height="289.0" rx="10" fill="#161a20" stroke="#2b313b"/>
+<circle cx="24" cy="26.0" r="5" fill="#ff5f57"/>
+<circle cx="42" cy="26.0" r="5" fill="#febc2e"/>
+<circle cx="60" cy="26.0" r="5" fill="#28c840"/>
+<text x="100" y="30.0" fill="#8b93a1" font-size="12">watching · nothing to do</text>
+<text x="18.0" y="70.0" fill="#98c379" fill-opacity="1" font-weight="normal" xml:space="preserve">⏺</text>
+<text x="26.4" y="70.0" fill="#c8ccd4" fill-opacity="1" font-weight="normal" xml:space="preserve"> Running the migration now.</text>
+<text x="18.0" y="108.0" fill="#56b6c2" fill-opacity="1" font-weight="normal" xml:space="preserve">⏺</text>
+<text x="26.4" y="108.0" fill="#c8ccd4" fill-opacity="1" font-weight="normal" xml:space="preserve"> Bash(pytest -q)</text>
+<text x="34.8" y="127.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">⎿  128 passed in 4.2s</text>
+<text x="18.0" y="165.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">╭────────────────────────────────────────────────────────────╮</text>
+<text x="18.0" y="184.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">│</text>
+<text x="26.4" y="184.0" fill="#c8ccd4" fill-opacity="1" font-weight="normal" xml:space="preserve"> &gt;</text>
+<text x="18.0" y="203.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">╰────────────────────────────────────────────────────────────╯</text>
+<text x="34.8" y="222.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">? for shortcuts</text>
+<text x="530.4" y="279.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">◆ cr</text>
+<rect x="524.4" y="265.0" width="45.6" height="19" rx="6" fill="none" stroke="#e5c07b" stroke-opacity="0.55" stroke-width="1.2" stroke-dasharray="3 3"/>
+<rect x="6" y="315.0" width="578.4" height="289.0" rx="10" fill="#161a20" stroke="#2b313b"/>
+<circle cx="24" cy="333.0" r="5" fill="#ff5f57"/>
+<circle cx="42" cy="333.0" r="5" fill="#febc2e"/>
+<circle cx="60" cy="333.0" r="5" fill="#28c840"/>
+<text x="100" y="337.0" fill="#8b93a1" font-size="12">limit hit · waiting for the reset</text>
+<text x="18.0" y="377.0" fill="#98c379" fill-opacity="1" font-weight="normal" xml:space="preserve">⏺</text>
+<text x="26.4" y="377.0" fill="#c8ccd4" fill-opacity="1" font-weight="normal" xml:space="preserve"> Running the migration now.</text>
+<text x="18.0" y="415.0" fill="#56b6c2" fill-opacity="1" font-weight="normal" xml:space="preserve">⏺</text>
+<text x="26.4" y="415.0" fill="#c8ccd4" fill-opacity="1" font-weight="normal" xml:space="preserve"> Bash(pytest -q)</text>
+<text x="34.8" y="434.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">⎿  128 passed in 4.2s</text>
+<text x="18.0" y="472.0" fill="#e5c07b" fill-opacity="1" font-weight="normal" xml:space="preserve">✗ You've hit your session limit · resets in 2 hours</text>
+<text x="18.0" y="510.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">╭────────────────────────────────────────────────────────────╮</text>
+<text x="18.0" y="529.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">│</text>
+<text x="26.4" y="529.0" fill="#c8ccd4" fill-opacity="1" font-weight="normal" xml:space="preserve"> &gt;</text>
+<text x="18.0" y="548.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">╰────────────────────────────────────────────────────────────╯</text>
+<text x="34.8" y="567.0" fill="#c8ccd4" fill-opacity="0.5" font-weight="normal" xml:space="preserve">? for shortcuts</text>
+<text x="480.0" y="586.0" fill="#e5c07b" fill-opacity="0.5" font-weight="normal" xml:space="preserve">◆ cr 1h59m</text>
+<rect x="474.0" y="572.0" width="96.0" height="19" rx="6" fill="none" stroke="#e5c07b" stroke-opacity="0.55" stroke-width="1.2" stroke-dasharray="3 3"/>
+</svg>

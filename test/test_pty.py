@@ -8,6 +8,7 @@ each of the two channels, without tmux anywhere in the picture.
 """
 import os
 import pty
+import re
 import select
 import shutil
 import signal
@@ -19,6 +20,8 @@ import termios
 import tempfile
 import time
 import unittest
+
+from screen import Screen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WRAP = os.path.join(ROOT, "claude-retrier.sh")
@@ -50,11 +53,17 @@ class Session:
     def __init__(self, env=None, args=(), rows=40, cols=120, cwd=None):
         self.master, slave = pty.openpty()
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-        full = dict(os.environ)
+        # A test run started from inside a wrapped session would inherit
+        # CLAUDE_RETRIER_ACTIVE=1 (and the caller's tuning), and every wrapper
+        # under test would dutifully degrade into a plain exec. Start clean.
+        full = {k: v for k, v in os.environ.items()
+                if not k.startswith("CR_")
+                and k not in ("CLAUDE_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
         full.update({
             "CR_CLAUDE_BIN": FAKE,
             "CR_LOG": os.path.join(tempfile.gettempdir(), "cr-pty-test.log"),
             "CR_NOTIFY": "0",
+            "CR_BADGE": "0",             # off unless a test is about the badge
             "PYTHONUNBUFFERED": "1",
         })
         full.update(env or {})
@@ -266,6 +275,120 @@ class TestScrapeChannel(PtyTestCase):
         self.assertNotIn("GOT:continue", s.buf)
         s.send("\r")                        # the human submits it themselves
         self.assertTrue(s.read_until("GOT:continue", timeout=20))
+
+
+class TestBadge(PtyTestCase):
+    """The corner badge, judged the way a user judges it: by what is on screen.
+
+    Every assertion here goes through a terminal emulator rather than the byte
+    stream, because the whole risk of painting into someone else's TUI is about
+    *where* the bytes land — a badge that greps fine but scrolls the screen or
+    strands the cursor is a regression, not a feature.
+    """
+
+    ROWS, COLS = 40, 120
+
+    def screen(self, session, rows=None, cols=None):
+        s = Screen(rows or self.ROWS, cols or self.COLS)
+        s.feed(session.buf)
+        return s
+
+    def running(self, **env):
+        e = {"CR_BADGE": "1"}
+        e.update(env)
+        s = self.session(env=e, rows=self.ROWS, cols=self.COLS)
+        self.assertTrue(s.read_until("winsize"))
+        s.drain(1.0)                      # let the badge settle after the frame
+        return s
+
+    def test_it_is_painted_in_the_bottom_right_corner(self):
+        sc = self.screen(self.running())
+        self.assertEqual(sc.line(self.ROWS).strip(), "◆ cr")
+        self.assertTrue(sc.line(self.ROWS).startswith(" " * 115))   # right-aligned
+        self.assertEqual(sc.cells[self.ROWS - 1][self.COLS - 1], " ")   # spare column
+
+    def test_it_never_scrolls_the_screen(self):
+        # The bottom-right cell is the one place a printed character makes the
+        # whole screen jump. If that ever happens, claude's output walks upward
+        # a line at a time for the rest of the session.
+        s = self.running()
+        for _ in range(3):
+            s.send("tick\r")
+            s.drain(0.5)
+        sc = self.screen(s)
+        self.assertEqual(sc.scrolled, 0)
+        self.assertTrue(sc.line(1).startswith("fake-claude ready"))
+
+    def test_it_does_not_move_the_cursor_claude_is_using(self):
+        # Claude keeps drawing where it left off; the badge saves and restores.
+        s = self.running()
+        s.send("hello\r")
+        self.assertTrue(s.read_until("GOT:hello"))
+        s.drain(0.5)
+        sc = self.screen(s)
+        # The reply lands at the start of its own line, where claude's cursor was
+        # — not in the corner the badge jumped to.
+        rows = [n for n in range(1, self.ROWS + 1) if sc.line(n) == "GOT:hello"]
+        self.assertEqual(len(rows), 1, sc.text())
+        self.assertLess(rows[0], self.ROWS)
+        self.assertEqual(sc.line(self.ROWS).strip(), "◆ cr")
+
+    def test_it_does_not_colour_what_claude_draws_next(self):
+        s = self.running()
+        s.send("plain\r")
+        self.assertTrue(s.read_until("GOT:plain"))
+        s.drain(0.5)
+        sc = self.screen(s)
+        self.assertEqual(sc.attr_at(3, 1), "")        # no dim leaking out of DECSC
+        self.assertEqual(sc.attr_at(self.ROWS, 116), "2")
+
+    def test_it_is_off_when_asked(self):
+        s = self.session(env={"CR_BADGE": "0"}, rows=self.ROWS, cols=self.COLS)
+        s.read_until("winsize")
+        s.drain(1.0)
+        self.assertNotIn("◆", s.buf)
+
+    def test_the_corner_is_configurable(self):
+        sc = self.screen(self.running(CR_BADGE_POS="top-left"))
+        self.assertTrue(sc.line(1).startswith("◆ cr"))
+        self.assertNotIn("◆", sc.line(self.ROWS))
+
+    def test_the_label_is_configurable(self):
+        sc = self.screen(self.running(CR_BADGE_LABEL="watching"))
+        self.assertEqual(sc.line(self.ROWS).strip(), "◆ watching")
+
+    def test_a_resize_moves_it(self):
+        s = self.running()
+        s.resize(24, 60)
+        s.drain(1.0)
+        sc = self.screen(s, rows=24, cols=60)
+        self.assertIn("◆ cr", sc.line(24))
+        self.assertEqual(sc.cells[23][59], " ")
+
+    def test_it_shows_the_time_left_while_waiting(self):
+        # A limit that "resets in 5 hours", compressed 60x, is a five-minute wait
+        # — long enough to read the countdown off the screen.
+        s = self.running(
+            CLAUDE_CONFIG_DIR=tempfile.mkdtemp(prefix="cr-cfg-"),
+            CR_SCRAPE="always", CR_WAIT_SCALE="60", CR_MARGIN_SEC="0",
+            FAKE_BANNER="You've hit your session limit - resets in 5 hours")
+        self.assertTrue(s.read_until("session limit"))
+        countdown = re.compile(r"◆ cr ([1-5])m$")
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            s.drain(0.5)
+            sc = self.screen(s)
+            if countdown.search(sc.line(self.ROWS)):
+                break
+        sc = self.screen(s)
+        self.assertRegex(sc.line(self.ROWS), countdown)
+        self.assertEqual(sc.attr_at(self.ROWS, sc.line(self.ROWS).index("◆") + 1), "2;33")
+
+    def test_it_is_taken_off_the_screen_on_exit(self):
+        s = self.running()
+        s.send("quit\r")
+        self.assertEqual(s.wait(), 0)
+        self.assertNotIn("◆", self.screen(s).text())
 
 
 class TestTranscriptChannel(PtyTestCase):
