@@ -11,6 +11,9 @@ quota.
   FAKE_DELAY       seconds to wait before doing either
   FAKE_EXIT        exit code to use when told to quit
   FAKE_WORKING     print a streaming footer forever (session looks busy)
+
+Typing `answer` writes an ordinary (non-limit) assistant record: a turn that was
+served, which is how a session says its quota came back.
 """
 import json
 import os
@@ -77,6 +80,11 @@ def main():
         line = line.strip()
         if line.startswith("quit"):
             break
+        if line == "answer":
+            write_transcript("an ordinary answer", limited=False)
+            out.write("GOT:answer\r\n")
+            out.flush()
+            continue
         if line == "winsize":
             try:
                 cols, rows = os.get_terminal_size()   # os.terminal_size is (columns, lines)

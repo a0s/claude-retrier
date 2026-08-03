@@ -412,6 +412,26 @@ class TestTranscriptChannel(PtyTestCase):
         }, cwd=self.work)
         self.assertTrue(s.read_until("GOT:continue", timeout=25))
 
+    def test_an_answered_turn_ends_the_wait(self):
+        # The account was switched mid-wait (or the plan upgraded, or the quota
+        # came back early): nothing announces it, the session simply starts
+        # answering. Left alone, the wrapper would count down its 40 hours over
+        # a working session and eventually type into it.
+        s = self.session(env={
+            "CLAUDE_CONFIG_DIR": self.cfg,
+            "CR_SCRAPE": "never",
+            "CR_NOTIFY": "1",
+            "CR_WAIT_SCALE": "3600",
+            "CR_MARGIN_SEC": "0",
+            "CR_POLL_SEC": "0.2",
+            "FAKE_TRANSCRIPT": "You've hit your weekly limit - resets in 40 hours",
+        }, cwd=self.work)
+        self.assertTrue(s.read_until("usage limit detected", timeout=15))
+        s.send("answer\r")
+        self.assertTrue(s.read_until("wait cancelled", timeout=15))
+        s.drain(2)
+        self.assertNotIn("GOT:continue", s.buf)
+
     def test_a_live_transcript_turns_the_scraper_off(self):
         # Both channels active: the transcript is being written (so `seen_any`
         # is true), and the screen shows text that WOULD match the scraper. The

@@ -103,6 +103,11 @@ Before typing anything it checks that Claude is not mid-turn and that you are no
 typing yourself — it can see your keystrokes, so an unsent draft in the prompt box
 is never overwritten.
 
+A wait also ends when the limit does. Switch accounts with `/login`, upgrade the
+plan, or simply get your quota back early: nothing announces any of that, so the
+wrapper takes the session answering again as the answer, drops the countdown and
+goes back to watching.
+
 Nothing is installed into your shell, no background process is left behind, and the
 only thing written under your home directory is the log.
 
@@ -145,6 +150,7 @@ All optional, all environment variables:
 | `CR_MARGIN_SEC` | `45` | extra wait past the stated reset time |
 | `CR_MAX_ATTEMPTS` | `3` | sends per incident before giving up |
 | `CR_USER_IDLE_SEC` | `20` | don't type while you are typing |
+| `CR_RESUME_SEC` | `15` | claude working this long during a wait ends it |
 | `CR_DRAFT_GRACE_SEC` | `600` | an untouched draft this old stops blocking |
 | `CR_SCRAPE` | `auto` | `auto` \| `always` \| `never` |
 | `CR_BADGE` | `1` | `0` hides the corner mark |
@@ -166,7 +172,7 @@ reason your session won't start.
 ## Tests
 
 ```sh
-./test/run.sh              # 161 tests: patterns, time parsing, transcript, state
+./test/run.sh              # 200 tests: patterns, time parsing, transcript, state
                            # machine, the badge, custom commands, degradation, and
                            # end-to-end runs on a real pty (rendered through a
                            # terminal emulator, so "what the user sees" is asserted)

@@ -64,20 +64,24 @@ class TestRecordParsing(unittest.TestCase):
             for r in records:
                 fh.write(json.dumps(r) + "\n")
 
+    def limits(self, found):
+        return [r for r in found if r["kind"] == "limit"]
+
     def test_finds_the_limit_record(self):
         self.write(ORDINARY, REAL, ORDINARY)
         offset, found = cr.transcript_limit_records(self.path, 0)
-        self.assertEqual(len(found), 1)
-        self.assertIn("resets Jul 22 at 6am", found[0]["text"])
+        limits = self.limits(found)
+        self.assertEqual(len(limits), 1)
+        self.assertIn("resets Jul 22 at 6am", limits[0]["text"])
         self.assertEqual(offset, os.path.getsize(self.path))
 
     def test_offset_makes_reads_incremental(self):
         self.write(ORDINARY)
         offset, found = cr.transcript_limit_records(self.path, 0)
-        self.assertEqual(found, [])
+        self.assertEqual(self.limits(found), [])
         self.write(REAL)
         offset, found = cr.transcript_limit_records(self.path, offset)
-        self.assertEqual(len(found), 1)
+        self.assertEqual(len(self.limits(found)), 1)
         # Reading again from the new offset must not re-report it.
         _, again = cr.transcript_limit_records(self.path, offset)
         self.assertEqual(again, [])
@@ -89,11 +93,11 @@ class TestRecordParsing(unittest.TestCase):
             fh.write(json.dumps(ORDINARY) + "\n")
             fh.write(json.dumps(REAL)[:60])
         offset, found = cr.transcript_limit_records(self.path, 0)
-        self.assertEqual(found, [])
+        self.assertEqual(self.limits(found), [])
         with open(self.path, "a") as fh:
             fh.write(json.dumps(REAL)[60:] + "\n")
         _, found = cr.transcript_limit_records(self.path, offset)
-        self.assertEqual(len(found), 1)
+        self.assertEqual(len(self.limits(found)), 1)
 
     def test_non_limit_api_errors_are_ignored(self):
         self.write(record("API Error: 529 overloaded", error="overloaded", status=529))
@@ -102,18 +106,52 @@ class TestRecordParsing(unittest.TestCase):
 
     def test_the_word_alone_is_not_enough(self):
         # A session that merely discusses rate limits writes ordinary assistant
-        # records; only the structured error field counts.
+        # records; only the structured error field makes one a limit.
         self.write({"type": "assistant", "message": {"content": [
             {"type": "text", "text": "rate_limit and isApiErrorMessage are the fields to watch"}]}})
         _, found = cr.transcript_limit_records(self.path, 0)
-        self.assertEqual(found, [])
+        self.assertEqual([r["kind"] for r in found], ["alive"])
 
     def test_malformed_json_does_not_raise(self):
         with open(self.path, "w") as fh:
             fh.write("{not json at all\n")
             fh.write(json.dumps(REAL) + "\n")
         _, found = cr.transcript_limit_records(self.path, 0)
-        self.assertEqual(len(found), 1)
+        self.assertEqual(len(self.limits(found)), 1)
+
+    def test_an_answered_turn_is_reported_as_alive(self):
+        # The account is serving requests again. It is what says so when a limit
+        # ends early — a switched account, an upgraded plan — with no banner and
+        # no reset to announce it.
+        self.write(ORDINARY)
+        _, found = cr.transcript_limit_records(self.path, 0)
+        self.assertEqual([r["kind"] for r in found], ["alive"])
+
+    def test_a_run_of_assistant_rows_collapses_into_one(self):
+        # One answer is many rows (a thought, three tool calls, a summary). The
+        # caller only needs "the session answered".
+        self.write(ORDINARY, ORDINARY, ORDINARY)
+        _, found = cr.transcript_limit_records(self.path, 0)
+        self.assertEqual([r["kind"] for r in found], ["alive"])
+
+    def test_alive_keeps_its_place_relative_to_a_limit(self):
+        # Order is the whole meaning: alive-then-limit is a session that just
+        # ran out, limit-then-alive is one that came back.
+        self.write(ORDINARY, REAL, ORDINARY)
+        _, found = cr.transcript_limit_records(self.path, 0)
+        self.assertEqual([r["kind"] for r in found], ["alive", "limit", "alive"])
+
+    def test_a_limit_record_is_not_also_alive(self):
+        self.write(REAL)
+        _, found = cr.transcript_limit_records(self.path, 0)
+        self.assertEqual([r["kind"] for r in found], ["limit"])
+
+    def test_a_user_row_quoting_the_type_field_is_not_alive(self):
+        # Tool output lands in a user row verbatim; this file's own source has
+        # been pasted into one more than once.
+        self.write(user_row('grep found: "type":"assistant" in the parser'))
+        _, found = cr.transcript_limit_records(self.path, 0)
+        self.assertEqual(found, [])
 
     def test_missing_file(self):
         offset, found = cr.transcript_limit_records(os.path.join(self.dir, "nope.jsonl"), 0)

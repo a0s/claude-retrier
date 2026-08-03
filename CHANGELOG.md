@@ -7,6 +7,23 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [1.4.0] - 2026-08-03
+
+### Fixed
+- A weekly limit was detected, the account was switched with `/login`, and the
+  session went back to work — while the wrapper kept counting down its 48 hours
+  over it, ready to type `continue` into the middle of that work. Nothing
+  announces "your quota is back": not the transcript, not the render. What says
+  it is that claude is answering again, so a wait now ends on either of two
+  sightings — an ordinary assistant record in the transcript, or the working
+  footer running for `CR_RESUME_SEC` (15s) without a break. A refused turn still
+  paints a second or two of footer before the banner lands, which is why a
+  flicker is not enough, and rows written within eight seconds of the banner are
+  taken as belonging to it.
+- Cancelling a wait clears the rolling screen window with it. The banner is
+  still in there, and it would otherwise be re-detected the moment the
+  controller went idle and park the session all over again.
+
 ## [1.3.0] - 2026-08-02
 
 Two field failures from the same evening, both of them the wrapper reading the

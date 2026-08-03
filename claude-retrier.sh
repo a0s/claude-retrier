@@ -24,7 +24,7 @@
 
 set -u
 
-CR_VERSION="1.3.0"
+CR_VERSION="1.4.0"
 
 # =============================================================================
 # SECTION 1 — DETECTION PATTERNS
@@ -158,6 +158,7 @@ CR_IGNORE_PATTERNS=(
 : "${CR_USER_IDLE_SEC:=20}"            # don't type while the human is typing
 : "${CR_DRAFT_GRACE_SEC:=600}"         # an untouched "draft" this old is not real
 : "${CR_BUSY_IDLE_SEC:=6}"             # no working-footer for this long => idle
+: "${CR_RESUME_SEC:=15}"               # claude working this long during a wait => limit is gone
 : "${CR_VERIFY_SEC:=60}"               # how long to watch for the retry taking hold
 : "${CR_SCRAPE:=auto}"                 # auto | always | never  (screen-scrape fallback)
 : "${CR_LOG:=$HOME/.claude-retrier/log}"
@@ -445,6 +446,8 @@ independent channels for "the session stopped because the quota ran out":
 
 When a limit is seen it computes the wall-clock wait, sleeps, and types the retry
 message into the pty — but only while the human is idle and claude is not busy.
+The wait also ends early if the session starts answering again, which is the only
+evidence there is that a limit lifted before the reset it announced.
 """
 import errno
 import fcntl
@@ -490,6 +493,7 @@ CFG = dict(
     user_idle=_env("CR_USER_IDLE_SEC", 20, float),
     draft_grace=_env("CR_DRAFT_GRACE_SEC", 600, float),
     busy_idle=_env("CR_BUSY_IDLE_SEC", 6, float),
+    resume=_env("CR_RESUME_SEC", 15, float),
     verify=_env("CR_VERIFY_SEC", 60, float),
     scrape=_env("CR_SCRAPE", "auto"),
     log=_env("CR_LOG", os.path.expanduser("~/.claude-retrier/log")),
@@ -780,14 +784,24 @@ def project_dir(cwd=None, config_dir=None):
     return os.path.join(config_dir, "projects", slug)
 
 
+# Matched against the raw row, before any JSON parsing: the rows we care about
+# are a small fraction of a transcript and the rest are large.
+_ASSISTANT_ROW = re.compile(rb'"type"\s*:\s*"assistant"')
+
+
 def transcript_limit_records(path, offset=0, echo=None):
     """(new_offset, [records]) for rows appended past `offset` that we care about.
 
-    Two kinds: the rate-limit rows, and — when `echo` is the retry message — the
-    user row claude writes when it accepts a prompt. That row is proof the retry
-    was submitted rather than left sitting in the input box, which is the only
-    question the verify step is really asking. Screen-scraping the footer to
-    answer it broke the day Claude Code reworded it.
+    Three kinds: the rate-limit rows; — when `echo` is the retry message — the
+    user row claude writes when it accepts a prompt; and assistant rows. That
+    user row is proof the retry was submitted rather than left sitting in the
+    input box, which is the only question the verify step is really asking
+    (screen-scraping the footer to answer it broke the day Claude Code reworded
+    it). An assistant row is proof the account is serving requests, which is the
+    question a wait is really asking.
+
+    Consecutive assistant rows collapse into one: a single answer can be a dozen
+    of them, and the caller only needs the fact.
     """
     out = []
     echo_key = ('"%s"' % echo).encode("utf-8", "replace") if echo else None
@@ -815,7 +829,10 @@ def transcript_limit_records(path, offset=0, echo=None):
     for raw in data[:tail_nl].split(b"\n"):
         limitish = b"rate_limit" in raw or b"isApiErrorMessage" in raw
         echoish = bool(echo_key) and echo_key in raw and b'"user"' in raw
-        if not limitish and not echoish:
+        # Prefilters only — all three can match on a tool result that merely
+        # quotes the words, so the row's own "type" decides below.
+        aliveish = bool(_ASSISTANT_ROW.search(raw))
+        if not limitish and not echoish and not aliveish:
             continue
         try:
             rec = json.loads(raw.decode("utf-8", "replace"))
@@ -824,6 +841,9 @@ def transcript_limit_records(path, offset=0, echo=None):
         if not rec.get("isApiErrorMessage"):
             if echoish and rec.get("type") == "user" and record_text(rec) == echo:
                 out.append(dict(kind="echo", text=echo, ts=rec.get("timestamp")))
+            elif rec.get("type") == "assistant":
+                if not out or out[-1]["kind"] != "alive":
+                    out.append(dict(kind="alive", ts=rec.get("timestamp")))
             continue
         err = str(rec.get("error") or "")
         status = rec.get("apiErrorStatus")
@@ -908,6 +928,8 @@ class Controller:
         self.banner = None
         self.last_user_input = 0.0
         self.last_working = 0.0
+        self.working_since = 0.0   # start of the current uninterrupted working spell
+        self.limit_at = 0.0        # when the wait we are serving was scheduled
         self.pending_input_chars = 0
         self.menu_open = False
         self.started = now if now is not None else time.time()
@@ -1011,6 +1033,9 @@ class Controller:
         probe = self._carry + text
         self._carry = probe[-160:]
         if is_working(probe):
+            if now - self.last_working >= self.cfg["busy_idle"]:
+                # A gap that long ended the previous spell; this is a new one.
+                self.working_since = now
             self.last_working = now
         if is_menu(probe):
             self.menu_open = True
@@ -1023,6 +1048,32 @@ class Controller:
         self.state = IDLE
         self.attempts = 0
         self.banner = None
+        return True
+
+    # A wait can also end because the limit did, without the reset we were told
+    # about ever arriving: the human logs into another account, upgrades the plan,
+    # or the quota simply comes back early. Nothing announces that — the only
+    # evidence is that claude is answering again. Without this, the wrapper keeps
+    # counting down its 48 hours over a session that has been working for hours,
+    # and eventually types "continue" into the middle of it.
+    ALIVE_GRACE = 8.0        # transcript rows this close to the banner are its own
+
+    def on_alive(self, now, source):
+        """The session is answering again: whatever we were waiting for is over."""
+        if self.state not in (WAITING, VERIFY):
+            return False
+        # Scaled like every other wait, so a compressed test run does not have to
+        # spend eight real seconds proving something about a 48-hour limit.
+        if now - self.limit_at < self.ALIVE_GRACE / self.cfg["wait_scale"]:
+            # Rows written just before the limit landed can reach us just after
+            # it did. They say nothing about the limit that followed them.
+            return False
+        self.log("session is answering again (%s); dropping the wait" % source)
+        self.state = IDLE
+        self.attempts = 0
+        self.banner = None
+        self.banner_text = None
+        self.wake_at = 0.0
         return True
 
     def on_limit(self, banner, now, source):
@@ -1041,13 +1092,16 @@ class Controller:
         self.banner_text = banner
         self.state = WAITING
         self.attempts = 0
+        self.limit_at = now
         self.wake_at = now + secs / self.cfg["wait_scale"]
         return True
 
     # -- clock -------------------------------------------------------------- #
     def tick(self, now):
-        """Return an action: None, or ('inject', text, dismiss_menu)."""
+        """Return an action: None, ('inject', text, dismiss_menu), or ('resume',)."""
         if self.state == WAITING:
+            if self._alive_again(now) and self.on_alive(now, "output"):
+                return ("resume",)
             if now < self.wake_at:
                 return None
             if self.attempts >= self.cfg["max_attempts"]:
@@ -1084,6 +1138,20 @@ class Controller:
                 return self.tick(now)
             return None
         return None
+
+    def _alive_again(self, now):
+        """Has claude been working steadily since the limit we are waiting on?
+
+        A refusal still paints a second or two of footer before it lands, so a
+        flicker proves nothing — and the /rate-limit-options retry loop paints
+        one too. A spell that keeps the footer alive for `resume` seconds cannot
+        be a session that is still refused.
+        """
+        if self.working_since <= self.limit_at:
+            return False                        # the spell predates the banner
+        if now - self.last_working >= self.cfg["busy_idle"]:
+            return False                        # it has already ended
+        return self.last_working - self.working_since >= self.cfg["resume"]
 
     def _blocked(self, now):
         if now - self.last_working < self.cfg["busy_idle"]:
@@ -1439,6 +1507,18 @@ def main(argv):
             pass
         badge.pending = True       # the line just scrolled the badge away
 
+    def wait_cancelled():
+        """The limit lifted on its own. Forget everything that described it.
+
+        The banner is still somewhere in the rolling window and in whatever the
+        scraper had half-confirmed; left there, it would be re-detected the
+        moment the controller went idle and park the session all over again.
+        """
+        nonlocal window, pending_scrape
+        window = ""
+        pending_scrape = None
+        notify("session is answering again; wait cancelled")
+
     def schedule_injection(text, dismiss_menu, now):
         """Type like a human, not like a paste.
 
@@ -1529,6 +1609,12 @@ def main(argv):
                     if ctl.on_echo(now):
                         notify("session resumed")
                     continue
+                if rec.get("kind") == "alive":
+                    # Rows are in file order, so an assistant row that follows a
+                    # limit row really did come after it.
+                    if ctl.on_alive(now, "transcript"):
+                        wait_cancelled()
+                    continue
                 text = rec["text"] or "usage limit"
                 pending_scrape = None            # the structured channel wins
                 if ctl.on_limit(text, now, "transcript"):
@@ -1551,6 +1637,8 @@ def main(argv):
             if action and action[0] == "inject":
                 schedule_injection(action[1], action[2], now)
                 notify("limit lifted; resuming session")
+            elif action and action[0] == "resume":
+                wait_cancelled()
 
             if pending:
                 stay = []
@@ -1701,6 +1789,7 @@ CR_CLAUDE_ARGV=$(printf '%s\037' "${CR_ARGV[@]}")
 export CR_CLAUDE_RESOLVED CR_CLAUDE_ARGV CLAUDE_RETRIER_ACTIVE=1
 export CR_MESSAGE CR_MARGIN_SEC CR_MAX_ATTEMPTS CR_FALLBACK_WAIT_SEC CR_MAX_WAIT_SEC
 export CR_USER_IDLE_SEC CR_BUSY_IDLE_SEC CR_VERIFY_SEC CR_SCRAPE CR_LOG CR_NOTIFY
+export CR_RESUME_SEC
 export CR_DRAFT_GRACE_SEC
 export CR_BADGE CR_BADGE_POS CR_BADGE_LABEL
 export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC

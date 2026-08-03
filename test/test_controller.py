@@ -17,7 +17,7 @@ cr = load()
 
 CFG = dict(message="continue", margin=0, max_attempts=3, fallback_wait=18000,
            max_wait=691200, user_idle=20, busy_idle=6, verify=60, wait_scale=1,
-           draft_grace=600)
+           draft_grace=600, resume=15)
 
 BANNER = "You've hit your session limit · resets in 2 hours"
 
@@ -144,6 +144,102 @@ class TestSafetyGates(unittest.TestCase):
     def test_arrow_keys_do_not_count_as_a_draft(self):
         self.ctl.on_user_bytes(b"\x1b[A", now=0)         # up arrow: an escape seq
         self.assertIsNotNone(self.ctl.tick(7201))
+
+
+class TestTheLimitCanEndWithoutTheReset(unittest.TestCase):
+    """Field failure: a weekly limit was detected, the human logged into another
+    account and worked for an hour — and the wrapper sat there counting down its
+    48 hours, ready to type "continue" into the middle of that work.
+
+    Nothing announces "your quota is back": not the transcript, not the render.
+    The evidence is that claude is answering, which is exactly what the wait was
+    waiting to find out.
+    """
+    def waiting(self, **over):
+        ctl = controller(**over)
+        ctl.on_limit("You've hit your weekly limit · resets in 48 hours", now=1000,
+                     source="transcript")
+        return ctl
+
+    def working(self, ctl, start, seconds, step=2):
+        for t in range(int(start), int(start + seconds) + 1, step):
+            ctl.on_output("✻ Cogitating… (esc to interrupt)", now=t)
+        return start + seconds
+
+    def test_a_long_working_spell_cancels_the_wait(self):
+        ctl = self.waiting()
+        end = self.working(ctl, 1100, 20)
+        self.assertEqual(ctl.tick(end), ("resume",))
+        self.assertEqual(ctl.state, cr.IDLE)
+        self.assertEqual(ctl.wake_at, 0.0)
+
+    def test_a_flicker_of_footer_does_not(self):
+        # A refused turn still paints a spinner for a second or two before the
+        # banner lands. Acting on that would drop every wait the moment the human
+        # tried again.
+        ctl = self.waiting()
+        end = self.working(ctl, 1100, 4)
+        self.assertIsNone(ctl.tick(end))
+        self.assertEqual(ctl.state, cr.WAITING)
+
+    def test_a_spell_that_began_before_the_limit_does_not_count(self):
+        # The footer was already running when the limit arrived — that spell is
+        # the turn that got refused, not proof of a new one.
+        ctl = controller()
+        end = self.working(ctl, 1000, 30)
+        ctl.on_limit("resets in 48 hours", now=end, source="screen")
+        self.working(ctl, end, 4)
+        self.assertIsNone(ctl.tick(end + 4))
+        self.assertEqual(ctl.state, cr.WAITING)
+
+    def test_a_spell_that_has_since_ended_does_not_count(self):
+        ctl = self.waiting()
+        end = self.working(ctl, 1100, 30)
+        self.assertIsNone(ctl.tick(end + 60))       # quiet again for a minute
+        self.assertEqual(ctl.state, cr.WAITING)
+
+    def test_two_short_spells_do_not_add_up(self):
+        ctl = self.waiting()
+        end = self.working(ctl, 1100, 8)
+        self.assertIsNone(ctl.tick(end))
+        end = self.working(ctl, end + 30, 8)
+        self.assertIsNone(ctl.tick(end))
+        self.assertEqual(ctl.state, cr.WAITING)
+
+    def test_an_answered_turn_in_the_transcript_cancels_the_wait(self):
+        ctl = self.waiting()
+        self.assertTrue(ctl.on_alive(now=1100, source="transcript"))
+        self.assertEqual(ctl.state, cr.IDLE)
+        self.assertIsNone(ctl.tick(1e9 + 1))        # and stays cancelled
+
+    def test_rows_written_just_before_the_banner_are_not_evidence(self):
+        # The transcript is polled, so the answer that ran out of quota can reach
+        # us a moment after the limit row that followed it.
+        ctl = self.waiting()
+        self.assertFalse(ctl.on_alive(now=1001, source="transcript"))
+        self.assertEqual(ctl.state, cr.WAITING)
+
+    def test_an_idle_session_is_not_cancelled_by_anything(self):
+        ctl = controller()
+        self.assertFalse(ctl.on_alive(now=1000, source="transcript"))
+        self.assertEqual(ctl.state, cr.IDLE)
+
+    def test_a_cancelled_wait_can_be_scheduled_again(self):
+        # The new quota runs out too. Nothing about the first incident may block
+        # the second: same banner text, hours apart.
+        ctl = self.waiting()
+        ctl.on_alive(now=2000, source="transcript")
+        self.assertTrue(ctl.on_limit("You've hit your weekly limit · resets in 48 hours",
+                                     now=3000, source="transcript"))
+        self.assertEqual(ctl.state, cr.WAITING)
+
+    def test_a_verify_in_progress_is_cancelled_too(self):
+        ctl = self.waiting()
+        self.assertEqual(ctl.tick(1000 + 48 * 3600 + 1)[0], "inject")
+        self.assertEqual(ctl.state, cr.VERIFY)
+        self.assertTrue(ctl.on_alive(now=1000 + 48 * 3600 + 30, source="transcript"))
+        self.assertEqual(ctl.state, cr.IDLE)
+        self.assertEqual(ctl.attempts, 0)
 
 
 class TestTheTerminalTalksBackToo(unittest.TestCase):
