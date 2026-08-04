@@ -7,6 +7,37 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [1.5.0] - 2026-08-04
+
+The other half of the 1.3.0 fix, found the same way: a session that had waited
+out a four-hour limit, reached the reset, and then never typed anything.
+
+### Fixed
+- `deferring retry: user is typing` once every 15 seconds while nobody was
+  touching the keyboard. 1.3.0 taught the wrapper that the terminal's replies to
+  claude are not a draft, but every one of them still stamped "the human is
+  here", and that gate wants twenty quiet seconds. A cursor-position report, a
+  focus event from switching windows, a mouse move over the terminal — any of
+  them, arriving oftener than that, held the retry for as long as the session
+  lived. Presence now means a key: replies are told from keystrokes by shape
+  (the string replies, `CSI…R`, a private `CSI ?…`, `CSI…c`, `CSI…t`, focus and
+  mouse reports, the paste brackets), and everything unrecognised stays human,
+  because mistaking a key for a report is the expensive direction.
+- The keyboard gate now has a ceiling (`CR_TYPING_MAX_SEC`, 15 minutes). With an
+  empty input box there is no half-written thought behind it, only the courtesy
+  of not typing while someone is — and whatever stamps presence next, the retry
+  still has to happen. A draft is untouched by this and keeps its own, longer
+  grace.
+
+### Changed
+- The badge says `◆ cr held` while a retry is being deferred. Each deferral
+  re-arms the clock by 15 seconds, so what the corner used to show was a
+  countdown restarting from 15s forever — indistinguishable from waiting out a
+  quota, which is the one thing it no longer meant.
+- A narrower badge frame now covers the wider one it replaces. `◇ cr 1m` giving
+  way to `◆ cr` left `◇ c◆ cr` in the corner until claude next repainted that
+  row.
+
 ## [1.4.0] - 2026-08-03
 
 ### Fixed

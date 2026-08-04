@@ -31,6 +31,14 @@ class TestText(unittest.TestCase):
         text, _ = badge().frame(cr.WAITING, 5000, 0, 3, 0)
         self.assertEqual(text, "◆ cr 1h23m")
 
+    def test_a_deferred_retry_says_so_instead_of_counting(self):
+        # Once the reset has passed, every deferral re-arms the clock by 15s and
+        # the countdown starts over. On screen that is indistinguishable from
+        # waiting for the quota, which is exactly what it no longer is.
+        text, sgr = badge().frame(cr.WAITING, 15, 0, 3, 0, deferred=True)
+        self.assertEqual(text, "◆ cr held")
+        self.assertNotIn("33", sgr)                # not the waiting colour
+
     def test_verifying_shows_the_attempt(self):
         text, _ = badge().frame(cr.VERIFY, 0, 2, 3, 0)
         self.assertEqual(text, "◆ cr 2/3")
@@ -165,6 +173,38 @@ class TestPaintAndErase(unittest.TestCase):
         self.assertTrue(b.paint(fd, 40, 120, cr.IDLE, 0, 0, 3, 100.0))
         self.assertIn("\x1b[40;116H", read())
         self.assertFalse(b.paint(fd, 40, 120, cr.IDLE, 0, 0, 3, 100.1))
+
+    def test_a_shorter_frame_covers_the_longer_one_it_replaces(self):
+        # Field sighting: "◇ cr 1m" gave way to "◆ cr" and the corner read
+        # "◇ c◆ cr" until claude next repainted that row.
+        fd, read = self.fd()
+        b = badge()
+        b.paint(fd, 40, 120, cr.WAITING, 60, 0, 3, 100.0)      # "◆ cr 1m"
+        b.note_output(100.5)
+        b.paint(fd, 40, 120, cr.IDLE, 0, 0, 3, 101.0)          # "◆ cr"
+        last = read().split("\x1b7")[-1]
+        self.assertIn("\x1b[40;113H", last)        # starts where the long one did
+        self.assertIn("   ◆ cr", last)             # three cells of it wiped
+
+    def test_a_left_anchored_badge_pads_the_other_way(self):
+        fd, read = self.fd()
+        b = badge(badge_pos="bottom-left")
+        b.paint(fd, 40, 120, cr.WAITING, 60, 0, 3, 100.0)
+        b.note_output(100.5)
+        b.paint(fd, 40, 120, cr.IDLE, 0, 0, 3, 101.0)
+        last = read().split("\x1b7")[-1]
+        self.assertIn("\x1b[40;1H", last)
+        self.assertIn("◆ cr   ", last)
+
+    def test_the_padding_is_not_carried_forward(self):
+        # Once the cells are cleared they stay ours; the next frame of the same
+        # width has nothing left to cover.
+        fd, read = self.fd()
+        b = badge()
+        b.paint(fd, 40, 120, cr.WAITING, 60, 0, 3, 100.0)
+        b.note_output(100.5)
+        b.paint(fd, 40, 120, cr.IDLE, 0, 0, 3, 101.0)
+        self.assertEqual(b.painted_width, len("◆ cr"))
 
     def test_erasing_covers_exactly_what_was_drawn(self):
         fd, read = self.fd()

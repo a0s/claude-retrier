@@ -17,7 +17,7 @@ cr = load()
 
 CFG = dict(message="continue", margin=0, max_attempts=3, fallback_wait=18000,
            max_wait=691200, user_idle=20, busy_idle=6, verify=60, wait_scale=1,
-           draft_grace=600, resume=15)
+           draft_grace=600, resume=15, typing_max=900)
 
 BANNER = "You've hit your session limit · resets in 2 hours"
 
@@ -306,6 +306,76 @@ class TestTheTerminalTalksBackToo(unittest.TestCase):
         self.assertEqual(self.draft_after(b"\x1b[200~hello\x1b[201~"), 5)
 
 
+class TestPresenceIsNotTraffic(unittest.TestCase):
+    """The other half of the same field failure. Swallowing the terminal's
+    replies kept them out of the draft counter, but every one of them still
+    stamped `last_user_input`, and that gate wants twenty quiet seconds. A
+    session that had waited out a four-hour limit then logged "user is typing"
+    every 15s while its owner sat watching the screen: switching to another app
+    and back, moving the mouse over the window, anything that makes a terminal
+    speak. Presence has to mean a key, not a byte.
+    """
+    def present_after(self, data):
+        ctl = controller()
+        ctl.on_user_bytes(data, now=500)
+        return ctl.last_user_input == 500
+
+    def test_a_cursor_position_report_is_not_presence(self):
+        self.assertFalse(self.present_after(b"\x1b[12;40R"))
+
+    def test_a_device_attributes_reply_is_not_presence(self):
+        self.assertFalse(self.present_after(b"\x1b[?1;2c"))
+
+    def test_an_xtversion_reply_is_not_presence(self):
+        self.assertFalse(self.present_after(b"\x1bP>|iTerm2 3.5.11\x1b\\"))
+
+    def test_an_osc_colour_reply_is_not_presence(self):
+        self.assertFalse(self.present_after(b"\x1b]11;rgb:1e1e/1e1e/1e1e\x07"))
+
+    def test_focus_events_are_not_presence(self):
+        # Switching to another window and back — which is what taking a
+        # screenshot of the stuck session looks like from down here.
+        self.assertFalse(self.present_after(b"\x1b[O"))
+        self.assertFalse(self.present_after(b"\x1b[I"))
+
+    def test_mouse_traffic_is_not_presence(self):
+        self.assertFalse(self.present_after(b"\x1b[<35;36;12M"))
+        self.assertFalse(self.present_after(b"\x1b[M\x20\x40\x30"))
+
+    def test_a_window_size_report_is_not_presence(self):
+        self.assertFalse(self.present_after(b"\x1b[8;40;120t"))
+
+    def test_a_device_status_report_is_not_presence(self):
+        self.assertFalse(self.present_after(b"\x1b[0n"))
+
+    def test_a_kitty_keyboard_flags_report_is_not_presence(self):
+        self.assertFalse(self.present_after(b"\x1b[?3u"))
+
+    def test_a_key_is_presence_even_when_it_is_an_escape_sequence(self):
+        for key in (b"\x1b[A", b"\x1b[1;5C", b"\x1bOP", b"\x1b[3~", b"\x1bb"):
+            self.assertTrue(self.present_after(key), key)
+
+    def test_a_lone_escape_is_presence(self):
+        self.assertTrue(self.present_after(b"\x1b"))
+
+    def test_ordinary_typing_is_presence(self):
+        self.assertTrue(self.present_after(b"hello"))
+        self.assertTrue(self.present_after(b"\r"))
+
+    def test_a_reply_riding_along_with_a_keystroke_still_counts(self):
+        self.assertTrue(self.present_after(b"\x1b[12;40Rx"))
+
+    def test_the_retry_goes_out_over_a_chattering_terminal(self):
+        # The failure end to end: the reset has passed and the only thing on
+        # stdin is the terminal answering claude. Nothing may defer this.
+        ctl = controller()
+        ctl.on_limit(BANNER, now=0, source="transcript")
+        for t in range(7100, 7220, 5):
+            ctl.on_user_bytes(b"\x1b[24;80R\x1b[I", now=t)
+        self.assertIsNotNone(ctl.tick(7220))
+        self.assertFalse(any("deferring" in line for line in ctl.log_lines))
+
+
 class TestTheGateCannotJam(unittest.TestCase):
     """Whatever desyncs the counter next, the wait must still end. The gate is a
     courtesy to the human; the retry is the product."""
@@ -324,6 +394,41 @@ class TestTheGateCannotJam(unittest.TestCase):
         for t in range(7201, 7201 + 3000, 300):          # still typing at it
             ctl.on_user_bytes(b"x", now=t - 60)
             self.assertIsNone(ctl.tick(t))
+
+    def test_the_keyboard_gate_has_a_ceiling(self):
+        # Nothing is behind this one: the box is empty (a draft has its own
+        # grace period), so it defers to a pair of hands and no more. Whatever
+        # keeps stamping presence next — a key that repeats, a report we failed
+        # to recognise — the retry still has to happen.
+        ctl = controller()
+        ctl.on_limit(BANNER, now=0, source="transcript")
+        for t in range(7201, 7201 + 900, 15):
+            ctl.on_user_bytes(b"\r", now=t)              # empty box, present
+            self.assertIsNone(ctl.tick(t))
+            self.assertTrue(ctl.deferred)
+        ctl.on_user_bytes(b"\r", now=7201 + 900)
+        self.assertIsNotNone(ctl.tick(7201 + 900))
+        self.assertTrue(any("ceiling" in line or "held for" in line
+                            for line in ctl.log_lines))
+
+    def test_the_ceiling_does_not_type_over_a_draft(self):
+        # Someone typing has an empty box between thoughts and a full one during
+        # them, and only the empty case is safe to overrule. A message being
+        # written for half an hour still waits.
+        ctl = controller()
+        ctl.on_limit(BANNER, now=0, source="transcript")
+        for t in range(7201, 7201 + 3000, 15):
+            ctl.on_user_bytes(b"y", now=t)               # the draft keeps growing
+            self.assertIsNone(ctl.tick(t))
+
+    def test_deferring_is_visible_and_clears(self):
+        ctl = controller()
+        ctl.on_limit(BANNER, now=0, source="transcript")
+        ctl.on_user_bytes(b"hi\r", now=7200)
+        self.assertIsNone(ctl.tick(7201))
+        self.assertTrue(ctl.deferred)
+        self.assertIsNotNone(ctl.tick(7300))             # nobody there any more
+        self.assertFalse(ctl.deferred)
 
 
 class TestVerifyAndGiveUp(unittest.TestCase):

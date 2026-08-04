@@ -115,7 +115,8 @@ only thing written under your home directory is the log.
 
 A wrapper you cannot see is indistinguishable from a wrapper that died an hour
 ago. So there is one mark, dim, in a corner of the screen: `◆ cr` while it is
-watching, and the time left while it is waiting out a limit.
+watching, the time left while it is waiting out a limit, and `◆ cr held` when the
+reset has passed but you are still at the keyboard.
 
 <p align="center">
   <img src="docs/badge.svg" width="620"
@@ -150,6 +151,7 @@ All optional, all environment variables:
 | `CR_MARGIN_SEC` | `45` | extra wait past the stated reset time |
 | `CR_MAX_ATTEMPTS` | `3` | sends per incident before giving up |
 | `CR_USER_IDLE_SEC` | `20` | don't type while you are typing |
+| `CR_TYPING_MAX_SEC` | `900` | …but not past this, with an empty input box |
 | `CR_RESUME_SEC` | `15` | claude working this long during a wait ends it |
 | `CR_DRAFT_GRACE_SEC` | `600` | an untouched draft this old stops blocking |
 | `CR_SCRAPE` | `auto` | `auto` \| `always` \| `never` |
@@ -172,7 +174,7 @@ reason your session won't start.
 ## Tests
 
 ```sh
-./test/run.sh              # 200 tests: patterns, time parsing, transcript, state
+./test/run.sh              # 221 tests: patterns, time parsing, transcript, state
                            # machine, the badge, custom commands, degradation, and
                            # end-to-end runs on a real pty (rendered through a
                            # terminal emulator, so "what the user sees" is asserted)

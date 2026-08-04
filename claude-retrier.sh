@@ -24,7 +24,7 @@
 
 set -u
 
-CR_VERSION="1.4.0"
+CR_VERSION="1.5.0"
 
 # =============================================================================
 # SECTION 1 — DETECTION PATTERNS
@@ -156,6 +156,7 @@ CR_IGNORE_PATTERNS=(
 : "${CR_FALLBACK_WAIT_SEC:=18000}"     # 5h, used when no reset time can be parsed
 : "${CR_MAX_WAIT_SEC:=691200}"         # 8d hard cap on any single wait
 : "${CR_USER_IDLE_SEC:=20}"            # don't type while the human is typing
+: "${CR_TYPING_MAX_SEC:=900}"          # ...but not past this, with an empty input box
 : "${CR_DRAFT_GRACE_SEC:=600}"         # an untouched "draft" this old is not real
 : "${CR_BUSY_IDLE_SEC:=6}"             # no working-footer for this long => idle
 : "${CR_RESUME_SEC:=15}"               # claude working this long during a wait => limit is gone
@@ -491,6 +492,7 @@ CFG = dict(
     fallback_wait=_env("CR_FALLBACK_WAIT_SEC", 18000, float),
     max_wait=_env("CR_MAX_WAIT_SEC", 691200, float),
     user_idle=_env("CR_USER_IDLE_SEC", 20, float),
+    typing_max=_env("CR_TYPING_MAX_SEC", 900, float),
     draft_grace=_env("CR_DRAFT_GRACE_SEC", 600, float),
     busy_idle=_env("CR_BUSY_IDLE_SEC", 6, float),
     resume=_env("CR_RESUME_SEC", 15, float),
@@ -932,6 +934,8 @@ class Controller:
         self.limit_at = 0.0        # when the wait we are serving was scheduled
         self.pending_input_chars = 0
         self.menu_open = False
+        self.deferred = False      # the reset has passed and a gate is holding it
+        self.typing_since = 0.0    # when that gate was first found shut
         self.started = now if now is not None else time.time()
         self.banner_text = None
         self._carry = ""          # overlap so a marker split across two reads still matches
@@ -948,6 +952,39 @@ class Controller:
     # we mis-parse is counted as characters the human typed, which parks the retry
     # behind a draft that does not exist.
     _STRING_OPENERS = (0x50, 0x5d, 0x58, 0x5e, 0x5f)   # DCS  OSC  SOS  PM  APC
+
+    def _is_terminal_reply(self, data, i, j):
+        """Is data[i:j] the terminal talking, rather than a key someone pressed?
+
+        Both arrive as escape sequences and there is no flag that separates them,
+        so this goes by shape. Only what a keyboard cannot produce is claimed:
+        the string replies, the reports claude asked for, mouse and focus
+        traffic. Arrows, function keys, Home/End, a lone Alt+key and everything
+        else unrecognised stay human — mistaking a key for a report is the
+        expensive direction, because it lets the wrapper type over someone.
+        """
+        nxt = data[i + 1]
+        if nxt in self._STRING_OPENERS:
+            return True                 # XTVERSION, colour queries, DECRQSS…
+        if nxt != 0x5b:                 # SS3 (F1-F4, keypad) and Alt+key: human
+            return False
+        body = data[i + 2:j]
+        if not body:
+            return False
+        head, final = body[0], body[-1]
+        if head == 0x4d:                            # "\x1b[M": X10 mouse
+            return True
+        if head == 0x3c and final in (0x4d, 0x6d):  # "\x1b[<0;36;12M": SGR mouse
+            return True
+        if head == 0x3f:                            # private report: DA, kitty…
+            return True
+        if final in (0x52, 0x63, 0x74, 0x6e):       # R: cursor  c: DA  t: window  n: DSR
+            return True
+        if final in (0x49, 0x4f) and len(body) == 1:            # focus in/out
+            return True
+        if final == 0x7e and body[:-1] in (b"200", b"201"):     # paste brackets
+            return True                 # the pasted text between them still counts
+        return False
 
     def _skip_escape(self, data, i, n):
         """Index just past the escape sequence at data[i], or None if truncated."""
@@ -980,14 +1017,17 @@ class Controller:
     def on_user_bytes(self, data, now):
         """Track the human so we never type over a half-written prompt.
 
-        Counts printable characters typed since the last submit/clear. Escape
-        SEQUENCES (arrows, function keys, mouse reports, the terminal's replies to
-        claude) are consumed whole — naively counting their bytes made every cursor
-        movement look like an unsent draft, which would defer the retry
-        indefinitely.
+        Counts printable characters typed since the last submit/clear, and marks
+        when someone was last at the keyboard. Escape SEQUENCES (arrows, function
+        keys, mouse reports, the terminal's replies to claude) are consumed whole
+        — naively counting their bytes made every cursor movement look like an
+        unsent draft, which would defer the retry indefinitely. The ones the
+        terminal wrote by itself do not count as presence either: a report
+        arriving every few seconds would hold the "user is typing" gate shut for
+        as long as the session lives.
         """
-        self.last_user_input = now
         before = self.pending_input_chars
+        human = False
         if self._input_carry:
             data = self._input_carry + data
             self._input_carry = b""
@@ -999,9 +1039,12 @@ class Controller:
                     # A lone Escape at the end of a read is the human pressing
                     # Esc, which clears Claude Code's input box.
                     self.pending_input_chars = 0
+                    human = True
                     i += 1
                     continue
                 j = self._skip_escape(data, i, n)
+                if j is not None and not self._is_terminal_reply(data, i, j):
+                    human = True
                 if j is None:
                     # Cut in half by the read boundary. Finish it next time rather
                     # than let its tail be mistaken for typing; cap the carry so a
@@ -1011,6 +1054,7 @@ class Controller:
                     break
                 i = j
                 continue
+            human = True                        # nothing below this line is ours
             if b in (0x0d, 0x0a):               # Enter: submitted, box is empty
                 self.pending_input_chars = 0
                 self.menu_open = False
@@ -1021,6 +1065,8 @@ class Controller:
             elif b >= 0x20:
                 self.pending_input_chars += 1
             i += 1
+        if human:
+            self.last_user_input = now
         if self.pending_input_chars != before:
             self.last_draft_change = now
 
@@ -1092,6 +1138,8 @@ class Controller:
         self.banner_text = banner
         self.state = WAITING
         self.attempts = 0
+        self.deferred = False
+        self.typing_since = 0.0
         self.limit_at = now
         self.wake_at = now + secs / self.cfg["wait_scale"]
         return True
@@ -1107,12 +1155,31 @@ class Controller:
             if self.attempts >= self.cfg["max_attempts"]:
                 self.log("giving up after %d attempts" % self.attempts)
                 self.state = DONE
+                self.deferred = False
                 return None
             blocked = self._blocked(now)
+            if blocked == "user is typing" and not self.pending_input_chars:
+                # With an empty box this gate defers to a pair of hands and
+                # nothing else — there is no half-written thought to protect,
+                # only the courtesy of not typing while someone is. If it has
+                # held this long, either nobody is there or something is
+                # stamping presence on their behalf. (A draft takes the branch
+                # below instead, and keeps its own, longer grace.)
+                if not self.typing_since:
+                    self.typing_since = now
+                elif now - self.typing_since >= self.cfg["typing_max"]:
+                    self.log("the keyboard gate has held for %.0fs; retrying anyway"
+                             % (now - self.typing_since))
+                    blocked = None
+            else:
+                self.typing_since = 0.0
             if blocked:
+                self.deferred = True
                 self.log("deferring retry: %s" % blocked)
                 self.wake_at = now + 15
                 return None
+            self.deferred = False
+            self.typing_since = 0.0
             self.attempts += 1
             self.state = VERIFY
             self.wake_at = now + self.cfg["verify"]
@@ -1215,10 +1282,11 @@ class Badge:
         self.last_output = 0.0
         self.last_paint = -1e9
         self.painted = None      # text currently on screen, None when nothing is
+        self.painted_width = 0   # cells it took, so a shorter frame can cover them
         self.pending = True      # claude drew something since we last painted
 
     # -- what it says ------------------------------------------------------- #
-    def frame(self, state, remaining, attempts, max_attempts, now):
+    def frame(self, state, remaining, attempts, max_attempts, now, deferred=False):
         """(text, sgr) for a controller state. Pure, so the tests can drive it."""
         mark = self.MARK
         if state == WAITING:
@@ -1226,6 +1294,12 @@ class Badge:
             # the only motion the badge ever has.
             if int(now / self.PULSE) % 2:
                 mark = self.MARK_ALT
+            if deferred:
+                # The reset came and went; what is left is a gate, and each
+                # deferral re-arms the clock 15 seconds at a time. Showing that
+                # countdown would read as "still waiting for the quota", which
+                # is the one thing it no longer means.
+                return ("%s %s held" % (mark, self.label), "2;35")
             return ("%s %s %s" % (mark, self.label, human_left(remaining)), "2;33")
         if state == VERIFY:
             return ("%s %s %d/%d" % (mark, self.label, attempts, max_attempts), "2;36")
@@ -1268,26 +1342,36 @@ class Badge:
         return ("\x1b7\x1b[%d;%dH\x1b[%sm%s\x1b[0m\x1b8" % (row, col, sgr, text)).encode()
 
     def paint(self, fd, rows, cols, state, remaining, attempts, max_attempts, now,
-              blocked=False):
-        text, sgr = self.frame(state, remaining, attempts, max_attempts, now)
+              blocked=False, deferred=False):
+        text, sgr = self.frame(state, remaining, attempts, max_attempts, now, deferred)
         if not self.due(text, now, blocked):
             return False
-        seq = self.sequence(rows, cols, text, sgr)
+        # A narrower frame than the last one would leave the tail of that one on
+        # screen — "◇ cr 1m" becoming "◆ cr" reads as "◇ c◆ cr" until claude
+        # happens to repaint that row. Pad away from the anchored edge so the
+        # cells we used are the cells we clear.
+        draw = text
+        if len(draw) < self.painted_width:
+            pad = " " * (self.painted_width - len(draw))
+            draw = pad + draw if self.pos.endswith("right") else draw + pad
+        seq = self.sequence(rows, cols, draw, sgr)
         if seq is None:
             return False
         self.last_paint = now
         self.pending = False
         self.painted = text
+        self.painted_width = len(text)
         return write_all(fd, seq)
 
     def erase(self, fd, rows, cols):
         """Take it back off the screen on the way out."""
         if not self.enabled or not self.painted:
             return
-        seq = self.sequence(rows, cols, " " * len(self.painted), "0")
+        seq = self.sequence(rows, cols, " " * self.painted_width, "0")
         if seq:
             write_all(fd, seq)
         self.painted = None
+        self.painted_width = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1655,7 +1739,7 @@ def main(argv):
                             CFG["max_attempts"], now,
                             # A half-received sequence of claude's is already in
                             # the terminal; anything written now lands inside it.
-                            blocked=bool(esc_carry))
+                            blocked=bool(esc_carry), deferred=ctl.deferred)
 
             try:
                 done, status = os.waitpid(pid, os.WNOHANG)
@@ -1790,7 +1874,7 @@ export CR_CLAUDE_RESOLVED CR_CLAUDE_ARGV CLAUDE_RETRIER_ACTIVE=1
 export CR_MESSAGE CR_MARGIN_SEC CR_MAX_ATTEMPTS CR_FALLBACK_WAIT_SEC CR_MAX_WAIT_SEC
 export CR_USER_IDLE_SEC CR_BUSY_IDLE_SEC CR_VERIFY_SEC CR_SCRAPE CR_LOG CR_NOTIFY
 export CR_RESUME_SEC
-export CR_DRAFT_GRACE_SEC
+export CR_DRAFT_GRACE_SEC CR_TYPING_MAX_SEC
 export CR_BADGE CR_BADGE_POS CR_BADGE_LABEL
 export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC
 
