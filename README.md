@@ -98,6 +98,9 @@ It detects a limit on two channels:
 1. **The transcript** — Claude Code writes `{"error":"rate_limit","isApiErrorMessage":true}`
    into `~/.claude/projects/<project>/<session>.jsonl`. Structured, unambiguous, primary.
 2. **The screen** — pattern matching, used only when the transcript is unavailable.
+   One screen is never read this way: the `claude agents` roster, where every card
+   is a different session's last line and a limit shown there is somebody else's,
+   usually hours old.
 
 Before typing anything it checks that Claude is not mid-turn and that you are not
 typing yourself — it can see your keystrokes, so an unsent draft in the prompt box
@@ -174,7 +177,7 @@ reason your session won't start.
 ## Tests
 
 ```sh
-./test/run.sh              # 221 tests: patterns, time parsing, transcript, state
+./test/run.sh              # 228 tests: patterns, time parsing, transcript, state
                            # machine, the badge, custom commands, degradation, and
                            # end-to-end runs on a real pty (rendered through a
                            # terminal emulator, so "what the user sees" is asserted)

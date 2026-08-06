@@ -98,6 +98,59 @@ class TestBannerDetection(unittest.TestCase):
         self.assertIsNotNone(cr.find_limit(text))
 
 
+class TestScreenRows(unittest.TestCase):
+    """A TUI paints rows by moving the cursor, not by printing newlines.
+
+    Captured from `claude agents` in a pty: the whole screen arrived with zero
+    "\\n" in it. Flattened to one line, the roster's oldest card supplied the
+    reset time for another card's limit wording, and the session was parked for
+    six hours over a banner that was three hours old.
+    """
+
+    def test_cursor_motion_becomes_a_line_break(self):
+        screen = ("\x1b[1;1HYou've hit your session limit"
+                  "\x1b[2;1H· resets 3pm (UTC)")
+        self.assertEqual(cr.strip_ansi(screen).split("\n")[-2:],
+                         ["You've hit your session limit", "· resets 3pm (UTC)"])
+
+    def test_a_carriage_return_starts_a_row(self):
+        self.assertEqual(cr.strip_ansi("first\rsecond").split("\n"), ["first", "second"])
+
+    def test_cells_from_different_rows_do_not_pair(self):
+        # Two unrelated cards, each complete on its own row: a limit with no
+        # reset time next to a reset time with no limit is not a banner.
+        screen = ("\x1b[3;1H∙ some agent   You've hit your session limit  3h"
+                  "\x1b[4;1H∙ other agent  resets 9:30pm (Europe/Warsaw)  1h")
+        rows = cr.strip_ansi(screen).split("\n")
+        self.assertEqual(len([r for r in rows if r.strip()]), 2)
+
+
+class TestAgentRoster(unittest.TestCase):
+    """`claude agents` lists OTHER sessions; none of it is this terminal's state."""
+
+    # Trimmed from the real render that parked a session until 9:30pm.
+    ROSTER = (
+        "\x1b[1;1H▐▛███▜▌Claude Code v2.1.222  ~/src/app"
+        "\x1b[3;1H1 awaiting input · 1 working · 6 completed"
+        "\x1b[5;1H∙ color matching tool seo   rate limited — wait and retry…  2h"
+        "\x1b[6;1H∙ close the debts D9, D15…  You've hit your session limit · resets 9:30pm (Eur…  3h"
+        "\x1b[8;1H❯ describe a task for a new session"
+    )
+
+    def test_a_card_is_not_this_session_s_banner(self):
+        self.assertIsNone(cr.find_limit(self.ROSTER))
+
+    def test_the_roster_is_recognised(self):
+        self.assertTrue(cr.is_roster(cr.strip_ansi(self.ROSTER)))
+
+    def test_an_ordinary_session_is_not_a_roster(self):
+        for text in ["You've hit your session limit · resets 3pm (UTC)",
+                     "Waiting for 2 background agents to finish",
+                     "● Task(3 completed)"]:
+            with self.subTest(text=text):
+                self.assertFalse(cr.is_roster(text))
+
+
 class TestWorkingDetection(unittest.TestCase):
     def test_streaming_footer_is_working(self):
         for text in ["✻ Cogitating… (esc to interrupt)",

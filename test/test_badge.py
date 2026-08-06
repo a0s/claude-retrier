@@ -122,6 +122,18 @@ class TestPaintTiming(unittest.TestCase):
         self.assertFalse(self.due(100.0 + self.b.QUIET / 2))
         self.assertTrue(self.due(100.0 + self.b.QUIET + 0.01))
 
+    def test_a_screen_that_never_goes_quiet_still_gets_painted(self):
+        # The agent roster repaints about ten times a second, so the quiet gap
+        # never arrives and the badge stayed frozen on its first frame — a
+        # countdown that does not count. The wait for the gap is bounded.
+        now = 100.0
+        for _ in range(int(self.b.STALE / 0.05)):
+            self.b.note_output(now)
+            self.assertFalse(self.due(now))
+            now += 0.05
+        self.b.note_output(now + self.b.STALE)
+        self.assertTrue(self.due(now + self.b.STALE))
+
     def test_a_half_received_sequence_blocks_it(self):
         self.b.note_output(100.0)
         self.assertFalse(self.due(101.0, blocked=True))

@@ -24,7 +24,7 @@
 
 set -u
 
-CR_VERSION="1.5.0"
+CR_VERSION="1.6.0"
 
 # =============================================================================
 # SECTION 1 — DETECTION PATTERNS
@@ -145,6 +145,21 @@ CR_IGNORE_PATTERNS=(
   "you are nearing"
   "claude-retrier|claude-auto-retry|CR_LIMIT_PATTERNS|CR_RESET_PATTERNS"
   "^\\s*[#>]\\s"                               # markdown quote / comment in a rendered doc
+)
+
+# `claude agents` — the roster. Every card on it is a DIFFERENT session's last
+# line plus how long ago that line was written; none of it describes the
+# terminal we are wrapping. A card saying "You've hit your session limit ·
+# resets 9:30pm … 3h" is an agent that ran out three hours ago, and taking it
+# for a live banner parked a fresh session for six hours over a limit that had
+# already lifted. The roster also has no input box of its own worth typing
+# "continue" into. So a screen showing one is never scraped — the structured
+# transcript channel still reports a limit hit by this session's own claude.
+CR_ROSTER_PATTERNS=(
+  # the header tally: two counters joined by the middle dot, which is the one
+  # shape no ordinary session output produces.
+  "[0-9]+ (awaiting input|working|completed)\\s*·\\s*[0-9]+ (awaiting input|working|completed)"
+  "describe a task for a new session"
 )
 
 # =============================================================================
@@ -529,6 +544,7 @@ PAT = {
     "working": _patterns("CR_PAT_WORKING"),
     "menu": _patterns("CR_PAT_MENU"),
     "ignore": _patterns("CR_PAT_IGNORE"),
+    "roster": _patterns("CR_PAT_ROSTER"),
 }
 
 
@@ -545,8 +561,23 @@ _ANSI = re.compile(
 )
 
 
+# A full-screen TUI does not print rows, it moves the cursor to them. Claude
+# Code's agent roster repaints every cell through CUP and carriage returns and
+# arrives here without a single "\n" in it, so dropping the escapes left the
+# whole screen as ONE line — and one line always pairs some limit wording with
+# some reset wording, whichever cells they came from. That is how a roster card
+# reading "· resets 9:30pm … 3h" (another agent's limit, three hours old) was
+# read as this session's banner and parked it until half past nine. Turning the
+# motions back into line breaks restores what the eye sees: separate rows.
+_ANSI_MOVE = re.compile(
+    r"\x1b\[[\x30-\x3f]*[HfABEFd]"        # CUP/HVP, cursor up/down, next/prev line, VPA
+    r"|\x1b[ME]"                          # RI / NEL
+    r"|\r\n?"                             # a bare CR is a row of its own; CRLF is one break
+)
+
+
 def strip_ansi(text):
-    return _ANSI.sub("", text)
+    return _ANSI.sub("", _ANSI_MOVE.sub("\n", text))
 
 
 # A tool-call render quotes text ABOUT an error; it is never the live state.
@@ -596,6 +627,11 @@ def is_menu(text):
     return _any(PAT["menu"], strip_ansi(text))
 
 
+def is_roster(text):
+    """Is this the agent roster rather than a session? Then it is not ours."""
+    return _any(PAT["roster"], text)
+
+
 WINDOW = 6          # how far apart a limit line and its reset line may sit
 
 
@@ -604,9 +640,13 @@ def find_limit(text):
 
     Requires a LIMIT line with a RESET line within WINDOW lines — the pairing is
     what separates a banner from prose that merely says the word "limit". Scans
-    bottom-up so the freshest banner wins over a stale one further up.
+    bottom-up so the freshest banner wins over a stale one further up. The agent
+    roster is skipped whole: everything on it belongs to other sessions.
     """
-    lines = [l.rstrip() for l in strip_ansi(text).split("\n")]
+    flat = strip_ansi(text)
+    if is_roster(flat):
+        return None
+    lines = [l.rstrip() for l in flat.split("\n")]
     mask = tool_echo_mask(lines)
     for i in range(len(lines) - 1, -1, -1):
         if mask[i] or not is_limit_line(lines[i]):
@@ -1273,6 +1313,7 @@ class Badge:
     MARK_ALT = "◇"
     PULSE = 1.6            # seconds per half-blink while waiting
     QUIET = 0.12           # output has to have stopped for this long
+    STALE = 2.0            # ...but a screen that never goes quiet still gets painted
     MIN_INTERVAL = 0.15    # hard floor on repaint rate
 
     def __init__(self, cfg):
@@ -1281,6 +1322,7 @@ class Badge:
         self.label = cfg["badge_label"]
         self.last_output = 0.0
         self.last_paint = -1e9
+        self.quiet_since = 0.0   # when the never-arriving quiet gap was first waited on
         self.painted = None      # text currently on screen, None when nothing is
         self.painted_width = 0   # cells it took, so a shorter frame can cover them
         self.pending = True      # claude drew something since we last painted
@@ -1318,7 +1360,19 @@ class Badge:
         if now - self.last_paint < self.MIN_INTERVAL:
             return False
         if now - self.last_output < self.QUIET:
-            return False       # claude is mid-frame; painting now could split it
+            # Claude is mid-frame; painting now could split it. Waiting for a gap
+            # is only safe as long as a gap arrives: the agent roster animates
+            # about ten times a second and never leaves one, which froze the badge
+            # on whichever frame it drew first — a countdown that does not count,
+            # which reads as a dead wrapper, the one thing the badge exists to
+            # disprove. So the wait itself is bounded: after STALE we paint into
+            # the traffic and let claude's next repaint tidy up after us.
+            if not self.quiet_since:
+                self.quiet_since = now
+            if now - self.quiet_since < self.STALE:
+                return False
+        else:
+            self.quiet_since = 0.0
         return self.pending or text != self.painted
 
     # -- where it goes ------------------------------------------------------ #
@@ -1358,6 +1412,7 @@ class Badge:
         if seq is None:
             return False
         self.last_paint = now
+        self.quiet_since = 0.0
         self.pending = False
         self.painted = text
         self.painted_width = len(text)
@@ -1812,7 +1867,8 @@ CR_PAT_RESET=$(printf '%s\n' "${CR_RESET_PATTERNS[@]}")
 CR_PAT_WORKING=$(printf '%s\n' "${CR_WORKING_PATTERNS[@]}")
 CR_PAT_MENU=$(printf '%s\n' "${CR_MENU_PATTERNS[@]}")
 CR_PAT_IGNORE=$(printf '%s\n' "${CR_IGNORE_PATTERNS[@]}")
-export CR_PAT_LIMIT CR_PAT_RESET CR_PAT_WORKING CR_PAT_MENU CR_PAT_IGNORE
+CR_PAT_ROSTER=$(printf '%s\n' "${CR_ROSTER_PATTERNS[@]}")
+export CR_PAT_LIMIT CR_PAT_RESET CR_PAT_WORKING CR_PAT_MENU CR_PAT_IGNORE CR_PAT_ROSTER
 
 case "${1:-}" in
   --cr-dump-python)
@@ -1821,7 +1877,7 @@ case "${1:-}" in
   --cr-dump-patterns)
     # The test suite reads the pattern arrays from here rather than re-declaring
     # them, so a pattern can never be tested in a form the wrapper doesn't use.
-    for _n in LIMIT RESET WORKING MENU IGNORE; do
+    for _n in LIMIT RESET WORKING MENU IGNORE ROSTER; do
       eval "printf '### CR_PAT_%s\n%s\n' \"\$_n\" \"\$CR_PAT_$_n\""
     done
     exit 0 ;;

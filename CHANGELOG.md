@@ -7,6 +7,32 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [1.6.0] - 2026-08-06
+
+What `claude agents` did to the scraper, found in a session that sat out a
+five-hour wait for a limit that had lifted five minutes after it started.
+
+### Fixed
+- The roster (`claude agents`) painted another session's three-hour-old card —
+  `You've hit your session limit · resets 9:30pm … 3h` — and the wrapper read it
+  as its own live banner, parking the terminal until half past nine while the
+  real reset (3:40pm) came and went. A roster is a list of OTHER sessions and
+  has no input box worth typing `continue` into, so a screen showing one is no
+  longer scraped at all. The transcript channel is untouched: a limit hit by
+  this session's own claude still arrives structured.
+- A full-screen TUI positions the cursor instead of printing rows, and the
+  roster reached the scraper with not one `\n` in it. Stripping the escapes left
+  the whole screen as a single line, where any limit wording pairs with any
+  reset wording — that is how a card's clock time was attached to a different
+  card's banner. Cursor motions and carriage returns are now line breaks, so the
+  pairing rule sees the rows the eye sees.
+- The badge froze. It waits for a gap in claude's output before painting over a
+  finished frame, and the roster animates about ten times a second, so the gap
+  never came and the corner kept whichever frame it drew first — a countdown
+  that does not count, which reads as a dead wrapper. The wait for the gap is
+  now bounded (2s), after which it paints into the traffic and lets the next
+  repaint tidy up.
+
 ## [1.5.0] - 2026-08-04
 
 The other half of the 1.3.0 fix, found the same way: a session that had waited
