@@ -451,5 +451,120 @@ class TestTranscriptChannel(PtyTestCase):
         self.assertNotIn("GOT:continue", s.buf)
 
 
+class TestContextRestart(PtyTestCase):
+    """The second trigger, end to end: a session whose context is nearly full is
+    folded into a file, cleared, and unfolded — with the wrapper reading the
+    usage figures claude writes and typing all four steps itself.
+
+    The fake plays the session's side: it writes the handoff when asked, moves to
+    a new transcript on `/clear` (which is what Claude Code does, and what makes
+    "did the context actually fall" answerable), and answers the resume phrase
+    with a small turn.
+    """
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp(prefix="cr-cfg-")
+        self.work = tempfile.mkdtemp(prefix="cr-work-")
+        self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        self.log = os.path.join(self.cfg, "log")
+
+    def env(self, **over):
+        e = {
+            "CLAUDE_CONFIG_DIR": self.cfg,
+            "CR_LOG": self.log,
+            "CR_SCRAPE": "never",
+            "CR_CONTEXT_PCT": "51",              # 510k of a 1M window
+            "CR_HANDOFF_FILE": "handoff.md",
+            "CR_ROOT_IDLE_SEC": "1",
+            "CR_HANDOFF_TIMEOUT_SEC": "45",
+            "CR_STEP_GAP_SEC": "0.5",
+            "CR_VERIFY_SEC": "8",
+            "CR_USER_IDLE_SEC": "0",
+            "CR_POLL_SEC": "0.3",
+            "CR_SLASH_GAP_SEC": "0.2",
+            "CR_SLASH_ENTER_GAP_SEC": "0.2",
+            "FAKE_USAGE": "700000",
+            "FAKE_USAGE_DELAY": "1.0",
+            "FAKE_MODEL": "claude-opus-5",
+        }
+        e.update(over)
+        return e
+
+    def logged(self):
+        try:
+            with open(self.log) as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def wait_log(self, needle, session, timeout=25):
+        """Wait for a line in the wrapper's log, draining the pty meanwhile.
+
+        Waiting on the log rather than on a fixed number of seconds is what keeps
+        these honest on a loaded runner: the assertion is about what the wrapper
+        decided, not about how long it took to decide it.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if needle in self.logged():
+                return True
+            session.drain(0.3)
+        return needle in self.logged()
+
+    def test_a_full_context_is_folded_cleared_and_unfolded(self):
+        s = self.session(env=self.env(), cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_log("context restarted", s), self.logged())
+
+        # The file the whole thing turns on, with the nonce as its last line.
+        with open(os.path.join(self.work, "handoff.md")) as fh:
+            handoff = fh.read()
+        self.assertTrue(handoff.rstrip().split("\n")[-1].startswith("HANDOFF-"))
+
+    def test_the_clear_is_typed_once_however_many_enters_it_takes(self):
+        # Two Enters go out for a slash command, because the first may only
+        # complete the entry the command list highlighted. The second lands in an
+        # empty box when it does not, and an empty box submits nothing.
+        s = self.session(env=self.env(), cwd=self.work)
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+        s.drain(2)
+        self.assertEqual(s.buf.count("GOT:/clear"), 1)
+
+    def test_a_handoff_that_never_arrives_never_clears_anything(self):
+        s = self.session(env=self.env(FAKE_HANDOFF="none", CR_HANDOFF_ATTEMPTS="1"),
+                         cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_log("never written", s), self.logged())
+        s.drain(3)
+        self.assertNotIn("GOT:/clear", s.buf)
+        self.assertFalse(os.path.exists(os.path.join(self.work, "handoff.md")))
+
+    def test_a_handoff_that_stops_before_the_marker_never_clears_anything(self):
+        s = self.session(env=self.env(FAKE_HANDOFF="nomarker", CR_HANDOFF_ATTEMPTS="1"),
+                         cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_log("does not end with", s), self.logged())
+        s.drain(3)
+        self.assertNotIn("GOT:/clear", s.buf)
+
+    def test_a_session_under_the_threshold_is_left_alone(self):
+        s = self.session(env=self.env(FAKE_USAGE="200000"), cwd=self.work)
+        self.assertTrue(s.read_until("ready"))
+        s.drain(6)
+        self.assertNotIn("GOT:handoff", s.buf)
+        self.assertNotIn("GOT:/clear", s.buf)
+
+    def test_the_feature_stays_off_until_it_is_switched_on(self):
+        # The whole point of the default: nobody upgrading this package should
+        # find their session being cleared for them.
+        s = self.session(env=self.env(CR_CONTEXT_PCT="0"), cwd=self.work)
+        self.assertTrue(s.read_until("ready"))
+        s.drain(6)
+        self.assertNotIn("GOT:handoff", s.buf)
+        self.assertNotIn("context restart armed", self.logged())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
