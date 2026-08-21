@@ -536,6 +536,21 @@ except Exception:          # pragma: no cover - stdlib since 3.9
 # --------------------------------------------------------------------------- #
 # config
 # --------------------------------------------------------------------------- #
+def parse_tokens(text):
+    """"200k", "1M", "1_000_000" -> an int. Anything else -> None.
+
+    Up here with the other config readers because it is one: both the window and
+    the absolute threshold are written by hand, and `int("500k")` raising would
+    fall back on the default, which for the threshold means silently off.
+    """
+    s = str(text or "").strip().lower().replace("_", "").replace(",", "")
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([km])?$", s)
+    if not m:
+        return None
+    n = float(m.group(1)) * {"k": 1e3, "m": 1e6}.get(m.group(2), 1)
+    return int(n) if n > 0 else None
+
+
 def _env(name, default, cast=str):
     v = os.environ.get(name)
     if v is None or v == "":
@@ -569,7 +584,7 @@ CFG = dict(
     scrape_confirm=_env("CR_SCRAPE_CONFIRM_SEC", 3.0, float),
     # -- context restart --
     context_pct=_env("CR_CONTEXT_PCT", 0.0, float),
-    context_tokens=_env("CR_CONTEXT_TOKENS", 0, int),
+    context_tokens=parse_tokens(os.environ.get("CR_CONTEXT_TOKENS")) or 0,
     context_window=_env("CR_CONTEXT_WINDOW", "auto"),
     handoff_file=_env("CR_HANDOFF_FILE", ".claude-retrier/handoff.md"),
     handoff_marker=_env("CR_HANDOFF_MARKER", "HANDOFF"),
@@ -1144,16 +1159,6 @@ def model_window(model):
     slug = re.sub(r"\[[^\]]*\]$", "", slug)      # "claude-opus-5[1m]"
     slug = re.sub(r"-\d{8}$", "", slug)           # "claude-haiku-4-5-20251001"
     return CONTEXT_WINDOWS.get(slug)
-
-
-def parse_tokens(text):
-    """"200k", "1M", "1_000_000" -> an int. Anything else -> None."""
-    s = str(text or "").strip().lower().replace("_", "").replace(",", "")
-    m = re.match(r"^(\d+(?:\.\d+)?)\s*([km])?$", s)
-    if not m:
-        return None
-    n = float(m.group(1)) * {"k": 1e3, "m": 1e6}.get(m.group(2), 1)
-    return int(n) if n > 0 else None
 
 
 def human_tokens(n):
@@ -1813,6 +1818,11 @@ class Controller:
         self.cycles += 1
         self.handoff_tries = 0
         self.resume_tries = 0
+        # The reading we acted on is the one the restart has to be judged
+        # against. Taking it at /clear time instead would mean trusting whatever
+        # the last row said by then — and a project directory can hold more than
+        # one live transcript, so "by then" is not always this session.
+        self.context_before = self.context_tokens
         self.log("context is %s of a %s window (%.0f%%, threshold %s); folding up"
                  % (human_tokens(self.context_tokens), human_tokens(self.context_window),
                     self.context_pct() or 0.0, human_tokens(self.context_limit)))
@@ -1847,7 +1857,7 @@ class Controller:
             return None
         # The one irreversible step, and the only route to it is a handoff that
         # satisfied all four layers below.
-        self.context_before = self.context_tokens or 0
+        self.context_before = max(self.context_before or 0, self.context_tokens or 0)
         self.rstate = CLEARED
         self.restart_left = self.cfg["handoff_timeout"]
         self.rwake = now + self.cfg["step_gap"]
@@ -1946,13 +1956,16 @@ class Controller:
             self.log("the resume phrase left no trace; sending it again (%d/%d)"
                      % (self.resume_tries, self.cfg["handoff_attempts"]))
             return self._send_resume(now)
-        # The window closed with the old context still in place, which means the
-        # clear did not happen. Trying again would only type into a session that
-        # is as full as it was, for as long as it lives.
-        return self._abort_restart(
-            "the context did not fall after %s (still %s)"
-            % (self.cfg["clear_cmd"], human_tokens(self.context_tokens)),
-            now, permanent=True)
+        # Two different failures end up here and they read very differently in a
+        # log. Either the phrase never reached the input box, or it did and the
+        # context is still the size it was — which means the clear did nothing.
+        # Both stop for good: retrying would type into a session that is as full
+        # as it was, or into one that cannot be typed into at all.
+        why = ("the context did not fall after %s (still %s)"
+               % (self.cfg["clear_cmd"], human_tokens(self.context_tokens))
+               if self.resume_echoed else
+               "the resume phrase never reached the session")
+        return self._abort_restart(why, now, permanent=True)
 
     # -- a limit in the middle of it ---------------------------------------- #
     def _after_limit(self, now):

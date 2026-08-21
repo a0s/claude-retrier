@@ -827,6 +827,32 @@ class TestTheClearHasToHaveWorked(RestartTestCase):
         usage(ctl, 200, FULL)
         self.assertIsNone(self.tick(ctl, 1000))    # and never tries again
 
+    def test_the_reading_it_is_judged_against_is_the_one_it_acted_on(self):
+        # A project directory can hold more than one live transcript, and the
+        # one that grew last is only usually ours. Taking the "before" figure at
+        # /clear time rather than at the trigger would mean judging the restart
+        # against whichever session happened to speak in between — and against a
+        # small enough number, a real restart reads as a failure and switches the
+        # feature off for good.
+        ctl = restart_controller()
+        self.fold(ctl)
+        self.folded(ctl)
+        usage(ctl, 66, 9000, path="/proj/somebody-else.jsonl")
+        self.assertEqual(self.tick(ctl, 90), ("inject", "/clear", False))
+        self.assertEqual(ctl.context_before, FULL)
+
+    def test_a_resume_that_never_lands_says_that_and_not_something_else(self):
+        # Two failures end in the same place and read completely differently in
+        # a log: a clear that did nothing, and a phrase that never arrived.
+        ctl = restart_controller(handoff_attempts=1)
+        self.unfolding(ctl)
+        usage(ctl, 80, FULL, path=MINE)
+        self.assertEqual(self.tick(ctl, 130), ("inject", RESUME, False))
+        action = self.tick(ctl, 200)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("never reached the session", action[1])
+        self.assertTrue(ctl.context_off)
+
     def test_a_resume_that_left_no_trace_is_sent_again(self):
         ctl = restart_controller()
         self.unfolding(ctl)
@@ -1066,6 +1092,22 @@ class TestWhatCountsAsContext(RestartTestCase):
         usage(ctl, 0, FULL, path=MINE)
         usage(ctl, 1, 9000, path="/proj/after.jsonl")
         self.assertEqual(ctl.context_tokens, 9000)
+
+
+class TestSettingsAsPeopleWriteThem(unittest.TestCase):
+    """The thresholds are typed by hand into a shell, and a value that fails to
+    parse falls back on the default — which for this feature is "off". Silently
+    off is the one outcome nobody would ever notice."""
+
+    def test_an_absolute_threshold_may_be_written_the_short_way(self):
+        from helper import load as reload_impl
+        for written, want in (("500k", 500000), ("1M", 1000000), ("450000", 450000)):
+            mod = reload_impl(CR_CONTEXT_TOKENS=written)
+            self.assertEqual(mod.CFG["context_tokens"], want, written)
+
+    def test_nonsense_is_not_a_threshold(self):
+        from helper import load as reload_impl
+        self.assertEqual(reload_impl(CR_CONTEXT_TOKENS="lots").CFG["context_tokens"], 0)
 
 
 class TestWhatTheCornerSays(RestartTestCase):
