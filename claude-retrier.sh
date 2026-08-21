@@ -17,6 +17,11 @@
 # command line. Anything the wrapper cannot exec itself is run through your login
 # shell, so rc-file aliases work exactly as they do when you type them.
 #
+# It can also restart a session that is running out of context window: at
+# CR_CONTEXT_PCT of the window it asks Claude for a handoff file, checks that the
+# file really was written, clears the session and unfolds it from that file. Off
+# unless you set CR_CONTEXT_PCT — see the README.
+#
 # While it runs there is a dim `◆ cr` in a corner of the screen — the wrapper's
 # only visible output. CR_BADGE=0 removes it.
 #
@@ -24,7 +29,7 @@
 
 set -u
 
-CR_VERSION="1.6.0"
+CR_VERSION="1.7.0"
 
 # =============================================================================
 # SECTION 1 — DETECTION PATTERNS
@@ -192,13 +197,54 @@ CR_ROSTER_PATTERNS=(
 : "${CR_POLL_SEC:=2}"                  # transcript poll interval
 : "${CR_SCRAPE_CONFIRM_SEC:=3}"        # a scraped banner must persist this long
 
+# --- context restart ---------------------------------------------------------
+# The second trigger: not "the quota ran out" but "the context window is filling
+# up". At the threshold the wrapper asks Claude to fold the session into a file,
+# proves the file was really written, clears the session, and hands the file to
+# a fresh one.
+#
+# OFF by default, and it has to be: this types into a live session and throws its
+# history away. Nothing below happens until CR_CONTEXT_PCT (or CR_CONTEXT_TOKENS)
+# is set to something other than 0.
+: "${CR_CONTEXT_PCT:=0}"               # restart at this % of the window; 0 = feature off
+: "${CR_CONTEXT_TOKENS:=0}"            # absolute threshold; wins over the percentage
+: "${CR_CONTEXT_WINDOW:=auto}"         # auto | 200k | 1M | a plain number
+: "${CR_HANDOFF_FILE:=.claude-retrier/handoff.md}"   # relative to cwd — .gitignore it
+: "${CR_HANDOFF_MARKER:=HANDOFF}"      # a nonce is appended; must end the file
+: "${CR_HANDOFF_MIN_BYTES:=200}"       # anything shorter is not a handoff
+: "${CR_HANDOFF_ATTEMPTS:=2}"          # tries to fold before giving up
+# Three things in this phrase are load-bearing: no new work, "a fresh session
+# that has no memory of this one", and the marker as the LAST LINE OF THE FILE.
+# A marker in the chat would only prove the model believes it finished; a marker
+# at the end of the file proves the write ran to completion. {file} and {marker}
+# are substituted. It has to stay one line: a newline submits it.
+CR_HANDOFF_MSG_DEFAULT='Wrap up now. Do not start new work. Write a complete handoff to `{file}` for a fresh session that has no memory of this one: current state, what is in flight, what to do next, and the exact commands to verify. The very last line of that file must be exactly {marker} and nothing else — write it only after the rest of the file is complete.'
+: "${CR_HANDOFF_MSG:=$CR_HANDOFF_MSG_DEFAULT}"
+: "${CR_CLEAR_CMD:=/clear}"            # the built-in that starts a new session in place
+CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
+: "${CR_RESUME_MSG:=$CR_RESUME_MSG_DEFAULT}"
+: "${CR_ROOT_IDLE_SEC:=20}"            # transcript quiet this long => the turn is over
+: "${CR_HANDOFF_TIMEOUT_SEC:=900}"     # per restart step, and frozen while a limit runs
+: "${CR_STEP_GAP_SEC:=3}"              # between /clear and the resume phrase
+: "${CR_CONTEXT_COOLDOWN_SEC:=600}"    # silence after any restart, successful or not
+: "${CR_CONTEXT_MAX_CYCLES:=0}"        # 0 = no cap; >0 is a fuse against a loop
+# Typing a "/" opens Claude Code's command list, where Enter can pick the
+# highlighted entry instead of submitting what was typed. On Claude Code 2.1.222
+# one Enter runs /clear and nothing asks for confirmation — so a slash command
+# gets a longer pause, for the list to settle on the exact match, and a second
+# Enter purely as insurance. That second one is free: an Enter into an empty box
+# submits nothing.
+: "${CR_SLASH_GAP_SEC:=0.9}"           # after typing a slash command, before Enter
+: "${CR_SLASH_ENTER:=2}"               # Enters to send for one
+: "${CR_SLASH_ENTER_GAP_SEC:=0.6}"     # between them
+
 # =============================================================================
 # SECTION 3 — argument handling / degradation
 # =============================================================================
 case "${1:-}" in
   --cr-version) echo "claude-retrier $CR_VERSION"; exit 0 ;;
   --cr-help|-h|--help-retrier)
-    sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
 esac
 
@@ -521,6 +567,29 @@ CFG = dict(
     wait_scale=max(1e-6, _env("CR_WAIT_SCALE", 1.0, float)),
     poll=_env("CR_POLL_SEC", 2.0, float),
     scrape_confirm=_env("CR_SCRAPE_CONFIRM_SEC", 3.0, float),
+    # -- context restart --
+    context_pct=_env("CR_CONTEXT_PCT", 0.0, float),
+    context_tokens=_env("CR_CONTEXT_TOKENS", 0, int),
+    context_window=_env("CR_CONTEXT_WINDOW", "auto"),
+    handoff_file=_env("CR_HANDOFF_FILE", ".claude-retrier/handoff.md"),
+    handoff_marker=_env("CR_HANDOFF_MARKER", "HANDOFF"),
+    handoff_min_bytes=_env("CR_HANDOFF_MIN_BYTES", 200, int),
+    handoff_attempts=_env("CR_HANDOFF_ATTEMPTS", 2, int),
+    handoff_msg=_env("CR_HANDOFF_MSG", ""),
+    clear_cmd=_env("CR_CLEAR_CMD", "/clear"),
+    resume_msg=_env("CR_RESUME_MSG", "Read `{file}` and continue from it."),
+    root_idle=_env("CR_ROOT_IDLE_SEC", 20.0, float),
+    handoff_timeout=_env("CR_HANDOFF_TIMEOUT_SEC", 900.0, float),
+    step_gap=_env("CR_STEP_GAP_SEC", 3.0, float),
+    context_cooldown=_env("CR_CONTEXT_COOLDOWN_SEC", 600.0, float),
+    context_max_cycles=_env("CR_CONTEXT_MAX_CYCLES", 0, int),
+    slash_gap=_env("CR_SLASH_GAP_SEC", 0.9, float),
+    slash_enter=_env("CR_SLASH_ENTER", 2, int),
+    slash_enter_gap=_env("CR_SLASH_ENTER_GAP_SEC", 0.6, float),
+    # Claude Code's own switches, read from the environment we hand it: the
+    # wrapper starts claude itself, so whatever narrows its window narrows ours.
+    context_env_max=_env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", 0, int),
+    context_no_1m=_env("CLAUDE_CODE_DISABLE_1M_CONTEXT", "0") not in ("0", "false", "no"),
 )
 
 
@@ -831,22 +900,47 @@ def project_dir(cwd=None, config_dir=None):
 _ASSISTANT_ROW = re.compile(rb'"type"\s*:\s*"assistant"')
 
 
+def assistant_row(rec):
+    """What an assistant row says beyond "the session answered".
+
+    `tokens` is the context that turn was sent with, straight out of the API's
+    own accounting; `stop_reason` is how the turn ended, which is the difference
+    between a model that finished and one that was cut off mid-sentence.
+
+    `sidechain` is here because a subagent started with the Agent tool writes
+    into the SAME transcript as the session that started it, and its usage is ITS
+    context, not the session's. Read as the session's it would either hide a full
+    window behind a small subagent or call for a restart over a subagent that
+    grew large.
+    """
+    msg = rec.get("message") or {}
+    return dict(kind="alive", ts=rec.get("timestamp"),
+                tokens=usage_tokens(msg.get("usage")),
+                model=msg.get("model"),
+                stop_reason=msg.get("stop_reason"),
+                sidechain=bool(rec.get("isSidechain")))
+
+
 def transcript_limit_records(path, offset=0, echo=None):
     """(new_offset, [records]) for rows appended past `offset` that we care about.
 
-    Three kinds: the rate-limit rows; — when `echo` is the retry message — the
-    user row claude writes when it accepts a prompt; and assistant rows. That
-    user row is proof the retry was submitted rather than left sitting in the
-    input box, which is the only question the verify step is really asking
-    (screen-scraping the footer to answer it broke the day Claude Code reworded
-    it). An assistant row is proof the account is serving requests, which is the
-    question a wait is really asking.
+    Three kinds: the rate-limit rows; — when `echo` is a message we typed, or a
+    list of them — the user row claude writes when it accepts a prompt; and
+    assistant rows. That user row is proof the message was submitted rather than
+    left sitting in the input box, which is the only question the verify step is
+    really asking (screen-scraping the footer to answer it broke the day Claude
+    Code reworded it). An assistant row is proof the account is serving requests,
+    which is the question a wait is really asking — and it carries the usage
+    figures the context trigger reads.
 
     Consecutive assistant rows collapse into one: a single answer can be a dozen
     of them, and the caller only needs the fact.
     """
     out = []
-    echo_key = ('"%s"' % echo).encode("utf-8", "replace") if echo else None
+    echoes = [echo] if isinstance(echo, str) else [e for e in (echo or []) if e]
+    # json.dumps rather than quoting by hand: a message with a quote, a backslash
+    # or a tab in it is escaped in the row exactly the way it is escaped here.
+    echo_keys = [json.dumps(e).encode("utf-8", "replace") for e in echoes]
     try:
         with open(path, "rb") as fh:
             if offset:
@@ -870,7 +964,7 @@ def transcript_limit_records(path, offset=0, echo=None):
     new_offset = offset + tail_nl + 1
     for raw in data[:tail_nl].split(b"\n"):
         limitish = b"rate_limit" in raw or b"isApiErrorMessage" in raw
-        echoish = bool(echo_key) and echo_key in raw and b'"user"' in raw
+        echoish = b'"user"' in raw and any(k in raw for k in echo_keys)
         # Prefilters only — all three can match on a tool result that merely
         # quotes the words, so the row's own "type" decides below.
         aliveish = bool(_ASSISTANT_ROW.search(raw))
@@ -881,11 +975,19 @@ def transcript_limit_records(path, offset=0, echo=None):
         except Exception:
             continue
         if not rec.get("isApiErrorMessage"):
-            if echoish and rec.get("type") == "user" and record_text(rec) == echo:
-                out.append(dict(kind="echo", text=echo, ts=rec.get("timestamp")))
+            text = record_text(rec) if echoish and rec.get("type") == "user" else None
+            if text is not None and text in echoes:
+                out.append(dict(kind="echo", text=text, ts=rec.get("timestamp")))
             elif rec.get("type") == "assistant":
-                if not out or out[-1]["kind"] != "alive":
-                    out.append(dict(kind="alive", ts=rec.get("timestamp")))
+                row = assistant_row(rec)
+                if out and out[-1]["kind"] == "alive":
+                    # The collapse keeps the NEWEST row's figures. Keeping the
+                    # older row's would freeze the context reading at whatever it
+                    # was when the answer began, which for a long answer is a
+                    # threshold that arrives an answer late.
+                    out[-1].update(row)
+                else:
+                    out.append(row)
             continue
         err = str(rec.get("error") or "")
         status = rec.get("apiErrorStatus")
@@ -921,7 +1023,10 @@ class TranscriptWatcher:
         self.offsets = {}
         self.next_poll = 0.0
         self.seen_any = False
+        self.grown = []          # files that gained bytes in the last poll
+        self.current = None      # of those, the one this terminal's session writes
         self._seed(now or time.time())
+        self.preexisting = set(self.offsets)
 
     def _seed(self, _now):
         for p in glob.glob(os.path.join(self.dir, "*.jsonl")):
@@ -932,6 +1037,7 @@ class TranscriptWatcher:
 
     def poll_now(self, now=None):
         now = now if now is not None else time.time()
+        self.grown = []
         if now < self.next_poll:
             return []
         self.next_poll = now + self.poll
@@ -948,10 +1054,136 @@ class TranscriptWatcher:
                 start = 0
             if size > start:
                 self.seen_any = True
+                self.grown.append(p)
             offset, recs = transcript_limit_records(p, start, self.echo)
             self.offsets[p] = offset
+            for rec in recs:
+                rec["path"] = p
             found.extend(recs)
+        self._pick_current()
         return found
+
+    def _pick_current(self):
+        """Which of the growing transcripts belongs to the session at this terminal.
+
+        A project directory holds more than one: yesterday's sessions, and — when
+        work is run under the same cwd from somewhere else — other live ones. For
+        a limit that never mattered, since a limit is the account's and not a
+        session's. For the context trigger it matters entirely: reading another
+        session's usage as this one's is a restart at the wrong moment or none at
+        all.
+
+        Two rules, and no guessing beyond them. Stay with the file already being
+        followed for as long as it keeps growing — that survives another session
+        writing a burst in between. When it stops (which is what `/clear` looks
+        like from here: the session moves to a new file), prefer one that did not
+        exist when we started, because our claude created its transcript within a
+        second of us and anything else in this directory is older.
+        """
+        if not self.grown or self.current in self.grown:
+            return
+        fresh = [p for p in self.grown if p not in self.preexisting]
+        self.current = max(fresh or self.grown, key=self._mtime)
+
+    @staticmethod
+    def _mtime(path):
+        try:
+            return os.path.getmtime(path)
+        except OSError:
+            return 0.0
+
+
+# --------------------------------------------------------------------------- #
+# context accounting — the numbers Claude already wrote down
+# --------------------------------------------------------------------------- #
+# Nothing here counts tokens. Every assistant row in the transcript carries the
+# API's own `usage`, and these three input counters ARE the prompt that was sent,
+# which is what "how full is the context" means. Output tokens are deliberately
+# left out: they are not context until the next turn quotes them back, and by
+# then they are inside cache_creation.
+_USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+
+# Native context window per model slug. The transcript writes the slug clean —
+# "claude-opus-5", no [1m] suffix — so a table answers it with no network call
+# and no guessing from the numbers themselves.
+#
+# Guessing LOW is the safe direction and the table leans that way: a window
+# assumed too small restarts a little early, one assumed too large never
+# restarts at all, and "never" is the failure that is invisible until the
+# session dies of a full context.
+CONTEXT_WINDOWS = {
+    "claude-opus-5": 1000000,
+    "claude-opus-4-8": 1000000,
+    "claude-opus-4-7": 1000000,
+    "claude-opus-4-6": 1000000,
+    "claude-sonnet-5": 1000000,
+    "claude-sonnet-4-6": 1000000,
+    "claude-fable-5": 1000000,
+    "claude-mythos-5": 1000000,
+    "claude-opus-4-5": 200000,
+    "claude-opus-4-1": 200000,
+    "claude-sonnet-4-5": 200000,
+    "claude-haiku-4-5": 200000,
+}
+SMALL_WINDOW = 200000
+BIG_WINDOW = 1000000
+
+
+def usage_tokens(usage):
+    """The context a turn was sent with, or None when the row does not say."""
+    if not isinstance(usage, dict):
+        return None
+    nums = [usage.get(k) for k in _USAGE_KEYS]
+    nums = [n for n in nums if isinstance(n, (int, float)) and not isinstance(n, bool)]
+    return int(sum(nums)) if nums else None
+
+
+def model_window(model):
+    """Native window for a model slug, or None when the slug is not in the table."""
+    slug = (model or "").strip().lower()
+    slug = re.sub(r"\[[^\]]*\]$", "", slug)      # "claude-opus-5[1m]"
+    slug = re.sub(r"-\d{8}$", "", slug)           # "claude-haiku-4-5-20251001"
+    return CONTEXT_WINDOWS.get(slug)
+
+
+def parse_tokens(text):
+    """"200k", "1M", "1_000_000" -> an int. Anything else -> None."""
+    s = str(text or "").strip().lower().replace("_", "").replace(",", "")
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([km])?$", s)
+    if not m:
+        return None
+    n = float(m.group(1)) * {"k": 1e3, "m": 1e6}.get(m.group(2), 1)
+    return int(n) if n > 0 else None
+
+
+def human_tokens(n):
+    if n is None:
+        return "?"
+    if n >= 1000000:
+        return "%.1fM" % (n / 1e6)
+    if n >= 1000:
+        return "%dk" % (n // 1000)
+    return str(int(n))
+
+
+def read_handoff(path, tail_bytes=512):
+    """dict(size, mtime, tail) for the handoff file, or None when there isn't one.
+
+    Only the tail is read. The file is the session's entire working state and can
+    be long; the one thing wanted from it is whether its last line is the nonce
+    that was asked for — the proof the write ran to the end instead of stopping
+    somewhere in the middle.
+    """
+    try:
+        st = os.stat(path)
+        with open(path, "rb") as fh:
+            if st.st_size > tail_bytes:
+                fh.seek(st.st_size - tail_bytes)
+            tail = fh.read(tail_bytes)
+    except OSError:
+        return None
+    return dict(size=st.st_size, mtime=st.st_mtime,
+                tail=tail.decode("utf-8", "replace"))
 
 
 # --------------------------------------------------------------------------- #
@@ -959,10 +1191,34 @@ class TranscriptWatcher:
 # --------------------------------------------------------------------------- #
 IDLE, WAITING, VERIFY, DONE = "idle", "waiting", "verify", "done"
 
+# The context restart runs alongside those rather than inside them. A limit that
+# lands in the middle of one does not cancel it — it suspends it — so the two
+# machines each have to be able to hold a position of their own.
+HANDOFF_SENT, HANDOFF_OK, CLEARED, RESUME_SENT = (
+    "handoff_sent", "handoff_ok", "cleared", "resume_sent")
+
+RESTART_LABELS = {HANDOFF_SENT: "folding", HANDOFF_OK: "folded",
+                  CLEARED: "cleared", RESUME_SENT: "unfolding"}
+
+# Defaults for everything the context restart reads, so a Controller built from a
+# config dict written before the feature existed (the tests build several) still
+# has them, and disabled is what it gets.
+CONTEXT_DEFAULTS = dict(
+    context_pct=0.0, context_tokens=0, context_window="auto",
+    context_env_max=0, context_no_1m=False,
+    handoff_file=".claude-retrier/handoff.md", handoff_marker="HANDOFF",
+    handoff_min_bytes=200, handoff_attempts=2, handoff_msg="", clear_cmd="/clear",
+    resume_msg="Read `{file}` and continue from it.",
+    root_idle=20.0, handoff_timeout=900.0, step_gap=3.0,
+    context_cooldown=600.0, context_max_cycles=0,
+)
+
 
 class Controller:
-    def __init__(self, cfg, log=lambda *_: None, now=None):
-        self.cfg = cfg
+    def __init__(self, cfg, log=lambda *_: None, now=None, probe=None):
+        # A config that predates the context restart keeps working, disabled.
+        self.cfg = dict(CONTEXT_DEFAULTS, **cfg)
+        cfg = self.cfg
         self.log = log
         self.state = IDLE
         self.wake_at = 0.0
@@ -981,6 +1237,36 @@ class Controller:
         self._carry = ""          # overlap so a marker split across two reads still matches
         self._input_carry = b""   # an escape sequence cut in half by a read boundary
         self.last_draft_change = now if now is not None else time.time()
+
+        # -- the context restart ---------------------------------------------- #
+        # Reading the handoff file is the only I/O any of this needs, and it goes
+        # through `probe` so the tests can hand over a file that never existed.
+        self.probe = probe or read_handoff
+        self.handoff_path = os.path.abspath(cfg["handoff_file"])
+        self.resume_text = cfg["resume_msg"].replace("{file}", cfg["handoff_file"])
+        self.context_tokens = None    # what the session's last turn was sent with
+        self.context_model = None
+        self.context_window = None
+        self.context_limit = None     # the threshold in tokens; None = no trigger
+        self.context_path = None      # the transcript those figures came from
+        self.context_grew_at = 0.0    # ...and when it last gained a byte
+        self.context_off = False      # a failure bad enough not to repeat
+        self.last_stop_reason = None  # how the turn we are waiting on ended
+        self.rstate = None            # None | HANDOFF_SENT | HANDOFF_OK | CLEARED | RESUME_SENT
+        self.nonce = None             # the marker only this attempt can satisfy
+        self.handoff_sent_at = 0.0
+        self.handoff_tries = 0        # the model failing to fold, not the world failing
+        self.resume_tries = 0
+        self.restart_left = 0.0       # timeout budget for the current step
+        self.rwake = 0.0              # earliest moment for the next step
+        self.cycles = 0
+        self.cooldown_until = 0.0
+        self.context_before = 0       # what the context read just before /clear
+        self.resume_echoed = False
+        self._restart_tick = None     # last tick the restart clock actually ran
+        self._rearm = False           # a wait ended mid-restart: re-send the step
+        self._gate_note = None
+        self._window_bumped = False
 
     # -- inputs ------------------------------------------------------------- #
     # Not everything arriving on our stdin was typed. The terminal answers
@@ -1160,6 +1446,10 @@ class Controller:
         self.banner = None
         self.banner_text = None
         self.wake_at = 0.0
+        if self.rstate is not None:
+            # The restart was suspended by this wait, not cancelled by it. Its
+            # current step has to go out again — nothing else will send it.
+            self._rearm = True
         return True
 
     def on_limit(self, banner, now, source):
@@ -1173,6 +1463,11 @@ class Controller:
                      % (source, secs, banner))
         else:
             self.log("limit detected (%s), resets in %.0fs: %s" % (source, secs, banner))
+        if self.rstate is not None:
+            # Not a reason to abandon the restart: the handoff file outlives a
+            # wait of any length, and every clock the restart runs on stops here.
+            self.log("the limit landed mid-restart (%s); the restart waits it out"
+                     % self.rstate)
         secs = min(secs + self.cfg["margin"], self.cfg["max_wait"])
         self.banner = key
         self.banner_text = banner
@@ -1186,7 +1481,21 @@ class Controller:
 
     # -- clock -------------------------------------------------------------- #
     def tick(self, now):
-        """Return an action: None, ('inject', text, dismiss_menu), or ('resume',)."""
+        """Return an action: None, ('inject', text, dismiss_menu), ('resume',) or
+        ('notify', text)."""
+        if self.state in (WAITING, VERIFY):
+            # A restart makes no progress while the quota is out, and none of its
+            # clocks may run out either: a weekly limit is days long and a
+            # fifteen-minute handoff timeout would expire inside it, aborting a
+            # restart that is going perfectly well.
+            self._restart_tick = None
+            return self._tick_limit(now)
+        action = self._tick_restart(now)
+        if action is not None:
+            return action
+        return self._tick_limit(now)
+
+    def _tick_limit(self, now):
         if self.state == WAITING:
             if self._alive_again(now) and self.on_alive(now, "output"):
                 return ("resume",)
@@ -1220,13 +1529,19 @@ class Controller:
                 return None
             self.deferred = False
             self.typing_since = 0.0
+            # `continue` means "carry on with what you were doing", and that is
+            # the wrong instruction at every step of a restart but the last.
+            if self.rstate is not None:
+                handled, step = self._after_limit(now)
+                if handled:
+                    self.state = IDLE
+                    self.attempts = 0
+                    return step
             self.attempts += 1
             self.state = VERIFY
             self.wake_at = now + self.cfg["verify"]
-            dismiss = self.menu_open
-            self.menu_open = False
             self.log("sending retry (attempt %d/%d)" % (self.attempts, self.cfg["max_attempts"]))
-            return ("inject", self.cfg["message"], dismiss)
+            return ("inject", self.cfg["message"], self._take_dismiss())
 
         if self.state == VERIFY:
             if now - self.last_working < self.cfg["busy_idle"]:
@@ -1242,7 +1557,7 @@ class Controller:
                 # Re-enter immediately: making the caller wait for the next tick
                 # would silently drop an attempt, and at the give-up boundary
                 # would leave the controller parked in WAITING forever.
-                return self.tick(now)
+                return self._tick_limit(now)
             return None
         return None
 
@@ -1260,9 +1575,25 @@ class Controller:
             return False                        # it has already ended
         return self.last_working - self.working_since >= self.cfg["resume"]
 
+    def _take_dismiss(self):
+        """Consume the "a menu is open" flag: the next thing typed dismisses it."""
+        dismiss = self.menu_open
+        self.menu_open = False
+        return dismiss
+
     def _blocked(self, now):
         if now - self.last_working < self.cfg["busy_idle"]:
             return "claude is working"
+        return self._blocked_by_human(now)
+
+    def _blocked_by_human(self, now):
+        """The gates that protect a person, apart from the one that protects a turn.
+
+        A context restart uses only these. Whether the session is busy is a
+        question the transcript answers exactly (`_session_busy`); the screen
+        cannot, because in a session that keeps background work running there is
+        always something painting a footer and it would never read idle.
+        """
         if now - self.last_user_input < self.cfg["user_idle"]:
             return "user is typing"
         if self.pending_input_chars > 0:
@@ -1278,6 +1609,405 @@ class Controller:
             self.pending_input_chars = 0
             self.last_draft_change = now
         return None
+
+    # ----------------------------------------------------------------------- #
+    # the context restart
+    # ----------------------------------------------------------------------- #
+    # Fold the session into a file, prove the file is real, clear the session,
+    # unfold it. Four steps, and the third one is irreversible — everything else
+    # here exists to make sure it is never reached on a promise.
+
+    MTIME_SLACK = 2.0      # some filesystems keep mtime to the second
+    RESTART_DROP = 0.5     # the context has to at least halve for /clear to have worked
+    BADGE_NEAR = 0.8       # show the percentage only once the threshold is in sight
+    GATE_RETRY = 5.0       # how long to sit on a held step before looking again
+
+    @property
+    def context_enabled(self):
+        return not self.context_off and (
+            self.cfg["context_tokens"] > 0 or self.cfg["context_pct"] > 0)
+
+    def context_pct(self):
+        if not self.context_window or self.context_tokens is None:
+            return None
+        return 100.0 * self.context_tokens / self.context_window
+
+    # -- inputs ------------------------------------------------------------- #
+    def on_context(self, rec, now):
+        """An assistant row from the transcript this terminal's session writes.
+
+        Everything the trigger needs is already in the row, so this is two
+        comparisons and no arithmetic of our own. It runs where the watcher has
+        just parsed the row — no extra poll, no re-read, and nothing at all on a
+        tick where the file did not grow.
+        """
+        path = rec.get("path")
+        if path and path != self.context_path:
+            # A different transcript: `/clear` moving the session to a new file,
+            # or the very first row we have seen. Its figures replace, never mix.
+            self.context_path = path
+            self.context_tokens = None
+        self.context_grew_at = now
+        if rec.get("sidechain"):
+            return                       # a subagent's context, not the session's
+        if rec.get("stop_reason") is not None:
+            self.last_stop_reason = rec["stop_reason"]
+        model = rec.get("model")
+        if model and model != self.context_model:
+            self.context_model = model
+            self._resolve_window()
+        tokens = rec.get("tokens")
+        if tokens is None:
+            return
+        self.context_tokens = tokens
+        if (self.context_window and tokens > self.context_window
+                and not self._window_bumped and not parse_tokens(self.cfg["context_window"])):
+            # Guessing low is the safe direction, but being PROVED low is not a
+            # reason to keep the guess: a threshold above the window we assumed
+            # is a restart that can never happen.
+            self._window_bumped = True
+            self.log("context is %s, past the %s window assumed for %s; assuming %s"
+                     % (human_tokens(tokens), human_tokens(self.context_window),
+                        self.context_model, human_tokens(BIG_WINDOW)))
+            self.context_window = BIG_WINDOW
+            self._recompute_limit()
+
+    def note_growth(self, paths, now):
+        """The transcript we follow gained bytes, so the session is mid-turn.
+
+        Idle is measured here rather than on the screen (see `_blocked_by_human`)
+        and by bytes rather than by the rows we happen to parse: the gap between
+        a tool call and its result can be minutes long, and the file grows across
+        it while assistant rows do not. Subagents write into this same file,
+        which is right — their work is the session's work.
+        """
+        if self.context_path and self.context_path in paths:
+            self.context_grew_at = now
+
+    def on_resume_echo(self, now):
+        """claude wrote the resume phrase into the transcript: it was submitted."""
+        if self.rstate != RESUME_SENT:
+            return False
+        self.log("the resume phrase was accepted")
+        self.resume_echoed = True
+        return True
+
+    # -- what the badge shows ----------------------------------------------- #
+    def badge_context(self):
+        """The context percentage worth putting on screen, or None.
+
+        Only near the threshold. A number sitting at 12% all day is noise, and
+        the single question the corner can usefully answer about this feature is
+        whether the threshold you picked is anywhere near sane.
+        """
+        if not self.context_enabled or not self.context_limit:
+            return None
+        if self.context_tokens is None:
+            return None
+        if self.context_tokens < self.context_limit * self.BADGE_NEAR:
+            return None
+        return self.context_pct()
+
+    def inject_note(self):
+        """The one line the human sees when something is typed for them."""
+        return {
+            HANDOFF_SENT: "context is filling up; asking for a handoff",
+            CLEARED: "handoff verified; clearing the context",
+            RESUME_SENT: "context cleared; unfolding the handoff",
+        }.get(self.rstate, "limit lifted; resuming session")
+
+    # -- the window --------------------------------------------------------- #
+    def _resolve_window(self):
+        """How large the context window is, in the order the answers are trusted."""
+        forced = parse_tokens(self.cfg["context_window"])
+        native = model_window(self.context_model)
+        if forced:
+            self.context_window, why = forced, "CR_CONTEXT_WINDOW"
+        elif self.cfg["context_env_max"] > 0:
+            self.context_window, why = (int(self.cfg["context_env_max"]),
+                                        "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        elif native is None:
+            self.context_window, why = SMALL_WINDOW, "an unfamiliar model slug"
+        elif self.cfg["context_no_1m"]:
+            # We started claude ourselves, so its environment is ours to read:
+            # the long window is switched off for this session whatever the
+            # model is capable of.
+            self.context_window, why = (min(native, SMALL_WINDOW),
+                                        "CLAUDE_CODE_DISABLE_1M_CONTEXT")
+        else:
+            self.context_window, why = native, "the model"
+        self._window_bumped = False
+        self._recompute_limit()
+        if self.context_enabled:
+            self.log("%s: a %s context window (%s), restarting at %s"
+                     % (self.context_model, human_tokens(self.context_window), why,
+                        human_tokens(self.context_limit)))
+
+    def _recompute_limit(self):
+        if self.cfg["context_tokens"] > 0:
+            self.context_limit = int(self.cfg["context_tokens"])
+        elif self.cfg["context_pct"] > 0 and self.context_window:
+            self.context_limit = int(self.context_window * self.cfg["context_pct"] / 100.0)
+        else:
+            self.context_limit = None
+
+    # -- the machine -------------------------------------------------------- #
+    def _tick_restart(self, now):
+        prev, self._restart_tick = self._restart_tick, now
+        if self.rstate is None:
+            return self._maybe_restart(now)
+        if prev is not None:
+            # The clock only runs on ticks where the restart could actually have
+            # made progress; `tick` blanks it for the duration of a limit.
+            self.restart_left -= max(0.0, now - prev)
+        if self._rearm:
+            self._rearm = False
+            return self._after_limit(now)[1]
+        if self.rstate == HANDOFF_SENT:
+            return self._check_handoff(now)
+        if self.restart_left <= 0:
+            return self._abort_restart("%s took longer than %.0fs"
+                                       % (self.rstate, self.cfg["handoff_timeout"]), now)
+        if self.rstate == HANDOFF_OK:
+            return self._send_clear(now)
+        if self.rstate == CLEARED:
+            if now < self.rwake or self._held(now):
+                return None
+            return self._send_resume(now)
+        if self.rstate == RESUME_SENT:
+            return self._check_resume(now)
+        return None
+
+    def _held(self, now):
+        """Is a person or a running turn holding the next step back?
+
+        Logged only when the answer changes: this is asked several times a second
+        and a line each time would bury everything else in the log.
+        """
+        why = self._blocked_by_human(now) or self._session_busy(now)
+        if why != self._gate_note:
+            self._gate_note = why
+            if why:
+                self.log("restart step held: %s" % why)
+        if why:
+            self.rwake = now + self.GATE_RETRY
+        return why
+
+    def _session_busy(self, now):
+        if self.context_grew_at and now - self.context_grew_at < self.cfg["root_idle"]:
+            return "the session is still writing to its transcript"
+        return None
+
+    def _maybe_restart(self, now):
+        if not self.context_enabled or self.context_limit is None:
+            return None
+        if self.context_tokens is None or self.context_tokens < self.context_limit:
+            return None
+        if now < self.cooldown_until:
+            return None
+        cap = self.cfg["context_max_cycles"]
+        if cap and self.cycles >= cap:
+            return None
+        if self._held(now):
+            return None
+        self.cycles += 1
+        self.handoff_tries = 0
+        self.resume_tries = 0
+        self.log("context is %s of a %s window (%.0f%%, threshold %s); folding up"
+                 % (human_tokens(self.context_tokens), human_tokens(self.context_window),
+                    self.context_pct() or 0.0, human_tokens(self.context_limit)))
+        return self._send_handoff(now, fresh=True)
+
+    def _send_handoff(self, now, fresh):
+        """Ask for the handoff, under a marker only this attempt can satisfy.
+
+        The nonce is the whole point of the marker. Without one, the marker left
+        in the file by the previous attempt — or by the previous restart, hours
+        ago — reads as this one's, which turns "the write finished" into "a write
+        finished once", and those are not the same claim at all.
+        """
+        if fresh:
+            self.handoff_tries += 1
+        self.nonce = "%s-%s" % (self.cfg["handoff_marker"], os.urandom(4).hex())
+        self.rstate = HANDOFF_SENT
+        self.handoff_sent_at = now
+        self.restart_left = self.cfg["handoff_timeout"]
+        self.rwake = now
+        self.last_stop_reason = None      # only the coming turn's ending counts
+        text = (self.cfg["handoff_msg"]
+                .replace("{file}", self.cfg["handoff_file"])
+                .replace("{marker}", self.nonce))
+        self.log("asking for a handoff into %s (attempt %d/%d, marker %s)"
+                 % (self.cfg["handoff_file"], self.handoff_tries,
+                    self.cfg["handoff_attempts"], self.nonce))
+        return ("inject", text, self._take_dismiss())
+
+    def _send_clear(self, now):
+        if now < self.rwake or self._held(now):
+            return None
+        # The one irreversible step, and the only route to it is a handoff that
+        # satisfied all four layers below.
+        self.context_before = self.context_tokens or 0
+        self.rstate = CLEARED
+        self.restart_left = self.cfg["handoff_timeout"]
+        self.rwake = now + self.cfg["step_gap"]
+        self.log("handoff verified; clearing the context with %s" % self.cfg["clear_cmd"])
+        return ("inject", self.cfg["clear_cmd"], self._take_dismiss())
+
+    def _send_resume(self, now):
+        self.rstate = RESUME_SENT
+        self.restart_left = self.cfg["handoff_timeout"]
+        self.rwake = now + self.cfg["verify"]
+        self.resume_echoed = False
+        self.log("unfolding from %s" % self.cfg["handoff_file"])
+        return ("inject", self.resume_text, self._take_dismiss())
+
+    # -- the four layers ---------------------------------------------------- #
+    def _check_handoff(self, now):
+        """`/clear` goes out only when all four of these agree.
+
+        The model saying it is done is not one of them. It is a report about its
+        own intent, and the failure this guards against is precisely the one
+        where that intent was sincere and the file is still half a page.
+        """
+        busy = self._session_busy(now)
+        st = self.probe(self.handoff_path)
+        fault = self._handoff_fault(st)
+        if fault is None and not busy:
+            self.rstate = HANDOFF_OK
+            self.restart_left = self.cfg["handoff_timeout"]
+            self.rwake = now
+            self.log("handoff accepted: %d bytes ending in %s, turn closed with end_turn"
+                     % (st["size"], self.nonce))
+            return self._send_clear(now)
+        if self.restart_left <= 0:
+            return self._abort_restart(
+                "no usable handoff within %.0fs: %s"
+                % (self.cfg["handoff_timeout"], fault or busy), now)
+        if busy or fault is None:
+            # Still writing, or written and the model kept going anyway. Either
+            # way the answer is to wait, and the timeout above is the bound.
+            return None
+        if self.last_stop_reason in (None, "tool_use", "pause_turn"):
+            return None                  # the turn has not landed yet
+        # Quiet, with the turn closed: this is as good as the handoff is ever
+        # going to get, and it is not good enough.
+        self.log("handoff attempt %d/%d failed: %s"
+                 % (self.handoff_tries, self.cfg["handoff_attempts"], fault))
+        if self.handoff_tries >= self.cfg["handoff_attempts"]:
+            return self._abort_restart(fault, now)
+        return self._send_handoff(now, fresh=True)
+
+    def _handoff_fault(self, st):
+        """Which layer is not satisfied, in words, or None when all of them are.
+
+        Ordered so that the cheap physical facts are reported before the ones
+        that need the transcript — the sentence this returns is what the log says
+        an abort was about, and "the file was never written" and "the turn was
+        cut off at max_tokens" call for very different reading.
+        """
+        if st is None:
+            return "the handoff file was never written"
+        if st["mtime"] < self.handoff_sent_at - self.MTIME_SLACK:
+            return "the handoff file is older than the request for it"
+        if st["size"] < self.cfg["handoff_min_bytes"]:
+            return ("the handoff file is %d bytes, under the %d-byte floor"
+                    % (st["size"], self.cfg["handoff_min_bytes"]))
+        if not re.search(r"(?:\A|\n)[ \t]*%s\Z" % re.escape(self.nonce or "\0"),
+                         st["tail"].rstrip()):
+            return "the handoff file does not end with %s" % self.nonce
+        if self.last_stop_reason != "end_turn":
+            # A fact from the runtime, not from the model: max_tokens is an
+            # answer cut off by length and refusal is one that never started,
+            # and a marker that somehow survived either proves nothing.
+            return "the turn ended with stop_reason=%s" % self.last_stop_reason
+        return None
+
+    # -- did it work -------------------------------------------------------- #
+    def _context_fell(self):
+        """Did the context actually go away? The only evidence `/clear` landed."""
+        if not self.context_before or self.context_tokens is None:
+            return False
+        return self.context_tokens <= self.context_before * self.RESTART_DROP
+
+    def _check_resume(self, now):
+        if self._context_fell():
+            note = ("context restarted: %s down to %s"
+                    % (human_tokens(self.context_before), human_tokens(self.context_tokens)))
+            self.log(note)
+            self._end_restart(now)
+            return ("notify", note)
+        if now < self.rwake:
+            return None
+        if self._held(now):
+            return None
+        if not self.resume_echoed and self.resume_tries < self.cfg["handoff_attempts"]:
+            self.resume_tries += 1
+            self.log("the resume phrase left no trace; sending it again (%d/%d)"
+                     % (self.resume_tries, self.cfg["handoff_attempts"]))
+            return self._send_resume(now)
+        # The window closed with the old context still in place, which means the
+        # clear did not happen. Trying again would only type into a session that
+        # is as full as it was, for as long as it lives.
+        return self._abort_restart(
+            "the context did not fall after %s (still %s)"
+            % (self.cfg["clear_cmd"], human_tokens(self.context_tokens)),
+            now, permanent=True)
+
+    # -- a limit in the middle of it ---------------------------------------- #
+    def _after_limit(self, now):
+        """(handled, action) for a wait that ended while a restart was in flight.
+
+        `handled` False means the restart is over and the ordinary `continue` is
+        the right thing to type after all.
+        """
+        self.log("the wait ended during a restart (%s)" % self.rstate)
+        if self.rstate == HANDOFF_SENT:
+            # A limit is the world failing, not the model failing to fold, so it
+            # does not spend an attempt. The phrase rewrites the file from
+            # scratch, which makes re-sending it whole both correct and cheaper
+            # than reasoning about how much of it got written.
+            return True, self._send_handoff(now, fresh=False)
+        if self.rstate == RESUME_SENT and (self.resume_echoed or self._context_fell()):
+            # The resume landed and was cut off partway through. That is the one
+            # position in this machine where "continue" is exactly the right word.
+            self.log("the resume phrase had already landed; the ordinary retry fits")
+            self._end_restart(now)
+            return False, None
+        self.rwake = 0.0
+        return True, self._tick_restart(now)
+
+    # -- endings ------------------------------------------------------------ #
+    def _end_restart(self, now):
+        self.rstate = None
+        self.nonce = None
+        self.rwake = 0.0
+        self.resume_echoed = False
+        self.context_before = 0
+        self._restart_tick = None
+        self._rearm = False
+        self._gate_note = None
+        self.cooldown_until = now + self.cfg["context_cooldown"]
+
+    def _abort_restart(self, why, now, permanent=False):
+        """Stop, name the layer that failed, and leave the session exactly as it is.
+
+        Nothing is cleared, nothing is retyped, no state is unwound. The worst
+        outcome reachable from here is a session that has to fall back on Claude
+        Code's own compaction — which is a great deal better than one whose
+        history was thrown away on the strength of a handoff that was never
+        written.
+        """
+        at = self.rstate
+        self._end_restart(now)
+        if permanent:
+            self.context_off = True
+            self.log("restart aborted at %s: %s — not attempting another this session"
+                     % (at, why))
+            return ("notify", "context restart aborted (%s); switched off for this session"
+                    % why)
+        self.log("restart aborted at %s: %s" % (at, why))
+        return ("notify", "context restart aborted: %s" % why)
 
 
 # --------------------------------------------------------------------------- #
@@ -1328,7 +2058,8 @@ class Badge:
         self.pending = True      # claude drew something since we last painted
 
     # -- what it says ------------------------------------------------------- #
-    def frame(self, state, remaining, attempts, max_attempts, now, deferred=False):
+    def frame(self, state, remaining, attempts, max_attempts, now, deferred=False,
+              restart=None, context=None):
         """(text, sgr) for a controller state. Pure, so the tests can drive it."""
         mark = self.MARK
         if state == WAITING:
@@ -1347,6 +2078,16 @@ class Badge:
             return ("%s %s %d/%d" % (mark, self.label, attempts, max_attempts), "2;36")
         if state == DONE:
             return ("%s %s stopped" % (mark, self.label), "2;31")
+        if restart:
+            # Minutes of typing into a live session, ending in a cleared one.
+            # While that is happening it is the most important thing the corner
+            # has to say, and it blinks for the same reason a wait does.
+            if int(now / self.PULSE) % 2:
+                mark = self.MARK_ALT
+            return ("%s %s %s" % (mark, self.label,
+                                  RESTART_LABELS.get(restart, restart)), "2;35")
+        if context is not None:
+            return ("%s %s %d%%" % (mark, self.label, int(context)), "2;32")
         return ("%s %s" % (mark, self.label), "2")
 
     # -- when it says it ---------------------------------------------------- #
@@ -1396,8 +2137,9 @@ class Badge:
         return ("\x1b7\x1b[%d;%dH\x1b[%sm%s\x1b[0m\x1b8" % (row, col, sgr, text)).encode()
 
     def paint(self, fd, rows, cols, state, remaining, attempts, max_attempts, now,
-              blocked=False, deferred=False):
-        text, sgr = self.frame(state, remaining, attempts, max_attempts, now, deferred)
+              blocked=False, deferred=False, restart=None, context=None):
+        text, sgr = self.frame(state, remaining, attempts, max_attempts, now, deferred,
+                               restart, context)
         if not self.due(text, now, blocked):
             return False
         # A narrower frame than the last one would leave the tail of that one on
@@ -1623,7 +2365,21 @@ def main(argv):
     badge = Badge(CFG)
     if not interactive:
         badge.enabled = False      # nothing to paint on when stdout is a pipe
-    watcher = TranscriptWatcher(project_dir(), CFG["poll"], echo=CFG["message"])
+    watcher = TranscriptWatcher(project_dir(), CFG["poll"],
+                                echo=[CFG["message"], ctl.resume_text])
+    if ctl.context_enabled:
+        log("context restart armed: handoff -> %s, %s"
+            % (ctl.handoff_path,
+               ("%d tokens" % CFG["context_tokens"]) if CFG["context_tokens"] > 0
+               else "%g%% of the window" % CFG["context_pct"]))
+        # The Write tool would create it, but a directory that is already there
+        # is one fewer thing for the folding turn to get wrong.
+        parent = os.path.dirname(ctl.handoff_path)
+        try:
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+        except OSError as exc:
+            log("cannot create %s: %s" % (parent, exc))
     scrape_allowed = CFG["scrape"] in ("auto", "always")
     window = ""            # rolling, ansi-stripped view of what claude just drew
     esc_carry = ""         # half-received control sequence from the previous read
@@ -1666,13 +2422,28 @@ def main(argv):
         issues #7/#19). Text and Enter therefore go out as separate writes,
         several hundred ms apart, with an optional Escape first to dismiss the
         /rate-limit-options selector.
+
+        A message that begins with "/" is one of Claude Code's own commands, and
+        typing the slash opens its command list, where Enter can pick the
+        highlighted entry rather than submitting what was typed. Those get a
+        longer pause — time for the list to settle on the exact match — and two
+        Enters. Driving a live TUI shows one Enter is enough (2.1.222: /clear
+        runs, with no confirmation step) and that the second lands in an empty
+        input box, where nothing is submitted. Either way the command runs
+        exactly once, which is the only property worth relying on.
         """
         t = now
         if dismiss_menu:
             pending.append((t, b"\x1b"))
             t += 0.35
         pending.append((t, text.encode()))
-        pending.append((t + 0.6, b"\r"))
+        if text.startswith("/"):
+            t += CFG["slash_gap"]
+            for _ in range(max(1, CFG["slash_enter"])):
+                pending.append((t, b"\r"))
+                t += CFG["slash_enter_gap"]
+        else:
+            pending.append((t + 0.6, b"\r"))
 
     try:
         while True:
@@ -1745,10 +2516,17 @@ def main(argv):
 
             for rec in watcher.poll_now(now):
                 if rec.get("kind") == "echo":
+                    if rec.get("text") == ctl.resume_text and ctl.on_resume_echo(now):
+                        continue
                     if ctl.on_echo(now):
                         notify("session resumed")
                     continue
                 if rec.get("kind") == "alive":
+                    # The usage figures are read only off the transcript this
+                    # terminal's session writes; another session's are another
+                    # session's context.
+                    if rec.get("path") == watcher.current:
+                        ctl.on_context(rec, now)
                     # Rows are in file order, so an assistant row that follows a
                     # limit row really did come after it.
                     if ctl.on_alive(now, "transcript"):
@@ -1758,6 +2536,10 @@ def main(argv):
                 pending_scrape = None            # the structured channel wins
                 if ctl.on_limit(text, now, "transcript"):
                     notify("usage limit detected; waiting for reset")
+            # Rows are not the only thing a transcript gains, and the gap between
+            # a tool call and its result can be minutes: bytes are what say the
+            # session is still mid-turn.
+            ctl.note_growth(watcher.grown, now)
 
             # A scraped banner is acted on only after it has stood for a moment.
             # That covers two races at once: a frame captured mid-repaint, and a
@@ -1775,9 +2557,11 @@ def main(argv):
             action = ctl.tick(now)
             if action and action[0] == "inject":
                 schedule_injection(action[1], action[2], now)
-                notify("limit lifted; resuming session")
+                notify(ctl.inject_note())
             elif action and action[0] == "resume":
                 wait_cancelled()
+            elif action and action[0] == "notify":
+                notify(action[1])
 
             if pending:
                 stay = []
@@ -1794,7 +2578,8 @@ def main(argv):
                             CFG["max_attempts"], now,
                             # A half-received sequence of claude's is already in
                             # the terminal; anything written now lands inside it.
-                            blocked=bool(esc_carry), deferred=ctl.deferred)
+                            blocked=bool(esc_carry), deferred=ctl.deferred,
+                            restart=ctl.rstate, context=ctl.badge_context())
 
             try:
                 done, status = os.waitpid(pid, os.WNOHANG)
@@ -1933,5 +2718,11 @@ export CR_RESUME_SEC
 export CR_DRAFT_GRACE_SEC CR_TYPING_MAX_SEC
 export CR_BADGE CR_BADGE_POS CR_BADGE_LABEL
 export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC
+export CR_CONTEXT_PCT CR_CONTEXT_TOKENS CR_CONTEXT_WINDOW
+export CR_HANDOFF_FILE CR_HANDOFF_MARKER CR_HANDOFF_MIN_BYTES CR_HANDOFF_ATTEMPTS
+export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG
+export CR_ROOT_IDLE_SEC CR_HANDOFF_TIMEOUT_SEC CR_STEP_GAP_SEC
+export CR_CONTEXT_COOLDOWN_SEC CR_CONTEXT_MAX_CYCLES
+export CR_SLASH_GAP_SEC CR_SLASH_ENTER CR_SLASH_ENTER_GAP_SEC
 
 exec "$CR_PYTHON_BIN" -c "$CR_PY" "$@"

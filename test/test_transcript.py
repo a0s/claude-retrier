@@ -237,5 +237,209 @@ class TestWatcher(unittest.TestCase):
         self.assertEqual(len(w.poll_now()), 1)
 
 
+class TestContextFigures(unittest.TestCase):
+    """The context trigger does not count tokens; it reads the count Claude wrote.
+
+    Every assistant row carries the API's own `usage`, and the three input
+    counters in it are the prompt that was sent. Anything this layer gets wrong
+    is a restart at the wrong moment — or, worse, never.
+    """
+
+    def test_the_three_input_counters_are_the_context(self):
+        self.assertEqual(cr.usage_tokens(
+            {"input_tokens": 2, "cache_creation_input_tokens": 1093,
+             "cache_read_input_tokens": 611317, "output_tokens": 6858}), 612412)
+
+    def test_output_tokens_are_not_context(self):
+        # Not until the next turn quotes them back, and by then they are inside
+        # cache_creation. Adding them here would count them twice.
+        self.assertEqual(cr.usage_tokens({"input_tokens": 10, "output_tokens": 9999}), 10)
+
+    def test_a_row_without_usage_says_nothing(self):
+        self.assertIsNone(cr.usage_tokens(None))
+        self.assertIsNone(cr.usage_tokens({}))
+        self.assertIsNone(cr.usage_tokens("not a dict"))
+
+    def test_missing_counters_do_not_zero_the_others(self):
+        self.assertEqual(cr.usage_tokens({"cache_read_input_tokens": 500}), 500)
+
+
+class TestModelWindows(unittest.TestCase):
+    def test_the_slug_the_transcript_actually_writes(self):
+        self.assertEqual(cr.model_window("claude-opus-5"), 1000000)
+        self.assertEqual(cr.model_window("claude-haiku-4-5"), 200000)
+
+    def test_a_dated_slug_resolves_to_the_family(self):
+        self.assertEqual(cr.model_window("claude-haiku-4-5-20251001"), 200000)
+
+    def test_a_bracketed_suffix_is_not_part_of_the_slug(self):
+        self.assertEqual(cr.model_window("claude-opus-5[1m]"), 1000000)
+
+    def test_an_unknown_slug_is_not_guessed(self):
+        # The caller turns this into the small window and says so in the log.
+        # Guessing large would be a trigger that never fires.
+        self.assertIsNone(cr.model_window("claude-something-9"))
+        self.assertIsNone(cr.model_window(None))
+
+    def test_window_sizes_are_written_the_way_people_write_them(self):
+        self.assertEqual(cr.parse_tokens("200k"), 200000)
+        self.assertEqual(cr.parse_tokens("1M"), 1000000)
+        self.assertEqual(cr.parse_tokens("1_000_000"), 1000000)
+        self.assertEqual(cr.parse_tokens("450000"), 450000)
+
+    def test_auto_is_not_a_size(self):
+        for text in ("auto", "", None, "lots", "0"):
+            self.assertIsNone(cr.parse_tokens(text), text)
+
+
+def assistant(text="ok", tokens=None, model="claude-opus-5", stop="end_turn",
+              sidechain=False):
+    msg = {"role": "assistant", "model": model, "stop_reason": stop,
+           "content": [{"type": "text", "text": text}]}
+    if tokens is not None:
+        msg["usage"] = {"input_tokens": 2, "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": tokens - 2, "output_tokens": 100}
+    return {"type": "assistant", "isSidechain": sidechain, "message": msg}
+
+
+class TestAssistantRows(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-ar-")
+        self.path = os.path.join(self.dir, "s.jsonl")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def write(self, *records):
+        with open(self.path, "a") as fh:
+            for r in records:
+                fh.write(json.dumps(r) + "\n")
+
+    def rows(self):
+        return cr.transcript_limit_records(self.path, 0)[1]
+
+    def test_an_alive_row_carries_the_figures(self):
+        self.write(assistant(tokens=612412))
+        row = self.rows()[0]
+        self.assertEqual(row["tokens"], 612412)
+        self.assertEqual(row["model"], "claude-opus-5")
+        self.assertEqual(row["stop_reason"], "end_turn")
+        self.assertFalse(row["sidechain"])
+
+    def test_a_collapse_keeps_the_newest_figures(self):
+        # One answer is many rows. Collapsing them to the FIRST would freeze the
+        # context reading at whatever it was when the answer started, which for a
+        # long answer is a threshold that arrives an answer late.
+        self.write(assistant(tokens=100, stop="tool_use"),
+                   assistant(tokens=200, stop="tool_use"),
+                   assistant(tokens=300, stop="end_turn"))
+        rows = self.rows()
+        self.assertEqual([r["kind"] for r in rows], ["alive"])
+        self.assertEqual(rows[0]["tokens"], 300)
+        self.assertEqual(rows[0]["stop_reason"], "end_turn")
+
+    def test_a_subagents_row_is_marked_as_one(self):
+        # A subagent writes into the session's own transcript, and its usage is
+        # its context, not the session's.
+        self.write(assistant(tokens=40000, sidechain=True))
+        self.assertTrue(self.rows()[0]["sidechain"])
+
+    def test_a_row_with_no_usage_still_says_the_session_answered(self):
+        self.write(assistant())
+        row = self.rows()[0]
+        self.assertEqual(row["kind"], "alive")
+        self.assertIsNone(row["tokens"])
+
+
+class TestWhichTranscriptIsOurs(unittest.TestCase):
+    """A project directory holds more than one live transcript. For a limit that
+    never mattered — a limit is the account's. For the context trigger it is the
+    whole question: another session's usage read as ours is a restart at the
+    wrong moment, or none at all."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-cur-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def append(self, name, rec, mtime=None):
+        p = os.path.join(self.dir, name)
+        with open(p, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        if mtime is not None:
+            os.utime(p, (mtime, mtime))
+        return p
+
+    def test_every_record_says_which_file_it_came_from(self):
+        w = cr.TranscriptWatcher(self.dir, poll=0)
+        p = self.append("a.jsonl", assistant(tokens=5))
+        self.assertEqual(w.poll_now()[0]["path"], p)
+
+    def test_the_transcript_that_did_not_exist_before_us_is_ours(self):
+        # `claude` writes its transcript within a second of starting; anything
+        # else in the directory was there first.
+        old = self.append("old.jsonl", assistant(tokens=1), mtime=1000)
+        w = cr.TranscriptWatcher(self.dir, poll=0)
+        self.append("old.jsonl", assistant(tokens=2), mtime=3000)
+        mine = self.append("mine.jsonl", assistant(tokens=3), mtime=2000)
+        w.poll_now()
+        self.assertEqual(w.current, mine)
+        self.assertEqual(sorted(w.grown), sorted([old, mine]))
+
+    def test_it_stays_with_the_file_it_picked_while_that_file_grows(self):
+        # Another session writing a burst in between must not steal the reading.
+        w = cr.TranscriptWatcher(self.dir, poll=0)
+        mine = self.append("mine.jsonl", assistant(tokens=1), mtime=1000)
+        w.poll_now()
+        self.assertEqual(w.current, mine)
+        self.append("mine.jsonl", assistant(tokens=2), mtime=1000)
+        self.append("other.jsonl", assistant(tokens=3), mtime=9000)
+        w.poll_now()
+        self.assertEqual(w.current, mine)
+
+    def test_it_follows_the_session_into_a_new_file(self):
+        # Which is what `/clear` looks like from here: the old transcript stops
+        # and a new one appears.
+        w = cr.TranscriptWatcher(self.dir, poll=0)
+        self.append("before.jsonl", assistant(tokens=1), mtime=1000)
+        w.poll_now()
+        after = self.append("after.jsonl", assistant(tokens=2), mtime=2000)
+        w.poll_now()
+        self.assertEqual(w.current, after)
+
+    def test_nothing_grew_means_nothing_grew(self):
+        w = cr.TranscriptWatcher(self.dir, poll=0)
+        self.append("a.jsonl", assistant(tokens=1))
+        w.poll_now()
+        w.poll_now()
+        self.assertEqual(w.grown, [])
+
+
+class TestSeveralEchoes(unittest.TestCase):
+    """A restart types more than one thing, and each of them has to be
+    recognisable coming back."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-ec-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def append(self, name, rec):
+        with open(os.path.join(self.dir, name), "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+
+    def test_any_of_the_messages_we_type_is_an_echo(self):
+        w = cr.TranscriptWatcher(self.dir, poll=0,
+                                 echo=["continue", "Read `h.md` and continue from it."])
+        self.append("s.jsonl", user_row("Read `h.md` and continue from it."))
+        found = w.poll_now()
+        self.assertEqual([r["kind"] for r in found], ["echo"])
+        self.assertEqual(found[0]["text"], "Read `h.md` and continue from it.")
+
+    def test_a_message_with_characters_json_escapes_still_matches(self):
+        # The prefilter builds its needle with json.dumps for exactly this: a
+        # quote or a backslash is written escaped in the row.
+        msg = 'continue with "the plan" \\ now'
+        w = cr.TranscriptWatcher(self.dir, poll=0, echo=[msg])
+        self.append("s.jsonl", user_row(msg))
+        self.assertEqual([r["kind"] for r in w.poll_now()], ["echo"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

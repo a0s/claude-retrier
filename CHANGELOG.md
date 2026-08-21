@@ -7,6 +7,68 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [1.7.0] - 2026-08-21
+
+A second trigger. The first one answers "the quota ran out"; this one answers
+"the context window is filling up" — and it is off until you switch it on.
+
+### Added
+- **Context restart.** At `CR_CONTEXT_PCT` of the model's context window the
+  wrapper asks Claude to fold the session into a file, checks that the file
+  really was written, types `/clear`, and hands the file to the fresh session.
+  It automates a ritual people were already doing by hand, several times a day,
+  at whatever moment they happened to notice the window filling up.
+
+  Nothing is counted on our side: every assistant row in the transcript carries
+  the API's own `usage`, and `input + cache_creation + cache_read` is the prompt
+  that was sent. The check rides on the row the watcher has already parsed, so
+  it costs two comparisons and happens only when the file actually grew. The
+  denominator comes from the model slug in the same row, narrowed by
+  `CLAUDE_CODE_DISABLE_1M_CONTEXT` or `CLAUDE_CODE_MAX_CONTEXT_TOKENS` if either
+  is set, and raised if the session is ever seen past it.
+
+  `/clear` throws a session's history away, so it goes out only when four
+  independent things agree: the handoff file ends with a one-time marker that
+  was generated for this attempt (proof the write ran to the end, not that the
+  model believes it did); the runtime recorded the turn as `end_turn` rather
+  than `max_tokens` or `refusal`; the file is newer than the request and over a
+  size floor; and the session's own transcript has stopped growing. Any of them
+  missing and the fold is asked for again, then abandoned — with the session
+  left exactly as it was, because falling back on Claude Code's own compaction
+  is a far better outcome than a history cleared on a promise.
+
+  A usage limit landing in the middle suspends the restart instead of cancelling
+  it: every clock it runs on stops for the duration, its attempt budget is not
+  spent on the world's problems, and when the quota returns the step that was
+  interrupted is re-sent — `continue`, which is what the limit path types, is
+  the wrong instruction at every step of a restart but the last.
+
+  Off by default (`CR_CONTEXT_PCT=0`). Existing installs behave exactly as they
+  did.
+
+- `CR_HANDOFF_FILE`, `CR_HANDOFF_MSG`, `CR_RESUME_MSG`, `CR_CONTEXT_WINDOW`,
+  `CR_CONTEXT_TOKENS`, `CR_HANDOFF_ATTEMPTS`, `CR_ROOT_IDLE_SEC`,
+  `CR_CONTEXT_COOLDOWN_SEC`, `CR_CONTEXT_MAX_CYCLES` and the rest of the knobs,
+  all listed in the README.
+
+- The corner badge shows the context percentage once the threshold is in sight,
+  and names the step while a restart is running. It is the only way to find out
+  whether the threshold you picked is a sensible one.
+
+### Changed
+- A message beginning with `/` is typed as a command rather than as prose:
+  a longer pause after the text, so Claude Code's command list can settle on the
+  exact match, and two Enters. The second submits if the first only completed
+  the highlighted entry, and lands in an empty input box if it did not — where
+  Claude Code ignores it. `CR_SLASH_ENTER=1` for a build that does not need it.
+- The transcript watcher says which file each row came from, and which of the
+  growing files belongs to the session at this terminal. A limit is the
+  account's and never cared; a context reading taken from another session's
+  transcript would be a restart at the wrong moment, or none at all.
+- A subagent's rows are marked as such. Its work is the session's work, so it
+  holds a restart back — but its context is its own and is not read as the
+  session's.
+
 ## [1.6.0] - 2026-08-06
 
 What `claude agents` did to the scraper, found in a session that sat out a

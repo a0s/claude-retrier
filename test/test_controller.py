@@ -505,5 +505,597 @@ class TestWaitScale(unittest.TestCase):
         self.assertAlmostEqual(ctl.wake_at, 2.0, delta=0.01)
 
 
+# --------------------------------------------------------------------------- #
+# the context restart
+# --------------------------------------------------------------------------- #
+# Settings for a controller with the feature on, small enough to drive by hand:
+# a 1M window, a threshold at half of it, and a handoff of a couple of lines.
+CTX = dict(
+    context_pct=50, context_tokens=0, context_window="1M",
+    context_env_max=0, context_no_1m=False,
+    handoff_file="H.md", handoff_marker="HANDOFF", handoff_min_bytes=20,
+    handoff_attempts=2,
+    handoff_msg="Fold into `{file}` and end it with {marker}.",
+    clear_cmd="/clear", resume_msg="Read `{file}` and continue from it.",
+    root_idle=20, handoff_timeout=900, step_gap=3,
+    context_cooldown=600, context_max_cycles=0,
+)
+
+MINE = "/proj/mine.jsonl"          # the transcript this terminal's session writes
+FULL = 700000                      # past the 500k threshold
+RESUME = "Read `H.md` and continue from it."
+
+
+class Handoff:
+    """The file the model was asked to write, as the controller can see it.
+
+    The controller reads it through an injected probe precisely so that a test
+    can hand it a file that was never written, one that stops halfway, or one
+    still carrying the marker from a previous attempt.
+    """
+
+    def __init__(self):
+        self.state = None
+
+    def write(self, ctl, at, body=None, marker=True, size=None):
+        text = body if body is not None else "everything you need to know\n" * 4
+        if marker:
+            text += ctl.nonce + "\n"
+        self.state = dict(size=len(text.encode()) if size is None else size,
+                          mtime=at, tail=text[-512:])
+
+    def touch(self, at):
+        self.state["mtime"] = at
+
+    def __call__(self, _path):
+        return self.state
+
+
+def restart_controller(**over):
+    cfg = dict(CFG)
+    cfg.update(CTX)
+    cfg.update(over)
+    logs = []
+    hand = Handoff()
+    ctl = cr.Controller(cfg, logs.append, now=0, probe=hand)
+    ctl.log_lines = logs
+    ctl.handoff = hand
+    return ctl
+
+
+def usage(ctl, at, tokens, model="claude-opus-5", stop="end_turn", path=MINE,
+          sidechain=False):
+    """One assistant row, the way the watcher hands them over."""
+    ctl.on_context(dict(kind="alive", path=path, tokens=tokens, model=model,
+                        stop_reason=stop, sidechain=sidechain), at)
+
+
+class RestartTestCase(unittest.TestCase):
+    """Every action the controller returns is recorded, because half of what is
+    being asserted here is what it did NOT do — and `/clear` is the one action
+    that cannot be taken back."""
+
+    def setUp(self):
+        self.acts = []
+
+    def tick(self, ctl, t):
+        action = ctl.tick(t)
+        if action:
+            self.acts.append(action)
+        return action
+
+    def injected(self):
+        return [a[1] for a in self.acts if a[0] == "inject"]
+
+    def assertNeverCleared(self):
+        self.assertNotIn("/clear", self.injected())
+
+    # -- the machine, one step at a time ------------------------------------ #
+    def fold(self, ctl, tokens=FULL, at=0, tick_at=30):
+        """From "the context is full" to the folding phrase going out."""
+        usage(ctl, at, tokens)
+        return self.tick(ctl, tick_at)
+
+    def folded(self, ctl, written_at=40):
+        """...and the model writes the file and finishes its turn."""
+        ctl.handoff.write(ctl, at=written_at)
+        usage(ctl, written_at, FULL)
+
+    def cleared(self, ctl):
+        """...through the verification and out the other side of /clear."""
+        self.fold(ctl)
+        self.folded(ctl)
+        self.tick(ctl, 65)
+        return ctl
+
+    def unfolding(self, ctl):
+        """...and the resume phrase sent."""
+        self.cleared(ctl)
+        self.tick(ctl, 69)
+        return ctl
+
+
+class TestTheHappyPath(RestartTestCase):
+    def test_full_context_becomes_a_fresh_session(self):
+        ctl = restart_controller()
+        action = self.fold(ctl)
+        self.assertEqual(action[0], "inject")
+        self.assertIn("H.md", action[1])
+        self.assertIn(ctl.nonce, action[1])
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+
+        self.folded(ctl)
+        self.assertIsNone(self.tick(ctl, 45))      # the transcript is still growing
+        self.assertEqual(self.tick(ctl, 65), ("inject", "/clear", False))
+        self.assertEqual(ctl.rstate, cr.CLEARED)
+
+        self.assertIsNone(self.tick(ctl, 66))      # the gap between the two
+        self.assertEqual(self.tick(ctl, 69), ("inject", RESUME, False))
+        self.assertEqual(ctl.rstate, cr.RESUME_SENT)
+
+        # The new session answers, and it answers small.
+        usage(ctl, 72, 8000, path="/proj/after.jsonl")
+        action = self.tick(ctl, 73)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("restarted", action[1])
+        self.assertIsNone(ctl.rstate)
+
+    def test_the_marker_is_different_every_time(self):
+        first = restart_controller()
+        self.fold(first)
+        second = restart_controller()
+        self.fold(second)
+        self.assertNotEqual(first.nonce, second.nonce)
+        self.assertTrue(first.nonce.startswith("HANDOFF-"))
+
+    def test_a_restart_is_followed_by_silence(self):
+        ctl = restart_controller()
+        self.unfolding(ctl)
+        usage(ctl, 72, 8000, path="/proj/after.jsonl")
+        self.tick(ctl, 73)
+        usage(ctl, 100, FULL, path=MINE)           # full again straight away
+        self.assertIsNone(self.tick(ctl, 200))     # inside the cooldown
+        self.assertIsNotNone(self.tick(ctl, 700))
+
+    def test_the_fuse_caps_how_many_a_session_gets(self):
+        ctl = restart_controller(context_max_cycles=1, context_cooldown=0)
+        self.fold(ctl)
+        usage(ctl, 40, FULL)                       # no file: attempt 2
+        self.tick(ctl, 65)
+        usage(ctl, 70, FULL)
+        self.tick(ctl, 95)                         # ...and the abort
+        self.assertEqual(ctl.cycles, 1)
+        usage(ctl, 100, FULL)
+        self.assertIsNone(self.tick(ctl, 200))
+
+
+class TestNothingIsClearedOnAPromise(RestartTestCase):
+    """The dangerous failure in the whole design: the fold was asked for, the
+    model did not manage it, and the context is cleared anyway — which loses the
+    session's work with nothing written down. The model reporting success is not
+    evidence; it says only that the model believes it finished."""
+
+    def failing(self, **over):
+        ctl = restart_controller(**over)
+        self.fold(ctl)
+        return ctl
+
+    def second_attempt_then_abort(self, ctl):
+        """Both attempts end the same way; the second one is the abort."""
+        usage(ctl, 70, FULL)
+        return self.tick(ctl, 95)
+
+    def test_a_file_that_was_never_written(self):
+        ctl = self.failing()
+        usage(ctl, 40, FULL)
+        action = self.tick(ctl, 65)
+        self.assertEqual(action[0], "inject")      # attempt 2, not /clear
+        self.assertEqual(ctl.handoff_tries, 2)
+        action = self.second_attempt_then_abort(ctl)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("never written", action[1])
+        self.assertNeverCleared()
+        self.assertIsNone(ctl.rstate)
+
+    def test_a_file_too_short_to_be_a_handoff(self):
+        ctl = self.failing()
+        ctl.handoff.write(ctl, at=40, body="", size=8)
+        usage(ctl, 40, FULL)
+        self.tick(ctl, 65)
+        ctl.handoff.write(ctl, at=70, body="", size=8)
+        action = self.second_attempt_then_abort(ctl)
+        self.assertIn("byte floor", action[1])
+        self.assertNeverCleared()
+
+    def test_a_file_that_stops_before_the_marker(self):
+        # The one failure the marker exists for: a write that ran out partway,
+        # which looks exactly like a complete file from every other angle.
+        ctl = self.failing()
+        ctl.handoff.write(ctl, at=40, marker=False)
+        usage(ctl, 40, FULL)
+        self.tick(ctl, 65)
+        ctl.handoff.write(ctl, at=70, marker=False)
+        action = self.second_attempt_then_abort(ctl)
+        self.assertIn("does not end with", action[1])
+        self.assertNeverCleared()
+
+    def test_a_file_older_than_the_request_for_it(self):
+        ctl = self.failing()
+        ctl.handoff.write(ctl, at=5)               # left over from before
+        usage(ctl, 40, FULL)
+        self.tick(ctl, 65)
+        action = self.second_attempt_then_abort(ctl)
+        self.assertIn("older than the request", action[1])
+        self.assertNeverCleared()
+
+    def test_a_turn_cut_off_at_max_tokens(self):
+        # A perfect-looking file whose turn the runtime says was truncated. The
+        # marker cannot have been written by a finished answer, whatever the
+        # bytes say.
+        ctl = self.failing()
+        ctl.handoff.write(ctl, at=40)
+        usage(ctl, 40, FULL, stop="max_tokens")
+        self.tick(ctl, 65)
+        ctl.handoff.write(ctl, at=70)
+        usage(ctl, 70, FULL, stop="max_tokens")
+        action = self.tick(ctl, 95)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("max_tokens", action[1])
+        self.assertNeverCleared()
+
+    def test_a_turn_that_was_refused(self):
+        ctl = self.failing()
+        ctl.handoff.write(ctl, at=40)
+        usage(ctl, 40, FULL, stop="refusal")
+        self.tick(ctl, 65)
+        ctl.handoff.write(ctl, at=70)
+        usage(ctl, 70, FULL, stop="refusal")
+        self.assertIn("refusal", self.tick(ctl, 95)[1])
+        self.assertNeverCleared()
+
+    def test_a_session_that_kept_working_is_waited_for_not_cleared(self):
+        # The file is complete and the model ignored "do not start new work".
+        # Clearing now would take the new work with it.
+        ctl = self.failing()
+        ctl.handoff.write(ctl, at=40)
+        usage(ctl, 40, FULL)
+        for t in range(45, 400, 10):
+            ctl.note_growth([MINE], now=t)         # still writing
+            self.assertIsNone(self.tick(ctl, t))
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        self.assertNeverCleared()
+
+    def test_a_turn_still_in_flight_is_not_a_failed_one(self):
+        # Quiet transcript, no file yet, and the last row is a tool call: the
+        # answer has not landed. Failing it here would burn an attempt on a
+        # session that is doing exactly as it was asked.
+        ctl = self.failing()
+        usage(ctl, 40, FULL, stop="tool_use")
+        self.assertIsNone(self.tick(ctl, 65))
+        self.assertEqual(ctl.handoff_tries, 1)
+
+    def test_the_marker_from_the_last_attempt_is_not_this_attempts_proof(self):
+        # Without a fresh nonce, the file left behind by a rejected attempt
+        # satisfies the next one — which turns "the write finished" into "a
+        # write finished once", and those are not the same claim.
+        ctl = self.failing()
+        ctl.handoff.write(ctl, at=40)
+        usage(ctl, 40, FULL, stop="max_tokens")
+        first = ctl.nonce
+        action = self.tick(ctl, 65)
+        self.assertEqual(action[0], "inject")
+        self.assertNotEqual(ctl.nonce, first)
+        ctl.handoff.touch(70)                      # same bytes, same old marker
+        usage(ctl, 70, FULL)
+        self.assertIn("does not end with", self.tick(ctl, 95)[1])
+        self.assertNeverCleared()
+
+    def test_the_fold_gives_up_rather_than_asking_forever(self):
+        ctl = restart_controller(handoff_attempts=3)
+        self.fold(ctl)
+        for t in (40, 70, 100):
+            usage(ctl, t, FULL)
+            self.tick(ctl, t + 25)
+        self.assertEqual(ctl.handoff_tries, 3)
+        self.assertEqual(len([a for a in self.acts if a[0] == "notify"]), 1)
+        self.assertNeverCleared()
+
+    def test_a_fold_nobody_answers_times_out(self):
+        ctl = restart_controller(handoff_timeout=60)
+        self.fold(ctl)
+        usage(ctl, 40, FULL, stop="tool_use")      # a turn that never ends
+        action = self.tick(ctl, 200)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("no usable handoff", action[1])
+        self.assertNeverCleared()
+
+
+class TestTheClearHasToHaveWorked(RestartTestCase):
+    """The other half: `/clear` went out and the context did not move. Retrying
+    that forever would type into a session that stays exactly as full as it was,
+    for as long as it lives."""
+
+    def test_a_clear_that_did_nothing_switches_the_feature_off(self):
+        ctl = restart_controller()
+        self.unfolding(ctl)
+        ctl.on_resume_echo(70)                     # the phrase was accepted...
+        usage(ctl, 80, FULL, path=MINE)            # ...and the context is untouched
+        action = self.tick(ctl, 130)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("did not fall", action[1])
+        self.assertTrue(ctl.context_off)
+        usage(ctl, 200, FULL)
+        self.assertIsNone(self.tick(ctl, 1000))    # and never tries again
+
+    def test_a_resume_that_left_no_trace_is_sent_again(self):
+        ctl = restart_controller()
+        self.unfolding(ctl)
+        usage(ctl, 80, FULL, path=MINE)
+        action = self.tick(ctl, 130)
+        self.assertEqual(action, ("inject", RESUME, False))
+        self.assertEqual(ctl.resume_tries, 1)
+
+    def test_a_context_that_only_dipped_is_not_a_restart(self):
+        ctl = restart_controller()
+        self.unfolding(ctl)
+        ctl.on_resume_echo(70)
+        usage(ctl, 80, 600000, path="/proj/after.jsonl")   # 700k -> 600k: no
+        self.assertEqual(self.tick(ctl, 130)[0], "notify")
+        self.assertTrue(ctl.context_off)
+
+
+class TestTheLimitOutranksTheContext(RestartTestCase):
+    """A session that is out of quota is stopped either way, so there is nothing
+    to fold into a file and no point typing at it. A limit that arrives DURING a
+    restart is a different thing: it suspends it, never cancels it."""
+
+    def test_a_limit_holds_a_restart_back(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        ctl.on_limit(BANNER, now=10, source="transcript")
+        self.assertIsNone(self.tick(ctl, 30))
+        self.assertIsNone(ctl.rstate)
+        self.assertEqual(self.tick(ctl, 7300), ("inject", "continue", False))
+
+    def test_and_the_restart_happens_once_the_limit_is_gone(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        ctl.on_limit(BANNER, now=10, source="transcript")
+        self.tick(ctl, 7300)
+        ctl.on_echo(now=7302)                      # the retry was accepted
+        action = self.tick(ctl, 7400)
+        self.assertEqual(action[0], "inject")
+        self.assertIn("H.md", action[1])
+
+    def test_a_fold_interrupted_by_a_limit_is_re_sent_whole(self):
+        # `continue` would be wrong here: the phrase rewrites the file from
+        # scratch, so what a half-written handoff needs is the phrase again.
+        ctl = restart_controller()
+        self.fold(ctl)
+        first = ctl.nonce
+        ctl.on_limit("resets in 1 hours", now=40, source="transcript")
+        self.assertIsNone(self.tick(ctl, 100))     # frozen for the duration
+        action = self.tick(ctl, 40 + 3601)
+        self.assertEqual(action[0], "inject")
+        self.assertIn("H.md", action[1])
+        self.assertNotEqual(ctl.nonce, first)
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        self.assertEqual(ctl.state, cr.IDLE)
+
+    def test_a_limit_does_not_spend_a_fold_attempt(self):
+        # The attempt counter is for a model that will not fold, not for the
+        # world getting in the way. Two limits in a row must not exhaust it.
+        ctl = restart_controller()
+        self.fold(ctl)
+        for at in (40, 4000):
+            ctl.on_limit("resets in 1 hours", now=at, source="transcript")
+            self.tick(ctl, at + 3601)
+        self.assertEqual(ctl.handoff_tries, 1)
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+
+    def test_the_fold_timeout_does_not_run_while_a_limit_does(self):
+        # A weekly limit is days long; a fifteen-minute fold timeout inside one
+        # would abort a restart that is going perfectly well.
+        ctl = restart_controller(handoff_timeout=60)
+        self.fold(ctl)
+        ctl.on_limit("resets in 40 hours", now=35, source="transcript")
+        for t in range(100, 40 * 3600, 1800):
+            self.assertIsNone(self.tick(ctl, t))
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+
+    def test_a_verified_handoff_survives_a_limit_and_still_clears(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        self.folded(ctl)
+        ctl.on_user_bytes(b"typing", now=64)       # a draft holds the clear back
+        self.assertIsNone(self.tick(ctl, 65))
+        self.assertEqual(ctl.rstate, cr.HANDOFF_OK)
+        ctl.on_limit("resets in 1 hours", now=66, source="transcript")
+        self.assertEqual(self.tick(ctl, 66 + 3601), ("inject", "/clear", False))
+
+    def test_a_limit_between_the_clear_and_the_resume_sends_the_resume(self):
+        ctl = restart_controller()
+        self.cleared(ctl)
+        ctl.on_limit("resets in 1 hours", now=66, source="transcript")
+        self.assertEqual(self.tick(ctl, 66 + 3601), ("inject", RESUME, False))
+        self.assertEqual(ctl.rstate, cr.RESUME_SENT)
+
+    def test_a_resume_that_never_landed_is_sent_again(self):
+        ctl = restart_controller()
+        self.unfolding(ctl)
+        ctl.on_limit("resets in 1 hours", now=70, source="transcript")
+        action = self.tick(ctl, 70 + 3601)
+        self.assertEqual(action, ("inject", RESUME, False))
+
+    def test_a_resume_that_had_landed_falls_back_to_continue(self):
+        # The one position in the machine where "carry on with what you were
+        # doing" is exactly the right instruction.
+        ctl = restart_controller()
+        self.unfolding(ctl)
+        ctl.on_resume_echo(70)
+        ctl.on_limit("resets in 1 hours", now=71, source="transcript")
+        self.assertEqual(self.tick(ctl, 71 + 3601), ("inject", "continue", False))
+        self.assertIsNone(ctl.rstate)
+
+    def test_a_wait_that_ends_early_resumes_the_restart_too(self):
+        # The quota can come back without the reset it announced, and the only
+        # sign is the session answering. The restart still has to go on.
+        ctl = restart_controller()
+        self.cleared(ctl)
+        ctl.on_limit("resets in 40 hours", now=66, source="transcript")
+        self.assertTrue(ctl.on_alive(now=200, source="transcript"))
+        self.assertEqual(self.tick(ctl, 201), ("inject", RESUME, False))
+
+
+class TestWhoIsAllowedToBeInterrupted(RestartTestCase):
+    def test_it_does_not_fold_over_someone_typing(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        ctl.on_user_bytes(b"mid-thought", now=25)
+        self.assertIsNone(self.tick(ctl, 30))
+        self.assertIsNone(ctl.rstate)
+        ctl.on_user_bytes(b"\r", now=26)                   # they send it themselves
+        self.assertIsNotNone(self.tick(ctl, 60))
+
+    def test_it_does_not_fold_into_a_running_turn(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        ctl.note_growth([MINE], now=25)
+        self.assertIsNone(self.tick(ctl, 30))
+        self.assertIsNotNone(self.tick(ctl, 50))
+
+    def test_another_sessions_transcript_holds_nothing_back(self):
+        # Work running in the background under the same cwd writes its own
+        # transcript. It is not this session's turn and must not gate it.
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        ctl.note_growth(["/proj/somebody-else.jsonl"], now=29)
+        self.assertIsNotNone(self.tick(ctl, 30))
+
+    def test_a_busy_screen_holds_nothing_back(self):
+        # In a session that keeps background work going, something is always
+        # painting a footer. Waiting for the screen to go quiet would mean
+        # waiting for ever, so the restart asks the transcript instead.
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        for t in range(0, 31, 2):
+            ctl.on_output("✻ Cogitating… 4m 12s · ↓ 8.1k tokens", now=t)
+        self.assertIsNotNone(self.tick(ctl, 30))
+
+
+class TestWhatCountsAsContext(RestartTestCase):
+    def test_the_feature_is_off_unless_it_is_asked_for(self):
+        ctl = restart_controller(context_pct=0, context_tokens=0)
+        usage(ctl, 0, 999999)
+        self.assertFalse(ctl.context_enabled)
+        self.assertIsNone(self.tick(ctl, 100))
+
+    def test_below_the_threshold_nothing_happens(self):
+        ctl = restart_controller()
+        usage(ctl, 0, 400000)
+        self.assertIsNone(self.tick(ctl, 100))
+
+    def test_a_subagents_context_is_not_the_sessions(self):
+        # A subagent writes into the same transcript, and its usage is its own.
+        ctl = restart_controller()
+        usage(ctl, 0, 100000)
+        usage(ctl, 5, 900000, sidechain=True)
+        self.assertEqual(ctl.context_tokens, 100000)
+        self.assertIsNone(self.tick(ctl, 60))
+
+    def test_a_subagent_still_counts_as_the_session_working(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        usage(ctl, 25, 40000, sidechain=True)
+        self.assertIsNone(self.tick(ctl, 30))      # the session is not idle
+        self.assertIsNotNone(self.tick(ctl, 50))
+
+    def test_the_model_decides_the_denominator(self):
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 1000000)
+        self.assertEqual(ctl.context_limit, 500000)
+
+    def test_a_short_window_model_triggers_sooner(self):
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-sonnet-4-5")
+        self.assertEqual(ctl.context_limit, 100000)
+
+    def test_an_unfamiliar_model_is_assumed_small(self):
+        # Assuming large would be a restart that never happens, and a restart
+        # that never happens is invisible until the session dies of a full one.
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-something-9")
+        self.assertEqual(ctl.context_window, 200000)
+
+    def test_an_explicit_window_wins(self):
+        ctl = restart_controller(context_window="300k")
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 300000)
+
+    def test_claude_codes_own_switch_narrows_it(self):
+        ctl = restart_controller(context_window="auto", context_no_1m=True)
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 200000)
+
+    def test_claude_codes_own_ceiling_is_honoured(self):
+        ctl = restart_controller(context_window="auto", context_env_max=150000)
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 150000)
+
+    def test_a_window_proved_too_small_is_raised(self):
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-something-9")
+        usage(ctl, 5, 260000, model="claude-something-9")
+        self.assertEqual(ctl.context_window, 1000000)
+        self.assertEqual(ctl.context_limit, 500000)
+
+    def test_an_explicit_window_is_not_second_guessed(self):
+        ctl = restart_controller(context_window="200k")
+        usage(ctl, 0, 260000, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 200000)
+
+    def test_an_absolute_threshold_ignores_the_window_entirely(self):
+        ctl = restart_controller(context_pct=0, context_tokens=123456)
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertTrue(ctl.context_enabled)
+        self.assertEqual(ctl.context_limit, 123456)
+
+    def test_the_session_moving_to_a_new_transcript_replaces_the_reading(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL, path=MINE)
+        usage(ctl, 1, 9000, path="/proj/after.jsonl")
+        self.assertEqual(ctl.context_tokens, 9000)
+
+
+class TestWhatTheCornerSays(RestartTestCase):
+    def test_nothing_until_the_threshold_is_in_sight(self):
+        ctl = restart_controller()
+        usage(ctl, 0, 100000)
+        self.assertIsNone(ctl.badge_context())
+
+    def test_the_percentage_once_it_is(self):
+        ctl = restart_controller()
+        usage(ctl, 0, 450000)                      # 90% of the way to 500k
+        self.assertAlmostEqual(ctl.badge_context(), 45.0, delta=0.1)
+
+    def test_nothing_at_all_when_the_feature_is_off(self):
+        ctl = restart_controller(context_pct=0, context_tokens=0)
+        usage(ctl, 0, 999999)
+        self.assertIsNone(ctl.badge_context())
+
+    def test_the_restart_names_the_step_it_is_on(self):
+        badge = cr.Badge(dict(badge=1, badge_pos="bottom-right", badge_label="cr"))
+        text, _ = badge.frame(cr.IDLE, 0, 0, 3, now=0, restart=cr.HANDOFF_SENT)
+        self.assertIn("folding", text)
+        text, _ = badge.frame(cr.IDLE, 0, 0, 3, now=0, context=47.0)
+        self.assertIn("47%", text)
+
+    def test_a_wait_still_outranks_it_on_screen(self):
+        badge = cr.Badge(dict(badge=1, badge_pos="bottom-right", badge_label="cr"))
+        text, _ = badge.frame(cr.WAITING, 3600, 0, 3, now=0, restart=cr.HANDOFF_SENT)
+        self.assertIn("1h00m", text)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
