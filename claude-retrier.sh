@@ -1,25 +1,36 @@
 #!/usr/bin/env bash
-# claude-retrier — auto-resume Claude Code after a usage limit, without tmux.
+# claude-retrier — keep a Claude Code or codex session going, without tmux.
 #
-# One file. Wraps `claude` in a PTY it owns, so it can BOTH see everything Claude
-# prints AND type into the session — the two capabilities that forced the tmux
+# One file. Wraps the agent in a PTY it owns, so it can BOTH see everything the
+# session prints AND type into it — the two capabilities that forced the tmux
 # design in claude-auto-retry (capture-pane + send-keys). Everything else (detached
 # monitor, event markers, launchd/systemd reconcilers, shell-function installer)
 # falls out as unnecessary.
 #
 # Usage:  claude-retrier.sh [claude args...]
 #         claude-retrier.sh --cmd <your-claude> [claude args...]
+#         claude-retrier.sh --agent codex --cmd codex [codex args...]
 #         claude-retrier.sh --cr-dump-python      # print the embedded Python (used by tests)
 #         claude-retrier.sh --cr-version
 #
-# `--cmd` (or CR_CLAUDE_CMD) is whatever YOU type to start Claude: a binary, a
+# `--cmd` (or CR_CLAUDE_CMD) is whatever YOU type to start the agent: a binary, a
 # script, a name on PATH, an alias or shell function from your ~/.zshrc, or a whole
 # command line. Anything the wrapper cannot exec itself is run through your login
 # shell, so rc-file aliases work exactly as they do when you type them.
 #
+# `--agent` (or CR_AGENT) picks whose transcript to read: claude or codex. The
+# default works it out from the command being run, so naming it is only needed
+# when that command hides which one it starts.
+#
+# Two things stop a session that is not finished, and it handles both: a usage
+# limit, which states when it lifts and is waited out, and a server that refuses
+# the turn ("Selected model is at capacity") — which states nothing, so it is
+# nudged again after a minute, then two, then four. On codex that refusal takes
+# every running agent down with it, which is what makes the nudge worth having.
+#
 # It can also restart a session that is running out of context window: at
-# CR_CONTEXT_PCT of the window it asks Claude for a handoff file, checks that the
-# file really was written, clears the session and unfolds it from that file. Off
+# CR_CONTEXT_PCT of the window it asks for a handoff file, checks that the file
+# really was written, clears the session and unfolds it from that file. Off
 # unless you set CR_CONTEXT_PCT — see the README.
 #
 # While it runs there is a dim `◆ cr` in a corner of the screen — the wrapper's
@@ -29,7 +40,7 @@
 
 set -u
 
-CR_VERSION="1.7.0"
+CR_VERSION="1.8.0"
 
 # =============================================================================
 # SECTION 1 — DETECTION PATTERNS
@@ -101,6 +112,7 @@ CR_RESET_PATTERNS=(
   "will reset (at|on|in)\\b"
   "available again (at|on|in)\\b"
   "try again (at|in|after)\\s+[0-9]"                                 # try again in 5 minutes
+  "try again (at|on)\\s+[a-z]{3,9}\\.?\\s+[0-9]{1,2}"                # try again at Aug 20th, 2026 10:00 AM (codex)
   "come back (at|in)\\s+[0-9]"
   "retry[- ]after[:\\s]+[0-9]+"
   "wait\\s+[0-9]+\\s*(seconds?|minutes?|hours?|secs?|mins?|hrs?)\\b"
@@ -128,6 +140,36 @@ CR_WORKING_PATTERNS=(
   "[✢✳✶✷✸✹✺✻✽*][ ]?[a-z]{3,}…"                       # ✶ Nebulizing…
   "…\\s*[0-9]+(h|m|s)([ 0-9hms]{0,8})\\s*·\\s*↓"       # … 20m 57s · ↓ 6.8k tokens
   "↓\\s*[0-9.]+k?\\s*tokens"
+  # codex paints "• Working (12s • esc to interrupt)" and, while a turn runs,
+  # offers the composer as a queue instead of a prompt. Either says the same
+  # thing the footer above does: this session is mid-turn, do not type into it.
+  "\\bworking\\s*\\([0-9]+[hms]"
+  "\\btab to queue message\\b"
+)
+
+# Transient server-side failures: the model is out of capacity, the service is
+# overloaded, the request was refused by the infrastructure rather than by the
+# account. Not a quota — nothing resets, there is no time to wait until, and the
+# fix is to ask again in a minute.
+#
+# codex ends the whole turn on one of these, which on a session running agents
+# takes every agent down with it and leaves the session sitting at an idle
+# prompt. That is the shape this list is for: a stop that announces no way out
+# of itself.
+#
+# Kept narrow on purpose. Anything vaguer than these would fire on a model
+# talking ABOUT capacity, and a wrong stall is a message typed into a live
+# session for no reason.
+CR_STALL_PATTERNS=(
+  "selected model is at capacity"
+  "model is at capacity"
+  "please try a different model"
+  "\\bserver_overloaded\\b"
+  "\\boverloaded_error\\b"
+  "(server|service|model|api) is (currently )?overloaded"
+  "we'?re (currently )?experiencing high demand"
+  "http 503|status(:| code)? 503|\\berror 503\\b"
+  "\\bservice unavailable\\b"
 )
 
 # The interactive /rate-limit-options selector. If this is on screen a bare Enter
@@ -148,7 +190,7 @@ CR_IGNORE_PATTERNS=(
   "temporarily limiting requests"
   "approaching (your )?.{0,16}limit"           # the 90%-warning banner: not a stop
   "you are nearing"
-  "claude-retrier|claude-auto-retry|CR_LIMIT_PATTERNS|CR_RESET_PATTERNS"
+  "claude-retrier|claude-auto-retry|CR_LIMIT_PATTERNS|CR_RESET_PATTERNS|CR_STALL_PATTERNS"
   "^\\s*[#>]\\s"                               # markdown quote / comment in a rendered doc
 )
 
@@ -170,6 +212,7 @@ CR_ROSTER_PATTERNS=(
 # =============================================================================
 # SECTION 2 — configuration (all overridable from the environment)
 # =============================================================================
+: "${CR_AGENT:=auto}"                  # auto | claude | codex — whose session this is
 : "${CR_MESSAGE:=continue}"            # what to type when the limit lifts
 : "${CR_MARGIN_SEC:=45}"               # extra wait past the stated reset time
 : "${CR_MAX_ATTEMPTS:=3}"              # sends per incident before giving up
@@ -196,6 +239,17 @@ CR_ROSTER_PATTERNS=(
 : "${CR_CLAUDE_FALLBACKS:=$HOME/.claude/local/claude:$HOME/.local/bin/claude:/opt/homebrew/bin/claude:/usr/local/bin/claude}"
 : "${CR_POLL_SEC:=2}"                  # transcript poll interval
 : "${CR_SCRAPE_CONFIRM_SEC:=3}"        # a scraped banner must persist this long
+
+# --- transient stalls --------------------------------------------------------
+# The other way a session stops without being finished: the server refuses the
+# turn — out of capacity, overloaded — and nothing schedules a way back. There is
+# no reset time to parse, so the wait is one we choose, and it doubles each time
+# the same stall comes straight back rather than hammering a service that has
+# just said it is full.
+: "${CR_STALL_WAIT_SEC:=60}"           # first wait after a stall; 0 = ignore stalls
+: "${CR_STALL_BACKOFF:=2}"             # multiply the wait by this for each repeat
+: "${CR_STALL_MAX_WAIT_SEC:=600}"      # ...but never wait longer than this
+: "${CR_STALL_MAX_ATTEMPTS:=8}"        # consecutive stalls before we stop nudging
 
 # --- context restart ---------------------------------------------------------
 # The second trigger: not "the quota ran out" but "the context window is filling
@@ -244,7 +298,7 @@ CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
 case "${1:-}" in
   --cr-version) echo "claude-retrier $CR_VERSION"; exit 0 ;;
   --cr-help|-h|--help-retrier)
-    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
 esac
 
@@ -264,9 +318,19 @@ while [ "$#" -gt 0 ]; do
       CR_CMD_SPEC="$2"; shift 2 ;;
     --cmd=*) CR_CMD_SPEC="${1#--cmd=}"; shift ;;
     --cr-cmd=*) CR_CMD_SPEC="${1#--cr-cmd=}"; shift ;;
+    --agent|--cr-agent)
+      [ "$#" -ge 2 ] || { echo "claude-retrier: $1 needs claude or codex" >&2; exit 2; }
+      CR_AGENT="$2"; shift 2 ;;
+    --agent=*) CR_AGENT="${1#--agent=}"; shift ;;
+    --cr-agent=*) CR_AGENT="${1#--cr-agent=}"; shift ;;
     *) break ;;
   esac
 done
+
+case "$CR_AGENT" in
+  auto|claude|codex) ;;
+  *) echo "claude-retrier: unknown agent '$CR_AGENT' — expected claude or codex" >&2; exit 2 ;;
+esac
 
 # A user command that resolves back to this script would fork-bomb the machine.
 # Every exec below inherits this counter; two levels are legitimate (the wrapper
@@ -562,6 +626,7 @@ def _env(name, default, cast=str):
 
 
 CFG = dict(
+    agent=_env("CR_AGENT", "auto"),
     message=_env("CR_MESSAGE", "continue"),
     margin=_env("CR_MARGIN_SEC", 45, float),
     max_attempts=_env("CR_MAX_ATTEMPTS", 3, int),
@@ -582,6 +647,11 @@ CFG = dict(
     wait_scale=max(1e-6, _env("CR_WAIT_SCALE", 1.0, float)),
     poll=_env("CR_POLL_SEC", 2.0, float),
     scrape_confirm=_env("CR_SCRAPE_CONFIRM_SEC", 3.0, float),
+    # -- transient stalls --
+    stall_wait=_env("CR_STALL_WAIT_SEC", 60.0, float),
+    stall_backoff=_env("CR_STALL_BACKOFF", 2.0, float),
+    stall_max_wait=_env("CR_STALL_MAX_WAIT_SEC", 600.0, float),
+    stall_max_attempts=_env("CR_STALL_MAX_ATTEMPTS", 8, int),
     # -- context restart --
     context_pct=_env("CR_CONTEXT_PCT", 0.0, float),
     context_tokens=parse_tokens(os.environ.get("CR_CONTEXT_TOKENS")) or 0,
@@ -629,6 +699,7 @@ PAT = {
     "menu": _patterns("CR_PAT_MENU"),
     "ignore": _patterns("CR_PAT_IGNORE"),
     "roster": _patterns("CR_PAT_ROSTER"),
+    "stall": _patterns("CR_PAT_STALL"),
 }
 
 
@@ -703,6 +774,10 @@ def is_reset_line(line):
     return _any(PAT["reset"], line)
 
 
+def is_stall_line(line):
+    return (not is_ignored(line)) and _any(PAT["stall"], line)
+
+
 def is_working(text):
     return _any(PAT["working"], text)
 
@@ -748,6 +823,26 @@ def find_limit(text):
     return None
 
 
+def find_stall(text):
+    """Return the line saying the server refused the turn, else None.
+
+    No pairing here, because there is nothing to pair with: a stall states no
+    reset time — that is exactly what makes it one. The narrowness of the
+    patterns is what stands in for the pairing, so this stays a bottom-up scan
+    with the same two exclusions (a tool call quoting the words, the roster).
+    """
+    flat = strip_ansi(text)
+    if is_roster(flat):
+        return None
+    lines = [l.rstrip() for l in flat.split("\n")]
+    mask = tool_echo_mask(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        if mask[i] or not is_stall_line(lines[i]):
+            continue
+        return lines[i].strip()
+    return None
+
+
 # --------------------------------------------------------------------------- #
 # reset-time parsing
 # --------------------------------------------------------------------------- #
@@ -756,10 +851,12 @@ _MONTHS = {m: i + 1 for i, m in enumerate(
 _WEEKDAYS = {d: i for i, d in enumerate(
     ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"])}
 
-# "resets [on] [Jul 22] [at] 6[:30][am] [(Europe/Warsaw)]"
+# "resets [on] [Jul 22] [at] 6[:30][am] [(Europe/Warsaw)]", and codex's own
+# wording for the same thing: "try again at Aug 20th, 2026 10:00 AM".
 _ABS = re.compile(
-    r"reset(?:s|ting)?\s+(?:on\s+)?"
-    r"(?:(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+)?"
+    r"(?:reset(?:s|ting)?|try again|available again|come back)\s+(?:(?:at|on)\s+)?"
+    r"(?:(?P<mon>jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?,?\s+"
+    r"(?:(?P<year>\d{4}),?\s+)?)?"
     r"(?:(?P<rel>tomorrow|today|tonight)\s+)?"
     r"(?:(?P<wd>monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+)?"
     r"(?:at\s+)?(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>am|pm)?"
@@ -866,7 +963,11 @@ def parse_reset(text, now=None):
     candidates = []
     if mon and day:
         mo, d = _MONTHS[mon[:3].lower()], int(day)
-        for year in (local_now.year, local_now.year + 1):
+        # A stated year settles it. Without one the date could be either side of
+        # a new year, so both are offered and the nearest future one wins below.
+        stated = m.group("year")
+        years = (int(stated),) if stated else (local_now.year, local_now.year + 1)
+        for year in years:
             try:
                 candidates.append(at(y=year, mo=mo, d=d))
             except ValueError:
@@ -936,6 +1037,45 @@ def assistant_row(rec):
                 sidechain=bool(rec.get("isSidechain")))
 
 
+def _appended(path, offset):
+    """(new_offset, [whole rows]) added past `offset`, as bytes.
+
+    Both transcript formats are one JSON object per line appended to a file we
+    are following, so the following is shared and only the reading of a row
+    differs. A partial last line is left for the next poll rather than parsed
+    half-written.
+    """
+    try:
+        with open(path, "rb") as fh:
+            if offset:
+                # Our offset is only meaningful if it still lands on a record
+                # boundary. If the file was rewritten rather than appended to,
+                # it points into the middle of a line and everything after it
+                # would decode as garbage — start over instead.
+                fh.seek(offset - 1)
+                if fh.read(1) != b"\n":
+                    offset = 0
+            fh.seek(offset)
+            data = fh.read()
+            new_offset = fh.tell()
+    except OSError:
+        return offset, []
+    if not data:
+        return new_offset, []
+    tail_nl = data.rfind(b"\n")
+    if tail_nl == -1:
+        return offset, []                     # a partial line: re-read it next tick
+    return offset + tail_nl + 1, data[:tail_nl].split(b"\n")
+
+
+def _echo_keys(echo):
+    """The messages we typed, and what they look like once written into a row."""
+    echoes = [echo] if isinstance(echo, str) else [e for e in (echo or []) if e]
+    # json.dumps rather than quoting by hand: a message with a quote, a backslash
+    # or a tab in it is escaped in the row exactly the way it is escaped here.
+    return echoes, [json.dumps(e).encode("utf-8", "replace") for e in echoes]
+
+
 def transcript_limit_records(path, offset=0, echo=None):
     """(new_offset, [records]) for rows appended past `offset` that we care about.
 
@@ -952,32 +1092,9 @@ def transcript_limit_records(path, offset=0, echo=None):
     of them, and the caller only needs the fact.
     """
     out = []
-    echoes = [echo] if isinstance(echo, str) else [e for e in (echo or []) if e]
-    # json.dumps rather than quoting by hand: a message with a quote, a backslash
-    # or a tab in it is escaped in the row exactly the way it is escaped here.
-    echo_keys = [json.dumps(e).encode("utf-8", "replace") for e in echoes]
-    try:
-        with open(path, "rb") as fh:
-            if offset:
-                # Our offset is only meaningful if it still lands on a record
-                # boundary. If the file was rewritten rather than appended to,
-                # it points into the middle of a line and everything after it
-                # would decode as garbage — start over instead.
-                fh.seek(offset - 1)
-                if fh.read(1) != b"\n":
-                    offset = 0
-            fh.seek(offset)
-            data = fh.read()
-            new_offset = fh.tell()
-    except OSError:
-        return offset, out
-    if not data:
-        return new_offset, out
-    tail_nl = data.rfind(b"\n")
-    if tail_nl == -1:
-        return offset, out                    # a partial line: re-read it next tick
-    new_offset = offset + tail_nl + 1
-    for raw in data[:tail_nl].split(b"\n"):
+    echoes, echo_keys = _echo_keys(echo)
+    new_offset, rows = _appended(path, offset)
+    for raw in rows:
         limitish = b"rate_limit" in raw or b"isApiErrorMessage" in raw
         echoish = b'"user"' in raw and any(k in raw for k in echo_keys)
         # Prefilters only — all three can match on a tool result that merely
@@ -1023,6 +1140,265 @@ def record_text(rec):
     return ""
 
 
+# --------------------------------------------------------------------------- #
+# codex — the same two questions, asked of a different file
+# --------------------------------------------------------------------------- #
+# codex keeps one JSONL "rollout" per thread under
+# $CODEX_HOME/sessions/<yyyy>/<mm>/<dd>/, and it says more than Claude Code's
+# transcript does: the turn boundaries are in it, so is the size of the context
+# window, and so is the reason a turn ended. Nothing here has to be inferred
+# from the screen.
+#
+# The rows that matter, all shaped `{"type": …, "payload": {"type": …}}`:
+#
+#   event_msg / task_complete    a turn ended. With no `error` it ended well;
+#                                with one, `codex_error_info` separates "the
+#                                account ran out" from "the server did".
+#   event_msg / token_count      what the last request was sent with, and how
+#                                large the window is: the context trigger's two
+#                                numbers, in codex's own accounting.
+#   response_item / message      role "user" is the echo of what was typed;
+#                                role "assistant" is the session answering.
+#   event_msg / thread_settings_applied   which model, for the log.
+#
+# The error that prompted all of this is a turn ending with
+# `{"message": "Selected model is at capacity. …", "codex_error_info":
+# "server_overloaded"}` — a stall: no reset time, no way out of itself, and on a
+# session running agents it takes every one of them down with it.
+CODEX_LIMIT_INFO = ("usage_limit_exceeded", "usage_limit_reached",
+                    "rate_limit_exceeded", "rate_limit", "quota_exceeded")
+
+
+def codex_home():
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def codex_text(payload):
+    """The words in a codex message row, whichever content shape it uses."""
+    content = payload.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for c in content:
+        if isinstance(c, dict) and isinstance(c.get("text"), str):
+            parts.append(c["text"])
+    return " ".join(parts).strip()
+
+
+def codex_records(path, offset=0, echo=None):
+    """(new_offset, [records]) for the rollout rows appended past `offset`.
+
+    Emits the same five kinds the rest of the wrapper already speaks — limit,
+    stall, echo, alive, and an alive marked `quiet` for a row that names the
+    model without proving anything is being served.
+
+    Rows are not collapsed the way Claude Code's assistant rows are. There, a
+    dozen rows are one answer; here each row is a different statement about the
+    turn, and merging them would let one without figures blank out the one that
+    had them.
+    """
+    out = []
+    echoes, echo_keys = _echo_keys(echo)
+    new_offset, rows = _appended(path, offset)
+    for raw in rows:
+        # Prefilters only, and deliberately spelling-insensitive: codex has
+        # written these files both with and without spaces after the colons.
+        interesting = (b"task_complete" in raw or b"token_count" in raw
+                       or b'"assistant"' in raw or b"thread_settings_applied" in raw
+                       or (echo_keys and any(k in raw for k in echo_keys)))
+        if not interesting:
+            continue
+        try:
+            rec = json.loads(raw.decode("utf-8", "replace"))
+        except Exception:
+            continue
+        payload = rec.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        kind = payload.get("type")
+        ts = rec.get("timestamp")
+        if kind == "task_complete":
+            err = payload.get("error")
+            if not isinstance(err, dict) or not err:
+                # A turn that ended on its own terms. It says the session is
+                # alive AND that whatever was refusing turns has stopped.
+                out.append(dict(kind="alive", ts=ts, clean=True, sidechain=False))
+                continue
+            text = str(err.get("message") or "").strip()
+            info = str(err.get("codex_error_info") or "").strip().lower()
+            if info in CODEX_LIMIT_INFO or (not info and is_limit_line(text)):
+                out.append(dict(kind="limit", text=text, ts=ts,
+                                error=info or "usage_limit"))
+            else:
+                # Everything else the server refused a turn over. The wait for
+                # one is ours to pick, so it does not matter which it was.
+                out.append(dict(kind="stall", text=text or info or "the turn was refused",
+                                ts=ts, error=info))
+        elif kind == "token_count":
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                continue
+            last = info.get("last_token_usage")
+            tokens = last.get("total_tokens") if isinstance(last, dict) else None
+            window = info.get("model_context_window")
+            out.append(dict(kind="alive", ts=ts, sidechain=False,
+                            tokens=int(tokens) if isinstance(tokens, (int, float)) else None,
+                            window=int(window) if isinstance(window, (int, float)) else None))
+        elif kind == "thread_settings_applied":
+            settings = payload.get("thread_settings")
+            model = settings.get("model") if isinstance(settings, dict) else None
+            if model:
+                out.append(dict(kind="alive", ts=ts, quiet=True, sidechain=False,
+                                model=str(model)))
+        elif kind == "message":
+            role = payload.get("role")
+            if role == "user":
+                text = codex_text(payload)
+                if text and text in echoes:
+                    out.append(dict(kind="echo", text=text, ts=ts))
+            elif role == "assistant":
+                out.append(dict(kind="alive", ts=ts, sidechain=False))
+    return new_offset, out
+
+
+class ClaudeAgent:
+    """Where Claude Code writes, and how to read it."""
+
+    name = "claude"
+
+    def __init__(self, directory=None):
+        self.dir = project_dir() if directory is None else directory
+
+    def paths(self, now=None):
+        return sorted(glob.glob(os.path.join(self.dir, "*.jsonl")))
+
+    def keep(self, path):
+        return True          # every transcript in a project dir is a session's
+
+    def records(self, path, offset, echo):
+        return transcript_limit_records(path, offset, echo)
+
+
+class CodexAgent:
+    """Where codex writes, and which of those files are this terminal's.
+
+    Two things differ from Claude Code and both matter. The rollouts of every
+    project live in one tree, under a directory named for the day — so the scan
+    is dated rather than fixed, and spans three of them, because "which day" is
+    a question the local clock and codex can answer differently and a session
+    can outlive midnight either way. And a subagent gets a rollout of its own:
+    reading one as the session's would report a limit this terminal never hit
+    and a context that is not ours to restart.
+    """
+
+    name = "codex"
+
+    def __init__(self, home=None, cwd=None):
+        self.home = home or codex_home()
+        self.dir = os.path.join(self.home, "sessions")
+        self.cwd = os.path.realpath(cwd or os.getcwd())
+        self._verdicts = {}          # path -> is this session's, once we can tell
+
+    def paths(self, now=None):
+        now = now if now is not None else time.time()
+        out = []
+        for offset in (-86400, 0, 86400):
+            t = time.localtime(now + offset)
+            out.extend(glob.glob(os.path.join(
+                self.dir, "%04d" % t.tm_year, "%02d" % t.tm_mon, "%02d" % t.tm_mday,
+                "*.jsonl")))
+        return sorted(set(out))
+
+    def keep(self, path):
+        verdict = self._verdicts.get(path)
+        if verdict is None:
+            verdict = self._classify(path)
+            if verdict is not None:
+                self._verdicts[path] = verdict
+        # Unknown means the head of the file has not landed yet. Reading it for
+        # one more poll is the cheap mistake; ignoring a session's own rollout
+        # for the rest of its life is not.
+        return verdict is not False
+
+    def _classify(self, path):
+        """True: this terminal's. False: somebody else's. None: cannot tell yet."""
+        head = b""
+        try:
+            with open(path, "rb") as fh:
+                while len(head) < 4 * 1024 * 1024:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        break
+                    head += chunk
+                    if b"\n" in head:
+                        break
+        except OSError:
+            return None
+        line, sep, _ = head.partition(b"\n")
+        if not sep:
+            return None
+        try:
+            rec = json.loads(line.decode("utf-8", "replace"))
+        except Exception:
+            return None
+        payload = rec.get("payload")
+        if rec.get("type") != "session_meta" or not isinstance(payload, dict):
+            return None
+        if payload.get("thread_source") == "subagent":
+            return False
+        if "subagent" in str(payload.get("source") or ""):
+            return False
+        cwd = payload.get("cwd")
+        if cwd:
+            try:
+                return os.path.realpath(cwd) == self.cwd
+            except Exception:
+                return True
+        return True
+
+    def records(self, path, offset, echo):
+        return codex_records(path, offset, echo)
+
+
+# codex takes the directory to work in on the command line, and when it is given
+# one the rollouts to follow are that directory's rather than ours.
+_CD_FLAGS = ("--cd", "--cwd", "-C")
+
+
+def codex_cwd(argv):
+    argv = list(argv or [])
+    for i, arg in enumerate(argv):
+        for flag in _CD_FLAGS:
+            if arg == flag and i + 1 < len(argv):
+                return argv[i + 1]
+            if arg.startswith(flag + "="):
+                return arg[len(flag) + 1:]
+    return None
+
+
+def pick_agent(name, launch):
+    """Which of the two we are wrapping: what was asked for, or what was run.
+
+    Only the launch vector is read, never the arguments meant for the agent. A
+    prompt is one of those — `claude-retrier "fix the codex build"` starts
+    claude, and reading the sentence would have it looking for a rollout file
+    that will never be written.
+    """
+    name = (name or "auto").strip().lower()
+    if name not in ("auto", ""):
+        return name
+    hay = " ".join(launch or [])
+    return "codex" if re.search(r"(?:^|[/\s'\"])codex(?:[\s'\"]|$)", hay) else "claude"
+
+
+def build_agent(name, argv=None):
+    if name == "codex":
+        return CodexAgent(cwd=codex_cwd(argv))
+    return ClaudeAgent()
+
+
 class TranscriptWatcher:
     """Follows every transcript in this project that grows after we start.
 
@@ -1031,8 +1407,12 @@ class TranscriptWatcher:
     a `--continue` run never replays yesterday's banner.
     """
 
-    def __init__(self, directory, poll=2.0, now=None, echo=None):
-        self.dir = directory
+    def __init__(self, directory=None, poll=2.0, now=None, echo=None, agent=None):
+        # `directory` stays first and positional: it is how the claude side has
+        # always been built, and naming a directory is still the whole of what
+        # that side needs.
+        self.agent = agent or ClaudeAgent(directory)
+        self.dir = getattr(self.agent, "dir", directory)
         self.poll = poll
         self.echo = echo
         self.offsets = {}
@@ -1043,8 +1423,8 @@ class TranscriptWatcher:
         self._seed(now or time.time())
         self.preexisting = set(self.offsets)
 
-    def _seed(self, _now):
-        for p in glob.glob(os.path.join(self.dir, "*.jsonl")):
+    def _seed(self, now):
+        for p in self.agent.paths(now):
             try:
                 self.offsets[p] = os.path.getsize(p)
             except OSError:
@@ -1057,7 +1437,15 @@ class TranscriptWatcher:
             return []
         self.next_poll = now + self.poll
         found = []
-        for p in sorted(glob.glob(os.path.join(self.dir, "*.jsonl"))):
+        # The file we are following stays on the list even if it drops off the
+        # scan: codex's directories are named for the day, and a session that
+        # runs long enough leaves its own behind.
+        scan = set(self.agent.paths(now))
+        if self.current:
+            scan.add(self.current)
+        for p in sorted(scan):
+            if not self.agent.keep(p):
+                continue
             start = self.offsets.get(p)
             if start is None:
                 start = 0                       # created after we started: read it all
@@ -1070,7 +1458,7 @@ class TranscriptWatcher:
             if size > start:
                 self.seen_any = True
                 self.grown.append(p)
-            offset, recs = transcript_limit_records(p, start, self.echo)
+            offset, recs = self.agent.records(p, start, self.echo)
             self.offsets[p] = offset
             for rec in recs:
                 rec["path"] = p
@@ -1205,10 +1593,11 @@ HANDOFF_SENT, HANDOFF_OK, CLEARED, RESUME_SENT = (
 RESTART_LABELS = {HANDOFF_SENT: "folding", HANDOFF_OK: "folded",
                   CLEARED: "cleared", RESUME_SENT: "unfolding"}
 
-# Defaults for everything the context restart reads, so a Controller built from a
-# config dict written before the feature existed (the tests build several) still
-# has them, and disabled is what it gets.
+# Defaults for everything the context restart and the stall handling read, so a
+# Controller built from a config dict written before either existed (the tests
+# build several) still has them, and for the restart disabled is what it gets.
 CONTEXT_DEFAULTS = dict(
+    stall_wait=60.0, stall_backoff=2.0, stall_max_wait=600.0, stall_max_attempts=8,
     context_pct=0.0, context_tokens=0, context_window="auto",
     context_env_max=0, context_no_1m=False,
     handoff_file=".claude-retrier/handoff.md", handoff_marker="HANDOFF",
@@ -1239,6 +1628,10 @@ class Controller:
         self.typing_since = 0.0    # when that gate was first found shut
         self.started = now if now is not None else time.time()
         self.banner_text = None
+        self.incident = None      # "limit" or "stall": what we are waiting out
+        self.stall_key = None     # the last stall acted on, and when
+        self.stall_at = 0.0
+        self.stall_streak = 0     # stalls since the last turn that finished
         self._carry = ""          # overlap so a marker split across two reads still matches
         self._input_carry = b""   # an escape sequence cut in half by a read boundary
         self.last_draft_change = now if now is not None else time.time()
@@ -1251,6 +1644,7 @@ class Controller:
         self.resume_text = cfg["resume_msg"].replace("{file}", cfg["handoff_file"])
         self.context_tokens = None    # what the session's last turn was sent with
         self.context_model = None
+        self.context_window_hint = None   # a window the transcript states outright
         self.context_window = None
         self.context_limit = None     # the threshold in tokens; None = no trigger
         self.context_path = None      # the transcript those figures came from
@@ -1457,6 +1851,62 @@ class Controller:
             self._rearm = True
         return True
 
+    # A stall is the other way a session stops without being finished: the
+    # server refused the turn. There is no reset time to parse — that is what
+    # makes it a stall rather than a limit — so the wait is one we pick, and it
+    # doubles for each stall that comes straight back, because a service that
+    # just said it is full does not want to be asked again in a minute forever.
+    #
+    # The streak is what carries that across incidents. `attempts` cannot: the
+    # nudge lands, the session answers, the controller goes idle, and the next
+    # refusal arrives as a brand new incident with the count back at zero.
+    STALL_SAME = 30.0        # the same wording again this soon is the same stall
+
+    def on_stall(self, text, now, source):
+        """The server refused the turn. Nudge it again, later each time."""
+        if self.cfg["stall_wait"] <= 0:
+            return False
+        key = re.sub(r"\s+", " ", text or "").strip().lower()
+        if self.state in (WAITING, VERIFY):
+            return False                        # already waiting something out
+        if key and key == self.stall_key and now - self.stall_at < self.STALL_SAME:
+            # A repainting TUI redraws the same line for as long as it is on
+            # screen, and the transcript can report it once more besides.
+            return False
+        if self.stall_streak >= self.cfg["stall_max_attempts"]:
+            if self.stall_key is not None:
+                self.log("stalled %d times in a row (%s); leaving it alone"
+                         % (self.stall_streak, source))
+                self.stall_key = None
+            return False
+        secs = min(self.cfg["stall_wait"] * self.cfg["stall_backoff"] ** self.stall_streak,
+                   self.cfg["stall_max_wait"], self.cfg["max_wait"])
+        self.stall_streak += 1
+        self.stall_key = key
+        self.stall_at = now
+        self.log("stall detected (%s), nudging in %.0fs (streak %d): %s"
+                 % (source, secs, self.stall_streak, text))
+        if self.rstate is not None:
+            self.log("the stall landed mid-restart (%s); the restart waits it out"
+                     % self.rstate)
+        self.banner = key
+        self.banner_text = text
+        self.incident = "stall"
+        self.state = WAITING
+        self.attempts = 0
+        self.deferred = False
+        self.typing_since = 0.0
+        self.limit_at = now
+        self.wake_at = now + secs / self.cfg["wait_scale"]
+        return True
+
+    def on_turn_done(self, now):
+        """A turn ended with no error, so nothing is refusing turns any more."""
+        if self.stall_streak:
+            self.log("a turn completed; the stall streak (%d) is over" % self.stall_streak)
+        self.stall_streak = 0
+        self.stall_key = None
+
     def on_limit(self, banner, now, source):
         key = re.sub(r"\s+", " ", banner or "").strip().lower()
         if self.state in (WAITING, VERIFY) and key == self.banner:
@@ -1476,6 +1926,7 @@ class Controller:
         secs = min(secs + self.cfg["margin"], self.cfg["max_wait"])
         self.banner = key
         self.banner_text = banner
+        self.incident = "limit"
         self.state = WAITING
         self.attempts = 0
         self.deferred = False
@@ -1657,16 +2108,27 @@ class Controller:
             return                       # a subagent's context, not the session's
         if rec.get("stop_reason") is not None:
             self.last_stop_reason = rec["stop_reason"]
+        window = rec.get("window")
         model = rec.get("model")
+        moved = False
         if model and model != self.context_model:
             self.context_model = model
+            moved = True
+        if window and window != self.context_window_hint:
+            # codex writes the window it is actually using into every row of
+            # accounting. Nothing we could work out from a model name beats
+            # being told.
+            self.context_window_hint = int(window)
+            moved = True
+        if moved:
             self._resolve_window()
         tokens = rec.get("tokens")
         if tokens is None:
             return
         self.context_tokens = tokens
         if (self.context_window and tokens > self.context_window
-                and not self._window_bumped and not parse_tokens(self.cfg["context_window"])):
+                and not self._window_bumped and not self.context_window_hint
+                and not parse_tokens(self.cfg["context_window"])):
             # Guessing low is the safe direction, but being PROVED low is not a
             # reason to keep the guess: a threshold above the window we assumed
             # is a restart that can never happen.
@@ -1719,7 +2181,9 @@ class Controller:
             HANDOFF_SENT: "context is filling up; asking for a handoff",
             CLEARED: "handoff verified; clearing the context",
             RESUME_SENT: "context cleared; unfolding the handoff",
-        }.get(self.rstate, "limit lifted; resuming session")
+        }.get(self.rstate,
+              "asking the session to carry on" if self.incident == "stall"
+              else "limit lifted; resuming session")
 
     # -- the window --------------------------------------------------------- #
     def _resolve_window(self):
@@ -1731,6 +2195,8 @@ class Controller:
         elif self.cfg["context_env_max"] > 0:
             self.context_window, why = (int(self.cfg["context_env_max"]),
                                         "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        elif self.context_window_hint:
+            self.context_window, why = self.context_window_hint, "the transcript"
         elif native is None:
             self.context_window, why = SMALL_WINDOW, "an unfamiliar model slug"
         elif self.cfg["context_no_1m"]:
@@ -1745,7 +2211,8 @@ class Controller:
         self._recompute_limit()
         if self.context_enabled:
             self.log("%s: a %s context window (%s), restarting at %s"
-                     % (self.context_model, human_tokens(self.context_window), why,
+                     % (self.context_model or "this session",
+                        human_tokens(self.context_window), why,
                         human_tokens(self.context_limit)))
 
     def _recompute_limit(self):
@@ -2321,7 +2788,8 @@ def main(argv):
     launch = launch_vector()
     claude = launch[0]
     log = Logger(CFG["log"])
-    log("start: %s %s" % (" ".join(launch), " ".join(argv)))
+    agent_name = pick_agent(CFG["agent"], launch)
+    log("start: %s %s (agent: %s)" % (" ".join(launch), " ".join(argv), agent_name))
 
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
@@ -2378,7 +2846,7 @@ def main(argv):
     badge = Badge(CFG)
     if not interactive:
         badge.enabled = False      # nothing to paint on when stdout is a pipe
-    watcher = TranscriptWatcher(project_dir(), CFG["poll"],
+    watcher = TranscriptWatcher(poll=CFG["poll"], agent=build_agent(agent_name, argv),
                                 echo=[CFG["message"], ctl.resume_text])
     if ctl.context_enabled:
         log("context restart armed: handoff -> %s, %s"
@@ -2510,7 +2978,12 @@ def main(argv):
                     if CFG["scrape"] == "always" or not watcher.seen_any:
                         banner = find_limit(window)
                         if banner:
-                            pending_scrape = (banner, now + CFG["scrape_confirm"])
+                            pending_scrape = ("limit", banner, now + CFG["scrape_confirm"])
+                        else:
+                            stall = find_stall(window)
+                            if stall:
+                                pending_scrape = ("stall", stall,
+                                                  now + CFG["scrape_confirm"])
 
             if watch_stdin and stdin_fd in ready:
                 try:
@@ -2540,10 +3013,21 @@ def main(argv):
                     # session's context.
                     if rec.get("path") == watcher.current:
                         ctl.on_context(rec, now)
+                    if rec.get("clean"):
+                        ctl.on_turn_done(now)
+                    # A row that only names the model says nothing about whether
+                    # anything is being served, and a wait must not end on it.
+                    if rec.get("quiet"):
+                        continue
                     # Rows are in file order, so an assistant row that follows a
                     # limit row really did come after it.
                     if ctl.on_alive(now, "transcript"):
                         wait_cancelled()
+                    continue
+                if rec.get("kind") == "stall":
+                    pending_scrape = None        # the structured channel wins
+                    if ctl.on_stall(rec["text"], now, "transcript"):
+                        notify("the server refused the turn; trying again shortly")
                     continue
                 text = rec["text"] or "usage limit"
                 pending_scrape = None            # the structured channel wins
@@ -2559,11 +3043,19 @@ def main(argv):
             # transcript that had not yet announced itself when the banner was
             # first drawn (in which case the structured channel takes over and
             # this is dropped).
-            if pending_scrape and now >= pending_scrape[1]:
-                banner, _ = pending_scrape
+            if pending_scrape and now >= pending_scrape[2]:
+                kind, text, _ = pending_scrape
                 pending_scrape = None
                 if CFG["scrape"] == "always" or not watcher.seen_any:
-                    if ctl.on_limit(banner, now, "screen"):
+                    if kind == "stall":
+                        if ctl.on_stall(text, now, "screen"):
+                            # The line stays on screen after we have acted on it,
+                            # and on a TUI it is repainted for as long as it is
+                            # there. Forgetting the window is what keeps one
+                            # refusal from reading as an endless run of them.
+                            window = ""
+                            notify("the server refused the turn; trying again shortly")
+                    elif ctl.on_limit(text, now, "screen"):
                         window = ""
                         notify("usage limit detected; waiting for reset")
 
@@ -2666,7 +3158,9 @@ CR_PAT_WORKING=$(printf '%s\n' "${CR_WORKING_PATTERNS[@]}")
 CR_PAT_MENU=$(printf '%s\n' "${CR_MENU_PATTERNS[@]}")
 CR_PAT_IGNORE=$(printf '%s\n' "${CR_IGNORE_PATTERNS[@]}")
 CR_PAT_ROSTER=$(printf '%s\n' "${CR_ROSTER_PATTERNS[@]}")
+CR_PAT_STALL=$(printf '%s\n' "${CR_STALL_PATTERNS[@]}")
 export CR_PAT_LIMIT CR_PAT_RESET CR_PAT_WORKING CR_PAT_MENU CR_PAT_IGNORE CR_PAT_ROSTER
+export CR_PAT_STALL
 
 case "${1:-}" in
   --cr-dump-python)
@@ -2675,7 +3169,7 @@ case "${1:-}" in
   --cr-dump-patterns)
     # The test suite reads the pattern arrays from here rather than re-declaring
     # them, so a pattern can never be tested in a form the wrapper doesn't use.
-    for _n in LIMIT RESET WORKING MENU IGNORE ROSTER; do
+    for _n in LIMIT RESET WORKING MENU IGNORE ROSTER STALL; do
       eval "printf '### CR_PAT_%s\n%s\n' \"\$_n\" \"\$CR_PAT_$_n\""
     done
     exit 0 ;;
@@ -2721,6 +3215,32 @@ for arg in "$@"; do
   esac
 done
 
+# The same judgement, made about codex: most of its subcommands are not a
+# session at all. `resume` and `fork` are, so they are not on this list.
+cr_looks_like_codex() {
+  case "$CR_AGENT" in
+    codex) return 0 ;;
+    claude) return 1 ;;
+  esac
+  case " $CR_CMD_SPEC ${CR_ARGV[*]} " in
+    *[/\ ]codex\ *) return 0 ;;
+  esac
+  return 1
+}
+
+if cr_looks_like_codex; then
+  # Every argument is looked at, not just the first one that is not a flag: the
+  # subcommand can sit behind a flag that took a value (`codex --cd DIR exec`),
+  # and stopping at that value would wrap a batch run. A prompt is one argument,
+  # so `codex "exec the plan"` is still a session.
+  for arg in "$@"; do
+    case "$arg" in
+      exec|login|logout|mcp|app|app-server|apply|completion|cloud-tasks|debug|doctor|sandbox|update|features|models|execpolicy|generate-ts)
+        exec "${CR_ARGV[@]}" "$@" ;;
+    esac
+  done
+fi
+
 # \037 (unit separator) rather than a newline: it cannot occur in a path, a
 # command name, or anything a shell would accept as one.
 CR_CLAUDE_ARGV=$(printf '%s\037' "${CR_ARGV[@]}")
@@ -2731,6 +3251,8 @@ export CR_RESUME_SEC
 export CR_DRAFT_GRACE_SEC CR_TYPING_MAX_SEC
 export CR_BADGE CR_BADGE_POS CR_BADGE_LABEL
 export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC
+export CR_AGENT
+export CR_STALL_WAIT_SEC CR_STALL_BACKOFF CR_STALL_MAX_WAIT_SEC CR_STALL_MAX_ATTEMPTS
 export CR_CONTEXT_PCT CR_CONTEXT_TOKENS CR_CONTEXT_WINDOW
 export CR_HANDOFF_FILE CR_HANDOFF_MARKER CR_HANDOFF_MIN_BYTES CR_HANDOFF_ATTEMPTS
 export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG

@@ -55,7 +55,7 @@ class TestCli(unittest.TestCase):
 
     def test_dump_patterns_lists_every_array(self):
         out = run(["--cr-dump-patterns"]).stdout
-        for name in ("LIMIT", "RESET", "WORKING", "MENU", "IGNORE"):
+        for name in ("LIMIT", "RESET", "WORKING", "MENU", "IGNORE", "STALL"):
             self.assertIn("### CR_PAT_%s" % name, out)
         self.assertIn("hit your", out)
 

@@ -8,9 +8,9 @@
 [![test](https://github.com/a0s/claude-retrier/actions/workflows/test.yml/badge.svg)](https://github.com/a0s/claude-retrier/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Keep a Claude Code session going when it stops for a usage limit, and restart it
-before it runs out of context. One shell script, with no tmux and no daemon
-behind it.
+Keep a Claude Code or codex session going when it stops — for a usage limit, or
+for a server that refused the turn — and restart it before it runs out of
+context. One shell script, with no tmux and no daemon behind it.
 
 ```sh
 brew install a0s/claude-retrier/claude-retrier
@@ -19,9 +19,16 @@ claude-retrier                       # instead of: claude
 
 ## What it does
 
+- Wraps codex as well as Claude Code. `--agent codex` says so outright, or
+  leave it on `auto` and it works out which one you are running from the
+  command.
 - Waits out a usage limit. The session stops on `You've hit your session limit ·
   resets 3pm`, and the wrapper sleeps until the reset and types `continue` for
   you.
+- Nudges a turn the server refused. `Selected model is at capacity` states no
+  reset time and schedules no way back — and on codex it takes every agent the
+  session was running down with it — so the wrapper waits a minute and types
+  `continue`, doubling the wait each time the refusal comes straight back.
 - Notices when a limit lifts early. Switching accounts or upgrading a plan
   announces nothing, so it takes the session answering again as the answer,
   drops the countdown and goes back to watching.
@@ -116,6 +123,73 @@ Everything after the command belongs to claude. `claude-retrier --cmd
 claude-work --resume` resumes, and a bare prompt stays a prompt. With no `--cmd`
 at all the wrapper finds `claude` the way your shell would.
 
+## codex
+
+Point `--cmd` at codex and the wrapper follows it the same way it follows
+claude:
+
+```sh
+claude-retrier --cmd codex
+claude-retrier --agent codex --cmd 'codex --model gpt-5.6-sol'
+```
+
+`--agent` (or `CR_AGENT`) says which one you are running; the default, `auto`,
+works it out from the command, so `claude-retrier --cmd codex` needs nothing
+else. `--cr-agent` is the same flag under the prefix the other wrapper options
+carry. `claude` and `codex` are the only two values.
+
+codex writes one JSONL "rollout" per thread under
+`$CODEX_HOME/sessions/<yyyy>/<mm>/<dd>/` (`CODEX_HOME` defaults to `~/.codex`),
+and it states outright several things Claude Code's transcript only implies:
+where a turn started and ended, the exact size of the context window
+(`model_context_window`), what the last request was sent with, and the reason a
+turn ended. So on codex the context window is read rather than guessed from a
+model name, and `CR_CONTEXT_WINDOW` is not needed.
+
+Every project's rollouts share one tree, and a codex subagent gets a rollout of
+its own. The wrapper reads only the rollout whose head says `thread_source:
+user` and whose `cwd` is the directory it is running in — reading a subagent's
+would report a limit this terminal never hit, and a context that is not ours to
+restart. When codex is given `--cd`, that directory is the one followed.
+
+Most of what codex can be asked to do is not a session at all. `codex exec`,
+`codex login`, `codex mcp` and the rest run untouched, the way `claude -p`
+already does; `codex resume` and `codex fork` are sessions, and are wrapped.
+
+The context percentage runs a few points ahead of the one in codex's own status
+line: codex subtracts a fixed baseline before working out its percentage and the
+wrapper does not, so a restart set at, say, 51% fires slightly before codex would
+call the session that full. Early is the safe direction.
+
+## The stall
+
+A usage limit says when it lifts, and the wrapper waits that out. The other way
+a session stops says nothing at all: the server refuses the turn outright —
+`Selected model is at capacity. Please try a different model.` — with no reset
+time and nothing scheduling a way back. On codex that refusal ends the whole
+turn, which takes every agent the session was running down with it, and leaves
+the session sitting at an idle prompt with no sign anything is wrong.
+
+So the wrapper waits a minute and types `continue`, the same thing a person
+watching the screen would do. A repeat refusal doubles the wait — 60s, 120s,
+240s — up to `CR_STALL_MAX_WAIT_SEC`, because a service that has just said it is
+full does not want to be asked again every minute. Any turn that finishes ends
+the streak, and the next stall starts back at a minute. The usual gates still
+apply: nothing is typed while the session is mid-turn or while there is an
+unsent draft in the prompt box.
+
+| variable | default | |
+|---|---|---|
+| `CR_STALL_WAIT_SEC` | `60` | first wait after a stall; `0` switches stalls off |
+| `CR_STALL_BACKOFF` | `2` | multiply the wait by this for each repeat |
+| `CR_STALL_MAX_WAIT_SEC` | `600` | the longest a stall wait gets |
+| `CR_STALL_MAX_ATTEMPTS` | `8` | consecutive stalls before it stops nudging |
+
+Detection patterns for a refused turn live in `CR_STALL_PATTERNS`, next to the
+other pattern arrays at the top of `claude-retrier.sh`. That array is kept
+narrow on purpose: a wrong stall is a message typed into a live session for no
+reason.
+
 ## Resuming a session
 
 Claude's own flags pass straight through, so whatever you would type after
@@ -140,7 +214,9 @@ files, and a launchd or systemd reconciler.
 
 It detects a limit on two channels. The first is the transcript: Claude Code
 writes `{"error":"rate_limit","isApiErrorMessage":true}` into
-`~/.claude/projects/<project>/<session>.jsonl`, which is structured,
+`~/.claude/projects/<project>/<session>.jsonl`, and codex writes its own JSONL
+"rollout" under `$CODEX_HOME/sessions/<yyyy>/<mm>/<dd>/`, stating outright the
+reason a turn ended and the size of the context window. Either is structured,
 unambiguous, and the one the wrapper trusts. The second is the screen, matched
 against patterns, and it is only used when the transcript is unavailable. One
 screen is never read that way: the `claude agents` roster, where every card is a
@@ -391,6 +467,7 @@ All optional, all environment variables:
 | variable | default | |
 |---|---|---|
 | `CR_CLAUDE_CMD` | | your claude command (same as `--cmd`) |
+| `CR_AGENT` | `auto` | `auto` \| `claude` \| `codex` — which one you are running (same as `--agent`) |
 | `CR_MESSAGE` | `continue` | what to type when the limit lifts |
 | `CR_MARGIN_SEC` | `45` | extra wait past the stated reset time |
 | `CR_MAX_ATTEMPTS` | `3` | sends per incident before giving up |
@@ -421,7 +498,7 @@ never becomes the reason your session will not start.
 ## Tests
 
 ```sh
-./test/run.sh              # 310 tests: patterns, time parsing, transcript, state
+./test/run.sh              # 364 tests: patterns, time parsing, transcript, state
                            # machine, the badge, custom commands, degradation, and
                            # end-to-end runs on a real pty (rendered through a
                            # terminal emulator, so "what the user sees" is asserted)

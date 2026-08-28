@@ -7,6 +7,59 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [1.8.0] - 2026-08-28
+
+A second agent, and a second way a session stops without being finished.
+
+### Added
+- **codex support.** `--agent codex` (or `CR_AGENT=codex`) wraps `codex`
+  instead of `claude`; left on `auto`, the default, the wrapper works out
+  which one from the command it is given, so `claude-retrier --cmd codex`
+  needs nothing else. `--cr-agent` is the same flag under the prefix the
+  other wrapper options carry.
+
+  codex writes one JSONL "rollout" per thread under
+  `$CODEX_HOME/sessions/<yyyy>/<mm>/<dd>/`, and it states outright several
+  things Claude Code's transcript only implies: where a turn started and
+  ended, the exact size of the context window (`model_context_window`), what
+  the last request was sent with, and the reason a turn ended. So on codex
+  the context window is read rather than guessed from a model name, and
+  `CR_CONTEXT_WINDOW` is not needed.
+
+  Every project's rollouts share one tree, and a codex subagent gets a
+  rollout of its own. The wrapper reads only the rollout whose head says
+  `thread_source: user` and whose `cwd` is the directory it is running in —
+  reading a subagent's would report a limit this terminal never hit, and a
+  context that is not ours to restart. When codex is given `--cd`, that
+  directory is the one followed.
+
+  Most of codex's subcommands are not a session at all (`codex exec`, `codex
+  login`, `codex mcp`, …), and the wrapper execs codex unchanged for those,
+  the way it already does for `claude -p`. `codex resume` and `codex fork`
+  are sessions, and are wrapped.
+
+- **The stall.** A limit says when it lifts. The other way a session stops
+  says nothing: the server refuses the turn — `Selected model is at
+  capacity. Please try a different model.` — and nothing schedules a way
+  back. On codex that refusal ends the whole turn, which takes every agent
+  the session was running down with it, and leaves the session sitting at an
+  idle prompt with no sign anything is wrong.
+
+  So the wrapper waits a minute and types `continue`, the same thing a person
+  would do. Repeat refusals double the wait — 60s, 120s, 240s — up to
+  `CR_STALL_MAX_WAIT_SEC`, because a service that has just said it is full
+  does not want to be asked again every minute. Any turn that finishes ends
+  the streak, and the next stall starts at a minute again. All the usual
+  gates still apply: nothing is typed while the session is mid-turn or while
+  there is an unsent draft in the prompt box.
+
+  Detection wordings for a refused turn live in their own array,
+  `CR_STALL_PATTERNS`, kept narrow on purpose: a wrong stall is a message
+  typed into a live session for no reason.
+
+- `CR_AGENT`, `CR_STALL_WAIT_SEC`, `CR_STALL_BACKOFF`, `CR_STALL_MAX_WAIT_SEC`
+  and `CR_STALL_MAX_ATTEMPTS`, all listed in the README.
+
 ## [1.7.0] - 2026-08-21
 
 A second trigger. The first one answers "the quota ran out"; this one answers
