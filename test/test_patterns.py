@@ -151,6 +151,32 @@ class TestAgentRoster(unittest.TestCase):
                 self.assertFalse(cr.is_roster(text))
 
 
+class TestWrappingTheRosterItself(unittest.TestCase):
+    """`claude agents` is not a session, so its screen is never ours to read.
+
+    Recognising the roster by what is drawn only holds while the roster is what
+    is drawn. Opening a card scrolls THAT session's history past the scraper —
+    banners and all — and the header the check keys on is gone by then. A
+    neighbour's "resets 2:10am" was read as this terminal's own and the badge
+    counted down 11h18m while the limit it was actually under lifted in seven
+    minutes. Knowing the subcommand at launch settles it once for the run.
+    """
+
+    def test_the_subcommand_is_recognised(self):
+        self.assertTrue(cr.is_roster_launch(["agents"]))
+        self.assertTrue(cr.is_roster_launch(["--debug", "agents"]))
+
+    def test_an_ordinary_session_is_not(self):
+        for argv in ([], ["--continue"], ["attach", "b4f68d7e"], ["-p", "hi"]):
+            with self.subTest(argv=argv):
+                self.assertFalse(cr.is_roster_launch(argv))
+
+    def test_a_prompt_that_says_agents_is_not_the_subcommand(self):
+        # `claude "write me a skill for agents"` starts a session like any other.
+        self.assertFalse(cr.is_roster_launch(["write me a skill for agents"]))
+        self.assertFalse(cr.is_roster_launch(["fix the tests", "agents"]))
+
+
 class TestWorkingDetection(unittest.TestCase):
     def test_streaming_footer_is_working(self):
         for text in ["✻ Cogitating… (esc to interrupt)",

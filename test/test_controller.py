@@ -73,6 +73,81 @@ class TestScheduling(unittest.TestCase):
         self.assertAlmostEqual(ctl.wake_at, 3700, delta=1)
 
 
+class TestAScrapedWaitCanBeTalkedOutOfIt(unittest.TestCase):
+    """A wait the screen scheduled stays open to the screen.
+
+    A scraped banner is the one kind that can belong to somebody else — a card on
+    the agent roster, a line of history behind one — and until now the wait it
+    scheduled was unfixable: the screen channel closes the moment the controller
+    leaves IDLE, and a roster has no transcript of its own to correct it from.
+    A neighbour's "resets 2:10am" parked a terminal for 11h18m over a limit that
+    lifted in seven minutes, and killing the process was the only way out.
+    """
+
+    def test_the_screen_may_still_be_read_during_a_scraped_wait(self):
+        ctl = controller()
+        ctl.on_limit("resets in 10 hours", now=0, source="screen")
+        self.assertTrue(ctl.rescrapable())
+
+    def test_a_transcript_wait_is_not_second_guessed(self):
+        # The transcript reports this session's own limit; there is nothing on
+        # screen worth weighing against it.
+        ctl = controller()
+        ctl.on_limit("resets in 10 hours", now=0, source="transcript")
+        self.assertFalse(ctl.rescrapable())
+
+    def test_a_stall_is_not_re_read_that_way(self):
+        ctl = controller(stall_wait=60, stall_backoff=2, stall_max_wait=600,
+                         stall_max_attempts=5)
+        ctl.on_stall("Selected model is at capacity", now=0, source="screen")
+        self.assertEqual(ctl.state, cr.WAITING)
+        self.assertFalse(ctl.rescrapable())
+
+    def test_an_earlier_reset_on_screen_shortens_the_wait(self):
+        ctl = controller()
+        ctl.on_limit("resets in 10 hours", now=0, source="screen")
+        self.assertTrue(ctl.on_limit("resets in 1 hours", now=100, source="screen"))
+        self.assertAlmostEqual(ctl.wake_at, 3700, delta=1)
+
+    def test_a_later_one_cannot_extend_it(self):
+        # The stale-banner direction: another card, read a moment later, must
+        # not push the wake-up further out — that is how eleven hours happened.
+        ctl = controller()
+        ctl.on_limit("resets in 1 hours", now=0, source="screen")
+        self.assertFalse(ctl.on_limit("resets in 10 hours", now=100, source="screen"))
+        self.assertAlmostEqual(ctl.wake_at, 3600, delta=1)
+
+    def test_a_banner_turned_down_once_is_not_re_read_forever(self):
+        # The screen keeps the card on it, so the same text arrives every few
+        # seconds for as long as the wait runs.
+        ctl = controller()
+        ctl.on_limit("resets in 1 hours", now=0, source="screen")
+        ctl.on_limit("resets in 10 hours", now=100, source="screen")
+        before = len(ctl.log_lines)
+        for t in range(103, 130, 3):
+            self.assertFalse(ctl.on_limit("resets in 10 hours", now=t, source="screen"))
+        self.assertEqual(len(ctl.log_lines), before)
+
+    def test_the_transcript_still_outranks_the_screen(self):
+        # Whatever the screen said, a limit this session actually hit replaces it.
+        ctl = controller()
+        ctl.on_limit("resets in 1 hours", now=0, source="screen")
+        self.assertTrue(ctl.on_limit("resets in 10 hours", now=100, source="transcript"))
+        self.assertAlmostEqual(ctl.wake_at, 36100, delta=1)
+        self.assertFalse(ctl.rescrapable())
+
+    def test_the_slate_is_clean_after_the_wait_ends(self):
+        ctl = controller()
+        ctl.on_limit("resets in 1 hours", now=0, source="screen")
+        ctl.on_limit("resets in 10 hours", now=10, source="screen")   # turned down
+        ctl.on_output("esc to interrupt", 100)
+        ctl.on_output("esc to interrupt", 120)
+        self.assertTrue(ctl.on_alive(200, "output"))
+        self.assertEqual(ctl.state, cr.IDLE)
+        self.assertFalse(ctl.rescrapable())
+        self.assertTrue(ctl.on_limit("resets in 10 hours", now=300, source="screen"))
+
+
 class TestInjection(unittest.TestCase):
     def test_nothing_happens_before_the_reset(self):
         ctl = controller()

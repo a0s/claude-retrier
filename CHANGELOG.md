@@ -7,6 +7,30 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [1.9.0] - 2026-08-30
+
+`claude agents` again, from the other side: not the roster's own screen this
+time, but a session opened from it.
+
+### Fixed
+- Wrapping `claude agents` no longer reads the screen at all. 1.6.0 taught the
+  scraper to recognise a roster by what is drawn on it, which holds exactly as
+  long as the roster is what is drawn: open a card and that session's history
+  scrolls past — old banners included — with the header the check keys on gone.
+  A neighbour's `resets 2:10am` was taken for this terminal's own, the corner
+  counted down `11h18m`, and the limit actually in force lifted seven minutes
+  later. The subcommand is known at launch, so the screen channel is switched
+  off for the run; the roster has no input box to type `continue` into either.
+  `CR_SCRAPE=always` still means always.
+- A wait the screen scheduled can now be talked out of it. The scraper only ran
+  while the controller was idle, so a wrong banner scheduled a wait that no
+  channel could correct — and a roster has no transcript of its own to correct
+  it from. The screen stays readable during such a wait, and a banner stating an
+  EARLIER reset takes over. Only earlier: a later one is how a stale card would
+  push the wake-up out forever. A wait the transcript scheduled is this
+  session's own and is not second-guessed; a banner turned down once is not
+  weighed again. Killing the process was previously the only way out.
+
 ## [1.8.0] - 2026-08-28
 
 A second agent, and a second way a session stops without being finished.

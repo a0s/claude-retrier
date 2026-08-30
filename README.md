@@ -219,9 +219,13 @@ writes `{"error":"rate_limit","isApiErrorMessage":true}` into
 reason a turn ended and the size of the context window. Either is structured,
 unambiguous, and the one the wrapper trusts. The second is the screen, matched
 against patterns, and it is only used when the transcript is unavailable. One
-screen is never read that way: the `claude agents` roster, where every card is a
-different session's last line and a limit shown there belongs to somebody else,
-usually hours old.
+command is never read that way at all: started on `claude agents`, the wrapper
+switches the screen channel off for the run. Every card on that roster is a
+different session's last line, a limit shown there belongs to somebody else and
+is usually hours old, and opening a card scrolls that session's history — old
+banners included — past the same scraper. A wait the screen did schedule stays
+open to it: a banner stating an earlier reset takes over, so a wrong one cannot
+hold the session past the moment it could have gone back to work.
 
 Before typing anything it checks that Claude is not mid-turn and that you are
 not typing yourself. It can see your keystrokes, so an unsent draft in the

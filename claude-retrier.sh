@@ -40,7 +40,7 @@
 
 set -u
 
-CR_VERSION="1.8.0"
+CR_VERSION="1.9.0"
 
 # =============================================================================
 # SECTION 1 — DETECTION PATTERNS
@@ -1629,6 +1629,8 @@ class Controller:
         self.started = now if now is not None else time.time()
         self.banner_text = None
         self.incident = None      # "limit" or "stall": what we are waiting out
+        self.limit_source = None  # "transcript" or "screen": how we learned of it
+        self.rejected = set()     # banners already weighed against the current wait
         self.stall_key = None     # the last stall acted on, and when
         self.stall_at = 0.0
         self.stall_streak = 0     # stalls since the last turn that finished
@@ -1844,6 +1846,8 @@ class Controller:
         self.attempts = 0
         self.banner = None
         self.banner_text = None
+        self.limit_source = None
+        self.rejected = set()
         self.wake_at = 0.0
         if self.rstate is not None:
             # The restart was suspended by this wait, not cancelled by it. Its
@@ -1907,11 +1911,39 @@ class Controller:
         self.stall_streak = 0
         self.stall_key = None
 
+    def rescrapable(self):
+        """May the screen still be read while this wait runs?
+
+        Only for a wait the screen itself scheduled. A scraped banner can be the
+        wrong one — a card on the agent roster, a line of history behind it — and
+        the wait it schedules is otherwise unfixable: the screen channel closes
+        the moment we leave IDLE, and a roster has no transcript of its own to
+        correct it from. Something told this terminal to sleep until 2:10am over
+        a neighbour's limit and nothing could talk it out of it. A wait the
+        transcript scheduled is this session's own and needs no second opinion.
+        """
+        return (self.state == WAITING and self.incident == "limit"
+                and self.limit_source == "screen")
+
     def on_limit(self, banner, now, source):
         key = re.sub(r"\s+", " ", banner or "").strip().lower()
         if self.state in (WAITING, VERIFY) and key == self.banner:
             return False                        # same incident, already scheduled
+        if key in self.rejected:
+            return False                        # weighed against this wait already
         secs = parse_reset(banner)
+        # A second reading during a scraped wait is a correction, not an
+        # incident: it is only worth having if it frees the session EARLIER.
+        # Anything later is how a stale banner would extend a wait forever.
+        if self.rescrapable() and source == "screen":
+            wake = now + min((secs if secs is not None else self.cfg["fallback_wait"])
+                             + self.cfg["margin"], self.cfg["max_wait"]) / self.cfg["wait_scale"]
+            if wake >= self.wake_at:
+                self.rejected.add(key)
+                return False
+            self.log("the screen states an earlier reset than the one we are waiting on "
+                     "(%s earlier); taking it: %s"
+                     % (human_left(self.wake_at - wake), banner))
         if secs is None:
             secs = self.cfg["fallback_wait"]
             self.log("limit detected (%s), no reset time parsed -> fallback %.0fs: %s"
@@ -1927,6 +1959,8 @@ class Controller:
         self.banner = key
         self.banner_text = banner
         self.incident = "limit"
+        self.limit_source = source
+        self.rejected = set()
         self.state = WAITING
         self.attempts = 0
         self.deferred = False
@@ -2784,6 +2818,29 @@ def launch_vector():
     return vec or [os.environ.get("CR_CLAUDE_RESOLVED") or "claude"]
 
 
+def is_roster_launch(argv):
+    """Were we started on the agent roster rather than on a session?
+
+    `claude agents` is a list of OTHER sessions. Every card on it states somebody
+    else's limit, and opening one scrolls that session's history — old banners
+    included — past our scraper. Neither is this terminal's state, and both parse
+    into a reset time that is not ours: a card reading "resets 2:10am" parked a
+    wrapper for eleven hours while the limit it was actually under lifted in
+    seven minutes. There is no input box on the roster to type "continue" into
+    either, so the screen channel has nothing to offer here at all. The
+    transcript channel is untouched: a session we open from the roster and then
+    work in still reports its own limit through it.
+
+    Read as the first positional word, so a prompt that happens to contain
+    "agents" is not mistaken for the subcommand.
+    """
+    for arg in argv or []:
+        if arg.startswith("-"):
+            continue
+        return arg == "agents"
+    return False
+
+
 def main(argv):
     launch = launch_vector()
     claude = launch[0]
@@ -2862,6 +2919,10 @@ def main(argv):
         except OSError as exc:
             log("cannot create %s: %s" % (parent, exc))
     scrape_allowed = CFG["scrape"] in ("auto", "always")
+    if scrape_allowed and CFG["scrape"] != "always" and is_roster_launch(argv):
+        scrape_allowed = False
+        log("wrapping the agent roster; the screen channel is off "
+            "(every banner on it belongs to another session)")
     window = ""            # rolling, ansi-stripped view of what claude just drew
     esc_carry = ""         # half-received control sequence from the previous read
     pending = []           # [(due_ts, bytes)] scheduled writes into the pty
@@ -2974,12 +3035,18 @@ def main(argv):
                 # a Claude Code build that stops writing the field). Running both
                 # unconditionally would just re-import the false-positive class the
                 # structured channel exists to avoid.
-                if scrape_allowed and ctl.state == IDLE and pending_scrape is None:
+                # A wait the screen scheduled stays open to the screen: it is the
+                # only channel that can correct it, and a scraped banner is the
+                # one kind that can be somebody else's (see `rescrapable`). A
+                # stall is not re-read that way — there is nothing in it to
+                # correct, and one refusal must not read as an endless run.
+                rescrape = ctl.rescrapable()
+                if scrape_allowed and pending_scrape is None and (ctl.state == IDLE or rescrape):
                     if CFG["scrape"] == "always" or not watcher.seen_any:
                         banner = find_limit(window)
                         if banner:
                             pending_scrape = ("limit", banner, now + CFG["scrape_confirm"])
-                        else:
+                        elif not rescrape:
                             stall = find_stall(window)
                             if stall:
                                 pending_scrape = ("stall", stall,

@@ -255,6 +255,38 @@ class TestScrapeChannel(PtyTestCase):
         s.drain(3)
         self.assertNotIn("GOT:continue", s.buf)
 
+    def test_the_agent_roster_is_never_scraped(self):
+        # `claude agents` lists OTHER sessions, and opening a card scrolls that
+        # session's history — banners and all — past us. A neighbour's card
+        # reading "resets 2:10am" scheduled an 11h18m wait in a terminal whose
+        # own limit lifted in seven minutes, and nothing could correct it.
+        #
+        # The log rather than the retry: a wait scheduled here is already the
+        # bug, whether or not "continue" has been typed yet.
+        log = os.path.join(self.work, "roster.log")
+        s = self.session(
+            env=self.env(CR_SCRAPE="auto", CR_LOG=log,
+                         FAKE_BANNER="You've hit your session limit - resets in 1 hours"),
+            args=["agents"], cwd=self.work)
+        self.assertTrue(s.read_until("argv=agents"))
+        s.drain(5)
+        self.assertNotIn("GOT:continue", s.buf)
+        with open(log) as fh:
+            written = fh.read()
+        self.assertNotIn("limit detected", written)
+        self.assertIn("wrapping the agent roster", written)
+
+    def test_an_ordinary_session_still_is(self):
+        # The same banner, the same settings, without the subcommand.
+        log = os.path.join(self.work, "session.log")
+        s = self.session(
+            env=self.env(CR_SCRAPE="auto", CR_LOG=log,
+                         FAKE_BANNER="You've hit your session limit - resets in 1 hours"),
+            cwd=self.work)
+        self.assertTrue(s.read_until("GOT:continue", timeout=20))
+        with open(log) as fh:
+            self.assertIn("limit detected (screen)", fh.read())
+
     def test_a_busy_session_is_not_typed_into(self):
         s = self.session(
             env=self.env(FAKE_BANNER="You've hit your session limit - resets in 1 hours",
