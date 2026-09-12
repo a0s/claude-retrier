@@ -423,6 +423,73 @@ class TestBadge(PtyTestCase):
         self.assertNotIn("◆", self.screen(s).text())
 
 
+class TestTheUpdateNotice(PtyTestCase):
+    """What a user with an out-of-date copy actually sees, on a real terminal.
+
+    The unit tests decide what the notice SAYS; this one is about whether it
+    reaches the screen at all, before claude takes the terminal over.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-upd-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.cache = os.path.join(self.dir, "update.json")
+        # The version is baked into the script and deliberately not overridable
+        # from the environment — a wrapper that can be told it is a different
+        # version is a wrapper that can be told it is up to date.
+        self.version = subprocess.run(
+            [WRAP, "--cr-version"], capture_output=True, text=True,
+            check=True).stdout.split()[-1]
+
+    def cached(self, version):
+        with open(self.cache, "w") as fh:
+            fh.write('{"version": "%s", "at": %d}' % (version, int(time.time())))
+
+    def env(self, **over):
+        e = {"CR_UPDATE_CACHE": self.cache, "CR_UPDATE_NOTICE_SEC": "0",
+             "CR_UPDATE_CHECK": "1"}
+        e.update(over)
+        return e
+
+    def test_it_is_on_screen_before_claude_starts(self):
+        self.cached("v9.9.9")
+        s = self.session(env=self.env())
+        self.assertTrue(s.read_until("9.9.9"), s.buf)
+        self.assertIn(self.version, s.buf)          # both numbers, not just the new one
+        self.assertIn("is out", s.buf)
+        # ...and the session it was printed over is a normal one.
+        self.assertTrue(s.read_until("fake-claude ready"), s.buf)
+        notice = s.buf.index("9.9.9")
+        self.assertLess(notice, s.buf.index("fake-claude ready"))
+
+    def test_a_current_copy_is_told_nothing(self):
+        self.cached("v" + self.version)
+        s = self.session(env=self.env())
+        self.assertTrue(s.read_until("fake-claude ready"), s.buf)
+        self.assertNotIn("is out", s.buf)
+
+    def test_the_switch_silences_it(self):
+        self.cached("v9.9.9")
+        s = self.session(env=self.env(CR_UPDATE_CHECK="0"))
+        self.assertTrue(s.read_until("fake-claude ready"), s.buf)
+        self.assertNotIn("is out", s.buf)
+
+    def test_a_check_that_ran_leaves_the_cache_behind(self):
+        # No cache at all: nothing is said, and the refresh that follows is what
+        # the NEXT launch reads. The feed is a file:// url, so no network.
+        feed = os.path.join(self.dir, "latest.json")
+        with open(feed, "w") as fh:
+            fh.write('{"tag_name": "v9.9.9"}')
+        s = self.session(env=self.env(CR_UPDATE_URL="file://" + feed))
+        self.assertTrue(s.read_until("fake-claude ready"), s.buf)
+        self.assertNotIn("is out", s.buf)
+        for _ in range(100):
+            if os.path.exists(self.cache):
+                break
+            time.sleep(0.05)
+        self.assertIn("9.9.9", open(self.cache).read())
+
+
 class TestTranscriptChannel(PtyTestCase):
     """The primary channel: nothing is scraped, the JSONL record drives it."""
 

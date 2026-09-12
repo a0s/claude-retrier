@@ -549,7 +549,7 @@ never becomes the reason your session will not start.
 ## Tests
 
 ```sh
-./test/run.sh              # 425 tests: patterns, time parsing, transcript, model
+./test/run.sh              # 429 tests: patterns, time parsing, transcript, model
                            # windows, update checks, state machine, the badge, custom
                            # commands, degradation, and end-to-end runs on a real pty
                            # (rendered through a terminal emulator, so "what the user
