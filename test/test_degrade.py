@@ -4,7 +4,9 @@ Upstream's sharpest failure was not a missed retry: it was issue #65, where an
 uninstalled wrapper left `claude` unable to start at all. A wrapper is only
 acceptable if every failure mode degrades to plain claude.
 """
+import glob
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -142,6 +144,48 @@ class TestDegradation(unittest.TestCase):
                            input="quit\n", capture_output=True, text=True, timeout=25)
         self.assertIn("fake-claude ready", r.stdout)
         self.assertTrue(self.supervised())
+
+
+class TestHowTheSupervisorIsHandedOver(unittest.TestCase):
+    """The embedded Python is ~140KB, and Linux caps a single argument at 128KB.
+
+    `python3 -c "$CR_PY"` therefore works on macOS and fails on Linux with
+    "Argument list too long" — which degrades every wrapped session to nothing at
+    all. Both routes that replace it are exercised here, on whichever platform
+    the suite is running.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-via-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.claude = launcher(self.dir)
+        self.log = os.path.join(self.dir, "log")
+
+    def supervised(self, via):
+        # "quit" rather than a closed stdin: the supervised claude sits on a pty
+        # of its own, which does not end just because ours did.
+        env = {**clean_env(), "CR_CLAUDE_BIN": self.claude, "CR_LOG": self.log,
+               "CR_PY_VIA": via, "CR_UPDATE_CHECK": "0", "CR_NOTIFY": "0"}
+        r = subprocess.run([WRAP], env=env, input="quit\n",
+                           capture_output=True, text=True, timeout=25)
+        started = os.path.exists(self.log) and "start:" in open(self.log).read()
+        return r, started
+
+    def test_a_descriptor_carries_it(self):
+        r, started = self.supervised("fd")
+        self.assertIn("fake-claude ready", r.stdout)
+        self.assertTrue(started, r.stderr)
+
+    def test_and_so_does_a_temp_file(self):
+        r, started = self.supervised("tmp")
+        self.assertIn("fake-claude ready", r.stdout)
+        self.assertTrue(started, r.stderr)
+
+    def test_the_temp_file_does_not_outlive_the_exec(self):
+        before = set(glob.glob(os.path.join(tempfile.gettempdir(), "claude-retrier.*")))
+        self.supervised("tmp")
+        after = set(glob.glob(os.path.join(tempfile.gettempdir(), "claude-retrier.*")))
+        self.assertEqual(after - before, set())
 
 
 class TestPatternRobustness(unittest.TestCase):

@@ -30,6 +30,15 @@ there is a newer one of itself.
   says what to set. `CR_CONTEXT_TOKENS` was never affected, as it needs no
   window.
 
+- The supervisor is handed to python on a file descriptor instead of as an
+  argument. Linux caps a single argument at 128 KiB and nothing raises that
+  limit; the embedded Python crossed it in this release and every wrapped
+  session on Linux died with "Argument list too long" — which is to say
+  degraded to no wrapper at all, silently. macOS caps only the whole vector, so
+  the suite was green there and red on the other half of the matrix. Where
+  `/dev/fd` is not mounted the fallback is a temp file the supervisor unlinks as
+  its first act. Both routes are covered by tests now.
+
 ### Added
 - It says when a newer release exists, the way claude and codex do — two dim
   lines before the session starts, naming both versions (`1.9.0 → 1.10.0`) and

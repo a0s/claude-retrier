@@ -3340,6 +3340,16 @@ def is_roster_launch(argv):
 
 
 def main(argv):
+    # Started from a temp file because /dev/fd was not available: it has done its
+    # job the moment python has read it, and leaving it behind would litter /tmp
+    # with copies of the wrapper.
+    tmp = os.environ.pop("CR_PY_TMP", "")
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
     launch = launch_vector()
     claude = launch[0]
     log = Logger(CFG["log"])
@@ -3858,4 +3868,26 @@ export CR_ROOT_IDLE_SEC CR_HANDOFF_TIMEOUT_SEC CR_STEP_GAP_SEC
 export CR_CONTEXT_COOLDOWN_SEC CR_CONTEXT_MAX_CYCLES
 export CR_SLASH_GAP_SEC CR_SLASH_ENTER CR_SLASH_ENTER_GAP_SEC
 
-exec "$CR_PYTHON_BIN" -c "$CR_PY" "$@"
+# The supervisor is handed over on a file descriptor rather than as an argument.
+# Linux caps a SINGLE argument at 128 KiB (MAX_ARG_STRLEN, and no ulimit raises
+# it) while macOS only caps the whole vector, so `-c "$CR_PY"` worked on one
+# platform and stopped working on the other the moment this file grew past that
+# — "Argument list too long", and every wrapped session degrading to nothing.
+#
+# /dev/fd/3 is read by python exactly like a script file, and the code never
+# touches the disk. Where /dev/fd is not mounted (a bare chroot), a temp file is
+# the fallback; the supervisor unlinks it as its first act, so it lives for the
+# length of one exec and belongs to nobody afterwards.
+# auto | fd | tmp — the tests drive both routes; nobody else needs to.
+: "${CR_PY_VIA:=auto}"
+if [ "$CR_PY_VIA" != "tmp" ] && [ -d /dev/fd ]; then
+  exec "$CR_PYTHON_BIN" /dev/fd/3 "$@" 3< <(printf '%s' "$CR_PY")
+fi
+
+CR_PY_TMP=$(mktemp "${TMPDIR:-/tmp}/claude-retrier.XXXXXX") || {
+  echo "claude-retrier: cannot write a temporary file; running claude unwrapped" >&2
+  exec "${CR_ARGV[@]}" "$@"
+}
+printf '%s' "$CR_PY" >"$CR_PY_TMP"
+export CR_PY_TMP
+exec "$CR_PYTHON_BIN" "$CR_PY_TMP" "$@"
