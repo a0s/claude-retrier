@@ -377,9 +377,13 @@ Look in `~/.claude-retrier/log`. In order of likelihood:
 - `restart step held: ...` is working as intended. It will not type over you
   mid-sentence, and it will not interrupt a turn that is still running.
 - `a 200k context window` for a model you expected to have 1M: the line says
-  where the figure came from, either an unfamiliar model slug or
-  `CLAUDE_CODE_DISABLE_1M_CONTEXT`. Name the window yourself with
-  `CR_CONTEXT_WINDOW=1M`.
+  where the figure came from — most likely `CLAUDE_CODE_DISABLE_1M_CONTEXT`.
+  Name the window yourself with `CR_CONTEXT_WINDOW=1M`.
+- `the window is unknown ... stays disarmed`, and `cr window?` in the corner:
+  this build has never heard of the model and could not look it up either. It
+  will not guess — a guessed window is how a session gets folded at 12% full —
+  so either `CR_CONTEXT_WINDOW=1M`, or set `CR_CONTEXT_TOKENS`, which needs no
+  window at all.
 - `restart aborted at handoff_sent: ...` means the fold produced nothing usable,
   and the message names which of the four checks failed. The session was left
   alone.
@@ -395,6 +399,9 @@ Look in `~/.claude-retrier/log`. In order of likelihood:
 | `CR_CONTEXT_PCT` | `0` | restart at this % of the window; `0` is off |
 | `CR_CONTEXT_TOKENS` | `0` | absolute threshold (`500k` is fine); beats the % |
 | `CR_CONTEXT_WINDOW` | `auto` | `auto` \| `200k` \| `1M` \| a number |
+| `CR_MODEL_LOOKUP` | `1` | look an unfamiliar model up; `0` never touches the network |
+| `CR_MODEL_CACHE` | `~/.claude-retrier/windows.json` | what the lookup learned |
+| `CR_MODEL_CACHE_TTL_SEC` | `604800` | a week |
 | `CR_HANDOFF_FILE` | `.claude-retrier/handoff.md` | where the fold is written |
 | `CR_HANDOFF_MSG` | (see `--cr-help`) | the folding phrase; `{file}`, `{marker}` |
 | `CR_RESUME_MSG` | ``Read `{file}` and continue from it.`` | the unfolding phrase |
@@ -419,9 +426,22 @@ work done. Watch the badge for a day and move it.
 it up. It narrows to 200k if `CLAUDE_CODE_DISABLE_1M_CONTEXT` or
 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set in the environment claude is started
 with, and it widens if the session is ever seen past the window it assumed.
-Guessing small only restarts a little early; guessing large never restarts at
-all. Name a number if your setup narrows the window some way the wrapper cannot
-see.
+Name a number if your setup narrows the window some way the wrapper cannot see.
+
+A model the built-in table does not list is not guessed at. A point release
+resolves to its family (`claude-fable-5-1` is whatever `claude-fable-5` is), and
+anything left over is looked up: the Models API when `ANTHROPIC_API_KEY` is set
+— a Claude subscription is not an API key, so most sessions skip this — and the
+published models table otherwise. That happens in a worker thread, so nothing
+waits on it, and the answer is cached in `CR_MODEL_CACHE` for a week. Until it
+arrives the percentage trigger is disarmed and the corner says `cr window?`;
+`CR_MODEL_LOOKUP=0` keeps the wrapper entirely offline, and then an unknown
+model needs `CR_CONTEXT_WINDOW` or `CR_CONTEXT_TOKENS` from you.
+
+This is the one thing in the wrapper that talks to the network, and only ever
+about a model name: it sends a slug and reads back a number. Guessing instead is
+what this replaced — assuming 200k for a slug that turned out to be a 1M model
+folded a session that was 12% full.
 
 `CR_SLASH_ENTER` exists because typing a `/` opens Claude Code's command list, and in a TUI
 that is a real hazard: Enter into an open list can pick the highlighted entry
@@ -434,6 +454,32 @@ which is also measured. `CR_SLASH_ENTER=1` turns it off.
 
 Add the handoff file to your `.gitignore`. It is a scratch note about one
 session and it is rewritten from scratch every time.
+
+## Updates
+
+It checks once a day whether there is a newer release, and says so in two dim
+lines before the session starts:
+
+```
+[claude-retrier] claude-retrier 1.9.0 → 1.10.0 is out
+                 brew upgrade a0s/claude-retrier/claude-retrier
+```
+
+The command is the one that updates the copy you are running — `brew upgrade`
+from a cellar install, `git -C <clone> pull` from a clone, the releases page for
+a file you downloaded. Nothing waits on the network for it: the notice is read
+out of a cache the previous run wrote, and the check that refreshes it runs in
+the background after claude is already up, so the first run after installing
+says nothing at all.
+
+| variable | default | |
+|---|---|---|
+| `CR_UPDATE_CHECK` | `1` | `0` never checks and never mentions it |
+| `CR_UPDATE_NOTICE_SEC` | `2` | how long the notice stays before claude starts |
+| `CR_UPDATE_TTL_SEC` | `86400` | between checks |
+| `CR_UPDATE_CACHE` | `~/.claude-retrier/update.json` | |
+| `CR_UPDATE_REPO` | `a0s/claude-retrier` | whose releases to read |
+| `CR_UPDATE_BREW_FORMULA` | `a0s/claude-retrier/claude-retrier` | named in the brew command |
 
 ## A sign of life
 
@@ -485,6 +531,7 @@ All optional, all environment variables:
 | `CR_BADGE_LABEL` | `cr` | the word next to the mark |
 | `CR_SHELL` | `$SHELL` | shell that knows your aliases |
 | `CR_LOG` | `~/.claude-retrier/log` | |
+| `CR_UPDATE_CHECK` | `1` | `0` never checks for a newer release ([more](#updates)) |
 | `CR_DISABLE` | | `1` runs plain claude |
 
 The context-restart settings have [a table of their own](#settings), and all of
@@ -502,10 +549,11 @@ never becomes the reason your session will not start.
 ## Tests
 
 ```sh
-./test/run.sh              # 364 tests: patterns, time parsing, transcript, state
-                           # machine, the badge, custom commands, degradation, and
-                           # end-to-end runs on a real pty (rendered through a
-                           # terminal emulator, so "what the user sees" is asserted)
+./test/run.sh              # 422 tests: patterns, time parsing, transcript, model
+                           # windows, update checks, state machine, the badge, custom
+                           # commands, degradation, and end-to-end runs on a real pty
+                           # (rendered through a terminal emulator, so "what the user
+                           # sees" is asserted)
 ./test/run.sh --docker     # the same suite on Linux, from anywhere with docker
 ./test/run.sh test_time.py # just one file
 ```

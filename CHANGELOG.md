@@ -7,6 +7,46 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [1.10.0] - 2026-09-12
+
+A model this file had never heard of was assumed to be small, and a session that
+was 12% full got folded and cleared for it. Also: the wrapper now notices when
+there is a newer one of itself.
+
+### Fixed
+- A point release is its family's window. `claude-fable-5-1` was not in the
+  table — `claude-fable-5` is — so it read as an unfamiliar slug, the window was
+  assumed to be 200k, and a 1M session sitting at 118k was called 59% full and
+  folded. Twice, on two different days. The slug now drops its trailing version
+  segments until something in the table matches, and stops at
+  `claude-<family>-<major>`, which is far enough for a point release and not far
+  enough to hand `claude-opus-4-9` the window of some other opus.
+- A window that is genuinely unknown is no longer invented. Assuming the small
+  window was chosen as the safe direction, on the grounds that a restart which
+  never fires is invisible; in practice an unfamiliar slug means a NEW model,
+  which means a large one, and the wrong guess does not fail quietly — it types
+  into a live session and throws its history away. Nothing is assumed now: the
+  percentage trigger stays disarmed, the corner says `cr window?`, and the log
+  says what to set. `CR_CONTEXT_TOKENS` was never affected, as it needs no
+  window.
+
+### Added
+- It says when a newer release exists, the way claude and codex do — two dim
+  lines before the session starts, naming both versions (`1.9.0 → 1.10.0`) and
+  the command that updates the copy you are actually running: `brew upgrade` for
+  a cellar install, `git -C <clone> pull` for a clone, the releases page for a
+  loose file. No session ever waits on that check: what is printed comes from a
+  cache the previous run left behind, and the fetch that refreshes it happens in
+  the background once claude is already up — a failed check included, so a
+  machine with no network does not ask on every launch. `CR_UPDATE_CHECK=0`
+  turns it off; `CR_UPDATE_NOTICE_SEC` is how long the notice stays.
+- The wrapper looks a model up instead of guessing at it. An unfamiliar slug is
+  asked about in a worker thread — the Models API when `ANTHROPIC_API_KEY` is
+  set, the published models table otherwise, which needs no credentials — and
+  the answer arms the trigger without a restart. It is cached in
+  `CR_MODEL_CACHE` for a week, and the log names the build as the thing that is
+  out of date. `CR_MODEL_LOOKUP=0` keeps the wrapper offline as before.
+
 ## [1.9.0] - 2026-08-30
 
 `claude agents` again, from the other side: not the roster's own screen this

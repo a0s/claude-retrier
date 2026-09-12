@@ -31,16 +31,27 @@
 # It can also restart a session that is running out of context window: at
 # CR_CONTEXT_PCT of the window it asks for a handoff file, checks that the file
 # really was written, clears the session and unfolds it from that file. Off
-# unless you set CR_CONTEXT_PCT — see the README.
+# unless you set CR_CONTEXT_PCT — see the README. How large the window is comes
+# from the model slug; a model this file has never heard of is looked up rather
+# than guessed at (CR_MODEL_LOOKUP=0 to keep it off the network).
 #
 # While it runs there is a dim `◆ cr` in a corner of the screen — the wrapper's
 # only visible output. CR_BADGE=0 removes it.
+#
+# On startup it says so when a newer release exists, with the command that
+# updates the copy you are actually running — brew, git, or a link. The check
+# itself runs in the background and is read from a cache next time, so a session
+# never waits on it. CR_UPDATE_CHECK=0 turns the whole thing off.
 #
 # Set CR_DISABLE=1 to bypass the wrapper entirely.
 
 set -u
 
-CR_VERSION="1.9.0"
+CR_VERSION="1.10.0"
+# Which copy of this file is running. The update notice prints the command
+# that updates THIS one, and `brew upgrade` at someone running a git clone
+# would be advice that does nothing.
+CR_SELF=${BASH_SOURCE[0]:-$0}
 
 # =============================================================================
 # SECTION 1 — DETECTION PATTERNS
@@ -263,6 +274,30 @@ CR_ROSTER_PATTERNS=(
 : "${CR_CONTEXT_PCT:=0}"               # restart at this % of the window; 0 = feature off
 : "${CR_CONTEXT_TOKENS:=0}"            # absolute threshold; wins over the percentage
 : "${CR_CONTEXT_WINDOW:=auto}"         # auto | 200k | 1M | a plain number
+# A model this file has never heard of has no window, and a guessed one is worse
+# than none: guessing small folds a session that is nowhere near full. So an
+# unfamiliar slug is looked up instead — the Models API when ANTHROPIC_API_KEY is
+# set, the published models table otherwise — in a worker thread, once a week per
+# slug. CR_MODEL_LOOKUP=0 turns the network off; the trigger then stays disarmed
+# for that model until CR_CONTEXT_WINDOW or CR_CONTEXT_TOKENS says what to use.
+# The wrapper's own version, checked against the newest release once a day. The
+# fetch never blocks a session: what is printed at startup comes from the cache
+# the previous run left, and the refresh happens in the background afterwards.
+: "${CR_UPDATE_CHECK:=1}"              # 0 = never look, never mention it
+: "${CR_UPDATE_REPO:=a0s/claude-retrier}"
+: "${CR_UPDATE_URL:=}"                 # overrides the repo's releases feed
+: "${CR_UPDATE_BREW_FORMULA:=a0s/claude-retrier/claude-retrier}"
+: "${CR_UPDATE_CACHE:=$HOME/.claude-retrier/update.json}"
+: "${CR_UPDATE_TTL_SEC:=86400}"        # a day between checks
+: "${CR_UPDATE_TIMEOUT_SEC:=10}"
+: "${CR_UPDATE_NOTICE_SEC:=2}"         # how long the notice stays before claude starts
+
+: "${CR_MODEL_LOOKUP:=1}"              # 0 = never ask anything over the network
+: "${CR_MODEL_LOOKUP_TIMEOUT_SEC:=10}" # per request, and it is never waited on
+: "${CR_MODEL_CACHE:=$HOME/.claude-retrier/windows.json}"
+: "${CR_MODEL_CACHE_TTL_SEC:=604800}"  # a week
+: "${CR_MODELS_DOC_URL:=https://platform.claude.com/docs/en/models/overview.md}"
+: "${CR_MODELS_API_URL:=https://api.anthropic.com/v1/models}"
 : "${CR_HANDOFF_FILE:=.claude-retrier/handoff.md}"   # relative to cwd — .gitignore it
 : "${CR_HANDOFF_MARKER:=HANDOFF}"      # a nonce is appended; must end the file
 : "${CR_HANDOFF_MIN_BYTES:=200}"       # anything shorter is not a handoff
@@ -298,7 +333,7 @@ CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
 case "${1:-}" in
   --cr-version) echo "claude-retrier $CR_VERSION"; exit 0 ;;
   --cr-help|-h|--help-retrier)
-    sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
 esac
 
@@ -587,8 +622,10 @@ import signal
 import struct
 import sys
 import termios
+import threading
 import time
 import tty
+import urllib.request
 from datetime import datetime, timedelta
 
 try:
@@ -673,6 +710,26 @@ CFG = dict(
     slash_enter_gap=_env("CR_SLASH_ENTER_GAP_SEC", 0.6, float),
     # Claude Code's own switches, read from the environment we hand it: the
     # wrapper starts claude itself, so whatever narrows its window narrows ours.
+    # -- a newer release of the wrapper itself --
+    update_check=_env("CR_UPDATE_CHECK", "1") == "1",
+    update_repo=_env("CR_UPDATE_REPO", "a0s/claude-retrier"),
+    update_url=_env("CR_UPDATE_URL", ""),
+    update_formula=_env("CR_UPDATE_BREW_FORMULA", "a0s/claude-retrier/claude-retrier"),
+    update_cache=_env("CR_UPDATE_CACHE",
+                      os.path.expanduser("~/.claude-retrier/update.json")),
+    update_ttl=_env("CR_UPDATE_TTL_SEC", 86400.0, float),
+    update_timeout=_env("CR_UPDATE_TIMEOUT_SEC", 10.0, float),
+    update_notice=_env("CR_UPDATE_NOTICE_SEC", 2.0, float),
+    version=_env("CR_VERSION", ""),
+    # -- learning a window the table does not have --
+    model_lookup=_env("CR_MODEL_LOOKUP", "1") == "1",
+    model_lookup_timeout=_env("CR_MODEL_LOOKUP_TIMEOUT_SEC", 10.0, float),
+    model_cache=_env("CR_MODEL_CACHE",
+                     os.path.expanduser("~/.claude-retrier/windows.json")),
+    model_cache_ttl=_env("CR_MODEL_CACHE_TTL_SEC", 604800.0, float),
+    models_doc_url=_env("CR_MODELS_DOC_URL",
+                        "https://platform.claude.com/docs/en/models/overview.md"),
+    models_api_url=_env("CR_MODELS_API_URL", "https://api.anthropic.com/v1/models"),
     context_env_max=_env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", 0, int),
     context_no_1m=_env("CLAUDE_CODE_DISABLE_1M_CONTEXT", "0") not in ("0", "false", "no"),
 )
@@ -1522,7 +1579,9 @@ CONTEXT_WINDOWS = {
     "claude-sonnet-5": 1000000,
     "claude-sonnet-4-6": 1000000,
     "claude-fable-5": 1000000,
+    "claude-fable-5-1": 1000000,
     "claude-mythos-5": 1000000,
+    "claude-mythos-5-1": 1000000,
     "claude-opus-4-5": 200000,
     "claude-opus-4-1": 200000,
     "claude-sonnet-4-5": 200000,
@@ -1541,12 +1600,30 @@ def usage_tokens(usage):
     return int(sum(nums)) if nums else None
 
 
-def model_window(model):
-    """Native window for a model slug, or None when the slug is not in the table."""
+def model_slug(model):
+    """A model name in the form the table is keyed by, or "" for no name at all."""
     slug = (model or "").strip().lower()
     slug = re.sub(r"\[[^\]]*\]$", "", slug)      # "claude-opus-5[1m]"
-    slug = re.sub(r"-\d{8}$", "", slug)           # "claude-haiku-4-5-20251001"
-    return CONTEXT_WINDOWS.get(slug)
+    return re.sub(r"-\d{8}$", "", slug)          # "claude-haiku-4-5-20251001"
+
+
+def model_window(model):
+    """Native window for a model slug, or None when nothing in the table fits.
+
+    A point release is its family's window until something says otherwise.
+    `claude-fable-5-1` was never in the table — `claude-fable-5` is — and reading
+    the first as unknown is what put a 1M session on a 200k denominator and folded
+    it at 12% full. So the trailing version segments are dropped one at a time,
+    and never past `claude-<family>-<major>`: far enough to catch a point release,
+    not far enough to hand `claude-opus-4-9` the window of some other opus.
+    """
+    parts = model_slug(model).split("-")
+    while len(parts) >= 3:
+        win = CONTEXT_WINDOWS.get("-".join(parts))
+        if win:
+            return win
+        parts.pop()
+    return None
 
 
 def human_tokens(n):
@@ -1557,6 +1634,373 @@ def human_tokens(n):
     if n >= 1000:
         return "%dk" % (n // 1000)
     return str(int(n))
+
+
+# --------------------------------------------------------------------------- #
+# asking what a window is, when the table has never heard of the model
+# --------------------------------------------------------------------------- #
+# A table shipped in a file is a table that goes stale, and the day it does is
+# the day a new model comes out — which is the day the wrapper is most likely to
+# be pointed at one. Both published tables answer the question outright, so a
+# slug this build does not know is looked up rather than guessed at:
+#
+#   the Models API   GET /v1/models/<slug> -> `max_input_tokens`. Exact, and
+#                    needs an ANTHROPIC_API_KEY; a Claude subscription is not
+#                    one, so most sessions never take this path.
+#   the models docs  the published table, one column per model, with a row
+#                    naming the API id and a row naming the context window.
+#                    No credentials, which is why it is the fallback that
+#                    actually runs.
+#
+# It happens in a worker thread and arrives as a finished answer or not at all:
+# the pty loop cannot block on the network, and no session may fail to start
+# because a documentation site is down. The answer is cached on disk, so a slug
+# is asked about once a week rather than once a session.
+MAX_FETCH = 1 << 20            # the docs page is ~20KB; this is a sanity bound
+# urllib's default agent string ("Python-urllib/3.x") is refused outright by the
+# CDN in front of the docs — a 403, measured. Saying who is actually asking is
+# both what gets through and the honest thing to send.
+USER_AGENT = "claude-retrier (+https://github.com/a0s/claude-retrier)"
+# The slug is read out of a JSON file and then pasted into a URL, so it is held
+# to what a model name can actually look like. A name with a slash or a query in
+# it is not a model this wrapper has anything to ask about.
+SANE_SLUG = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+DOC_ID_ROWS = ("claude api id", "claude api alias")
+DOC_WINDOW_ROW = "context window"
+
+
+def _doc_cell(cell):
+    """One markdown cell, with the markup that is not the value taken off."""
+    cell = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", cell.strip())   # [text](url)
+    return cell.replace("`", "").replace("*", "").strip()
+
+
+def parse_models_doc(text):
+    """{slug: window} out of the published models table.
+
+    The table is one column per model and one row per property, so the rows worth
+    reading are the ones naming the API id and the context window, matched to each
+    other column by column. The id row and the alias row both count: they differ
+    exactly where a model is published under a dated id, and the transcript can
+    write either.
+    """
+    ids, windows = {}, {}
+    for line in text.split("\n"):
+        if not line.lstrip().startswith("|"):
+            continue
+        cells = [_doc_cell(c) for c in line.strip().strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        head = cells[0].lower()
+        if head in DOC_ID_ROWS:
+            for i, cell in enumerate(cells[1:], 1):
+                slug = model_slug(cell)
+                if slug.startswith("claude-"):
+                    ids.setdefault(i, []).append(slug)
+        elif head == DOC_WINDOW_ROW:
+            for i, cell in enumerate(cells[1:], 1):
+                win = parse_tokens(cell.lower().replace("tokens", "").strip())
+                if win:
+                    windows[i] = win
+    out = {}
+    for col, slugs in ids.items():
+        win = windows.get(col)
+        if win:
+            for slug in slugs:
+                out[slug] = win
+    return out
+
+
+def parse_models_api(payload):
+    """The window out of one Models API object, or None if it does not say."""
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return None
+    win = data.get("max_input_tokens") if isinstance(data, dict) else None
+    return int(win) if isinstance(win, (int, float)) and not isinstance(win, bool) \
+        and win > 0 else None
+
+
+def fetch_url(url, timeout, headers=None):
+    """The body of a GET, as text. Raises on anything that is not a clean 200."""
+    head = {"user-agent": USER_AGENT}
+    head.update(headers or {})
+    req = urllib.request.Request(url, headers=head)
+    fh = urllib.request.urlopen(req, timeout=timeout)
+    try:
+        return fh.read(MAX_FETCH).decode("utf-8", "replace")
+    finally:
+        fh.close()
+
+
+class WindowLookup:
+    """Learns the context window of a model the shipped table does not know.
+
+    `want()` is called from the pty loop and returns immediately; `take()` hands
+    back whatever has finished since it was last called. Nothing in here can
+    raise into that loop and nothing in it waits on the network.
+    """
+
+    def __init__(self, cfg, log=None, fetch=None, clock=time.time):
+        self.cfg = cfg
+        self.log = log or (lambda *_: None)
+        self.fetch = fetch or fetch_url
+        self.clock = clock
+        self.asked = set()          # slugs already looked up this session
+        self.done = []              # finished answers waiting to be taken
+        self.lock = threading.Lock()
+
+    # -- the pty loop's two calls ------------------------------------------- #
+    def want(self, model):
+        """Learn this model's window, if it is not already being learned."""
+        slug = model_slug(model)
+        if not slug or slug in self.asked or not SANE_SLUG.match(slug):
+            return False
+        self.asked.add(slug)
+        cached = self._cached(slug)
+        if cached:
+            window, source = cached
+            self._finish(slug, window, "%s, cached" % source)
+            return True
+        if not self.cfg.get("model_lookup"):
+            self.log("%s is not in this build's table and CR_MODEL_LOOKUP is off; "
+                     "set CR_CONTEXT_WINDOW to give the percentage trigger a "
+                     "denominator" % slug)
+            return False
+        threading.Thread(target=self._work, args=(slug,), daemon=True).start()
+        return True
+
+    def take(self):
+        """[(slug, window, source)] for the lookups that have come back."""
+        with self.lock:
+            out, self.done = self.done, []
+        return out
+
+    # -- the worker --------------------------------------------------------- #
+    def _work(self, slug):
+        window, source = None, None
+        # Each source is tried on its own: an API key that is expired, or set for
+        # a different account, or simply does not know this model, must not take
+        # the credential-free source down with it.
+        for ask in (self._ask_api, self._ask_docs):
+            try:
+                window, source = ask(slug)
+            except Exception as exc:              # a thread that raises is a crash
+                self.log("asking %s about %s failed: %s"
+                         % (ask.__name__[5:], slug, exc))
+                continue
+            if window:
+                break
+        if not window:
+            self.log("nothing published says how large %s's context window is; "
+                     "the percentage trigger stays disarmed — set CR_CONTEXT_WINDOW "
+                     "or CR_CONTEXT_TOKENS" % slug)
+            return
+        self._store(slug, window, source)
+        self.log("%s: a %s context window per %s — this build's table does not know "
+                 "that slug, so the figure came off the network; update "
+                 "claude-retrier and it will not have to ask again"
+                 % (slug, human_tokens(window), source))
+        self._finish(slug, window, source)
+
+    def _ask_api(self, slug):
+        key = os.environ.get("ANTHROPIC_API_KEY")
+        url = self.cfg.get("models_api_url")
+        if not key or not url:
+            return None, None
+        text = self.fetch("%s/%s" % (url.rstrip("/"), slug),
+                          self.cfg["model_lookup_timeout"],
+                          {"x-api-key": key, "anthropic-version": "2023-06-01"})
+        return parse_models_api(text), "the models API"
+
+    def _ask_docs(self, slug):
+        url = self.cfg.get("models_doc_url")
+        if not url:
+            return None, None
+        table = parse_models_doc(self.fetch(url, self.cfg["model_lookup_timeout"]))
+        # Every model on that page is cached, not just the one asked about: the
+        # page was fetched either way, and the next unfamiliar slug is likely to
+        # be one of the others on it.
+        for other, win in table.items():
+            if other != slug:
+                self._store(other, win, "the models docs")
+        return table.get(slug), "the models docs"
+
+    def _finish(self, slug, window, source):
+        with self.lock:
+            self.done.append((slug, window, source))
+
+    # -- the cache ---------------------------------------------------------- #
+    # One file, shared by every session on the machine, holding only what is
+    # public anyway: a slug and a number. It is a courtesy to the network, never
+    # a source of truth — an entry older than the TTL is simply not there.
+    def _read_cache(self):
+        try:
+            with open(self.cfg["model_cache"], "r") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _cached(self, slug):
+        row = self._read_cache().get(slug)
+        if not isinstance(row, dict):
+            return None
+        window, at = row.get("window"), row.get("at")
+        if not isinstance(window, int) or not isinstance(at, (int, float)):
+            return None
+        if self.clock() - at > self.cfg["model_cache_ttl"]:
+            return None
+        return window, str(row.get("source") or "the models docs")
+
+    def _store(self, slug, window, source):
+        path = self.cfg["model_cache"]
+        data = self._read_cache()
+        data[slug] = dict(window=int(window), source=source, at=int(self.clock()))
+        tmp = "%s.%d" % (path, os.getpid())
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(tmp, "w") as fh:
+                json.dump(data, fh)
+            os.rename(tmp, path)                  # atomic: two sessions can race
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------- #
+# "there is a newer one of these"
+# --------------------------------------------------------------------------- #
+# Both agents this wrapper wraps say so on startup, and a wrapper that is a
+# single file people copy around needs it more than either of them: there is no
+# package manager in the loop unless the user chose one, and nothing else to
+# notice that a release happened.
+#
+# The rule that makes it safe is that a session NEVER waits on the network for
+# this. What is printed comes out of a file written by the previous run; the
+# fetch that refreshes that file happens in a worker thread, after claude is
+# already up, and its answer is for next time. A first run says nothing, which
+# is the correct thing for it to say.
+def parse_version(text):
+    """"v1.10.0" -> (1, 10, 0). None for anything that is not a release tag."""
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)$", (text or "").strip())
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+class UpdateCheck:
+    """What the last check found, and the exact command that acts on it."""
+
+    def __init__(self, cfg, log=None, fetch=None, clock=time.time):
+        self.cfg = cfg
+        self.log = log or (lambda *_: None)
+        self.fetch = fetch or fetch_url
+        self.clock = clock
+
+    # -- what the user sees ------------------------------------------------- #
+    def notice(self, current, self_path=None):
+        """The two lines to print before handing the terminal over, or None."""
+        if not self.cfg.get("update_check"):
+            return None
+        have, latest = parse_version(current), parse_version(self._cached())
+        if not have or not latest or latest <= have:
+            return None
+        return ("claude-retrier %s \u2192 %s is out"
+                % (".".join(str(n) for n in have), ".".join(str(n) for n in latest)),
+                self.upgrade_command(self_path))
+
+    def upgrade_command(self, self_path=None):
+        """How THIS copy is updated — which depends on how it was installed.
+
+        Printing `brew upgrade` at someone running a git clone would be wrong in
+        the one way that matters: they would run it and nothing would change.
+        """
+        real = os.path.realpath(self_path or os.environ.get("CR_SELF") or "")
+        if "/Cellar/" in real:
+            return "brew upgrade %s" % self.cfg["update_formula"]
+        here = os.path.dirname(real)
+        if here and os.path.isdir(os.path.join(here, ".git")):
+            return "git -C %s pull" % here
+        return "https://github.com/%s/releases/latest" % self.cfg["update_repo"]
+
+    # -- the check, which is never on the way to anything -------------------- #
+    def refresh(self, background=True):
+        """Bring the cache up to date, for the NEXT run to read."""
+        if not self.cfg.get("update_check") or not self._stale():
+            return False
+        if not background:
+            self._work()
+            return True
+        threading.Thread(target=self._work, daemon=True).start()
+        return True
+
+    def _work(self):
+        url = self.cfg["update_url"] or (
+            "https://api.github.com/repos/%s/releases/latest" % self.cfg["update_repo"])
+        try:
+            payload = json.loads(self.fetch(url, self.cfg["update_timeout"],
+                                            {"accept": "application/vnd.github+json"}))
+            tag = payload.get("tag_name") if isinstance(payload, dict) else None
+        except Exception as exc:
+            self.log("checking for a newer release failed: %s" % exc)
+            self._store(None)
+            return
+        if not parse_version(tag):
+            self.log("the release feed did not name a version")
+            self._store(None)
+            return
+        self._store(tag)
+
+    # -- the cache ---------------------------------------------------------- #
+    # Also the clock for the check itself: an entry younger than the TTL means
+    # the question was asked recently enough, whatever its answer was.
+    def _read(self):
+        try:
+            with open(self.cfg["update_cache"], "r") as fh:
+                data = json.load(fh)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _cached(self):
+        return str(self._read().get("version") or "")
+
+    def _stale(self):
+        at = self._read().get("at")
+        if not isinstance(at, (int, float)):
+            return True
+        return self.clock() - at > self.cfg["update_ttl"]
+
+    def _store(self, tag):
+        """Record that the question was asked, and — when there is one — the answer.
+
+        A check that failed still stamps the time. Otherwise a machine that is
+        offline, or behind a proxy that eats api.github.com, asks again on every
+        single launch, forever, and the one thing this feature must not become is
+        a tax on starting a session.
+        """
+        path = self.cfg["update_cache"]
+        row = self._read()
+        row["at"] = int(self.clock())
+        if tag:
+            row["version"] = tag
+        tmp = "%s.%d" % (path, os.getpid())
+        try:
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(tmp, "w") as fh:
+                json.dump(row, fh)
+            os.rename(tmp, path)
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
 def read_handoff(path, tail_bytes=512):
@@ -1605,6 +2049,9 @@ CONTEXT_DEFAULTS = dict(
     resume_msg="Read `{file}` and continue from it.",
     root_idle=20.0, handoff_timeout=900.0, step_gap=3.0,
     context_cooldown=600.0, context_max_cycles=0,
+    model_lookup=False, model_lookup_timeout=10.0,
+    model_cache=os.path.expanduser("~/.claude-retrier/windows.json"),
+    model_cache_ttl=604800.0, models_doc_url="", models_api_url="",
 )
 
 
@@ -1648,6 +2095,8 @@ class Controller:
         self.context_model = None
         self.context_window_hint = None   # a window the transcript states outright
         self.context_window = None
+        self.window_unknown = None    # a model nothing here can size, for the lookup
+        self.learned = {}             # slug -> window, from whoever answered
         self.context_limit = None     # the threshold in tokens; None = no trigger
         self.context_path = None      # the transcript those figures came from
         self.context_grew_at = 0.0    # ...and when it last gained a byte
@@ -2209,6 +2658,15 @@ class Controller:
             return None
         return self.context_pct()
 
+    def badge_warn(self):
+        """The one thing the corner has to say while nothing is happening.
+
+        A disarmed trigger is silent by construction, and silence is exactly what
+        an armed one looks like too. Anyone who set CR_CONTEXT_PCT and is relying
+        on it deserves to see that it is not currently protecting them.
+        """
+        return "window?" if self._needs_window() and self.context_model else None
+
     def inject_note(self):
         """The one line the human sees when something is typed for them."""
         return {
@@ -2223,7 +2681,8 @@ class Controller:
     def _resolve_window(self):
         """How large the context window is, in the order the answers are trusted."""
         forced = parse_tokens(self.cfg["context_window"])
-        native = model_window(self.context_model)
+        native = model_window(self.context_model) or self.learned.get(
+            model_slug(self.context_model))
         if forced:
             self.context_window, why = forced, "CR_CONTEXT_WINDOW"
         elif self.cfg["context_env_max"] > 0:
@@ -2232,7 +2691,12 @@ class Controller:
         elif self.context_window_hint:
             self.context_window, why = self.context_window_hint, "the transcript"
         elif native is None:
-            self.context_window, why = SMALL_WINDOW, "an unfamiliar model slug"
+            # No denominator, and inventing one is the bug this used to have:
+            # assuming the small window put a 1M session at 59% when it was at
+            # 12%, and folded it. An unfamiliar slug is almost always a NEW
+            # model, which is to say a large one — so nothing is assumed, the
+            # percentage trigger stays disarmed, and the wrapper goes and asks.
+            self.context_window, why = None, "an unfamiliar model slug"
         elif self.cfg["context_no_1m"]:
             # We started claude ourselves, so its environment is ours to read:
             # the long window is switched off for this session whatever the
@@ -2243,11 +2707,41 @@ class Controller:
             self.context_window, why = native, "the model"
         self._window_bumped = False
         self._recompute_limit()
-        if self.context_enabled:
+        self.window_unknown = self.context_model if self._needs_window() else None
+        if not self.context_enabled:
+            return
+        if self._needs_window():
+            self.log("%s: %s, so the window is unknown and the %g%% trigger stays "
+                     "disarmed until something says otherwise"
+                     % (self.context_model or "this session", why,
+                        self.cfg["context_pct"]))
+        else:
             self.log("%s: a %s context window (%s), restarting at %s"
                      % (self.context_model or "this session",
                         human_tokens(self.context_window), why,
                         human_tokens(self.context_limit)))
+
+    def _needs_window(self):
+        """Is a window the missing piece? An absolute threshold never needs one."""
+        return (self.context_window is None and self.cfg["context_tokens"] <= 0
+                and self.cfg["context_pct"] > 0 and not self.context_off)
+
+    def on_window_learned(self, model, window, source):
+        """Somebody answered the question `window_unknown` was asking.
+
+        Late and for the wrong model is the normal case — a lookup takes seconds
+        and a session can change models inside them — so the answer is filed
+        under its own slug and only resolves the window if it is the slug we are
+        actually on.
+        """
+        slug = model_slug(model)
+        if not slug or not window:
+            return False
+        self.learned[slug] = int(window)
+        if slug != model_slug(self.context_model):
+            return False
+        self._resolve_window()
+        return True
 
     def _recompute_limit(self):
         if self.cfg["context_tokens"] > 0:
@@ -2573,7 +3067,7 @@ class Badge:
 
     # -- what it says ------------------------------------------------------- #
     def frame(self, state, remaining, attempts, max_attempts, now, deferred=False,
-              restart=None, context=None):
+              restart=None, context=None, warn=None):
         """(text, sgr) for a controller state. Pure, so the tests can drive it."""
         mark = self.MARK
         if state == WAITING:
@@ -2600,6 +3094,10 @@ class Badge:
                 mark = self.MARK_ALT
             return ("%s %s %s" % (mark, self.label,
                                   RESTART_LABELS.get(restart, restart)), "2;35")
+        if warn:
+            # Dim red and not blinking: something needs attention, but nothing is
+            # being typed into the session over it.
+            return ("%s %s %s" % (mark, self.label, warn), "2;31")
         if context is not None:
             return ("%s %s %d%%" % (mark, self.label, int(context)), "2;32")
         return ("%s %s" % (mark, self.label), "2")
@@ -2651,9 +3149,9 @@ class Badge:
         return ("\x1b7\x1b[%d;%dH\x1b[%sm%s\x1b[0m\x1b8" % (row, col, sgr, text)).encode()
 
     def paint(self, fd, rows, cols, state, remaining, attempts, max_attempts, now,
-              blocked=False, deferred=False, restart=None, context=None):
+              blocked=False, deferred=False, restart=None, context=None, warn=None):
         text, sgr = self.frame(state, remaining, attempts, max_attempts, now, deferred,
-                               restart, context)
+                               restart, context, warn)
         if not self.due(text, now, blocked):
             return False
         # A narrower frame than the last one would leave the tail of that one on
@@ -2852,6 +3350,20 @@ def main(argv):
     stdout_fd = sys.stdout.fileno()
     interactive = os.isatty(stdin_fd) and os.isatty(stdout_fd)
 
+    # Before the fork, while the terminal is still ours and still cooked: after
+    # it, every cell belongs to claude's TUI and anything written here is either
+    # painted over or paints over something.
+    updater = UpdateCheck(CFG, log)
+    if interactive:
+        notice = updater.notice(CFG["version"])
+        if notice:
+            headline, how = notice
+            os.write(stdout_fd,
+                     ("\x1b[2m[claude-retrier] %s\n"
+                      "                 %s\x1b[0m\n" % (headline, how)).encode())
+            log("%s — %s" % (headline, how))
+            time.sleep(max(0.0, CFG["update_notice"]))
+
     rows, cols = get_winsize(stdout_fd) if interactive else (24, 80)
     pid, master = fork_pty(rows, cols)
     if pid == 0:
@@ -2899,7 +3411,12 @@ def main(argv):
         except Exception:
             pass
 
+    # Started only now: a fork out of a multi-threaded process is a hazard, and
+    # this thread's whole purpose is to be ready by the NEXT launch anyway.
+    updater.refresh()
+
     ctl = Controller(CFG, log)
+    lookup = WindowLookup(CFG, log)
     badge = Badge(CFG)
     if not interactive:
         badge.enabled = False      # nothing to paint on when stdout is a pipe
@@ -3105,6 +3622,14 @@ def main(argv):
             # session is still mid-turn.
             ctl.note_growth(watcher.grown, now)
 
+            # A model the shipped table cannot size. Asking is off the hot path
+            # in a worker thread, so this is only ever "post the question" and
+            # "collect whatever came back" — never a wait.
+            if ctl.window_unknown:
+                lookup.want(ctl.window_unknown)
+            for slug, learned, source in lookup.take():
+                ctl.on_window_learned(slug, learned, source)
+
             # A scraped banner is acted on only after it has stood for a moment.
             # That covers two races at once: a frame captured mid-repaint, and a
             # transcript that had not yet announced itself when the banner was
@@ -3151,7 +3676,8 @@ def main(argv):
                             # A half-received sequence of claude's is already in
                             # the terminal; anything written now lands inside it.
                             blocked=bool(esc_carry), deferred=ctl.deferred,
-                            restart=ctl.rstate, context=ctl.badge_context())
+                            restart=ctl.rstate, context=ctl.badge_context(),
+                            warn=ctl.badge_warn())
 
             try:
                 done, status = os.waitpid(pid, os.WNOHANG)
@@ -3321,6 +3847,11 @@ export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC
 export CR_AGENT
 export CR_STALL_WAIT_SEC CR_STALL_BACKOFF CR_STALL_MAX_WAIT_SEC CR_STALL_MAX_ATTEMPTS
 export CR_CONTEXT_PCT CR_CONTEXT_TOKENS CR_CONTEXT_WINDOW
+export CR_UPDATE_CHECK CR_UPDATE_REPO CR_UPDATE_URL CR_UPDATE_BREW_FORMULA
+export CR_UPDATE_CACHE CR_UPDATE_TTL_SEC CR_UPDATE_TIMEOUT_SEC CR_UPDATE_NOTICE_SEC
+export CR_VERSION CR_SELF
+export CR_MODEL_LOOKUP CR_MODEL_LOOKUP_TIMEOUT_SEC CR_MODEL_CACHE
+export CR_MODEL_CACHE_TTL_SEC CR_MODELS_DOC_URL CR_MODELS_API_URL
 export CR_HANDOFF_FILE CR_HANDOFF_MARKER CR_HANDOFF_MIN_BYTES CR_HANDOFF_ATTEMPTS
 export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG
 export CR_ROOT_IDLE_SEC CR_HANDOFF_TIMEOUT_SEC CR_STEP_GAP_SEC

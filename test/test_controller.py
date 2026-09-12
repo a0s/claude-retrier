@@ -1122,12 +1122,59 @@ class TestWhatCountsAsContext(RestartTestCase):
         usage(ctl, 0, 10, model="claude-sonnet-4-5")
         self.assertEqual(ctl.context_limit, 100000)
 
-    def test_an_unfamiliar_model_is_assumed_small(self):
-        # Assuming large would be a restart that never happens, and a restart
-        # that never happens is invisible until the session dies of a full one.
+    def test_an_unfamiliar_model_is_not_guessed_at(self):
+        # Assuming the small window is what folded a 1M session at 12% full:
+        # 118k of a 1M window read as 59% of a 200k one. An unfamiliar slug is
+        # almost always a new — which is to say large — model, so nothing is
+        # assumed and the percentage trigger simply does not arm.
         ctl = restart_controller(context_window="auto")
         usage(ctl, 0, 10, model="claude-something-9")
-        self.assertEqual(ctl.context_window, 200000)
+        self.assertIsNone(ctl.context_window)
+        self.assertIsNone(ctl.context_limit)
+        self.assertEqual(ctl.window_unknown, "claude-something-9")
+
+    def test_a_point_release_is_its_familys_window(self):
+        # The actual bug: claude-fable-5-1 is a 1M model, the table knew only
+        # claude-fable-5, and the difference was a session cleared for nothing.
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-fable-5-1")
+        self.assertEqual(ctl.context_window, 1000000)
+        self.assertEqual(ctl.context_limit, 500000)
+        self.assertIsNone(ctl.window_unknown)
+
+    def test_an_unknown_window_never_folds_however_full_it_looks(self):
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 900000, model="claude-something-9")
+        self.assertIsNone(self.tick(ctl, 60))
+        self.assertEqual(ctl.badge_warn(), "window?")
+
+    def test_the_lookup_answer_arms_the_trigger(self):
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 600000, model="claude-something-9")
+        self.assertIsNone(self.tick(ctl, 60))
+        self.assertTrue(ctl.on_window_learned("claude-something-9", 1000000,
+                                              "the models docs"))
+        self.assertEqual(ctl.context_limit, 500000)
+        self.assertIsNone(ctl.window_unknown)
+        self.assertIsNone(ctl.badge_warn())
+        self.assertIsNotNone(self.tick(ctl, 120))      # 600k is past 500k
+
+    def test_an_answer_about_another_model_is_kept_but_not_applied(self):
+        # A lookup takes seconds and a session can change model inside them.
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-something-9")
+        self.assertFalse(ctl.on_window_learned("claude-other-9", 300000, "docs"))
+        self.assertIsNone(ctl.context_window)
+        usage(ctl, 5, 10, model="claude-other-9")
+        self.assertEqual(ctl.context_window, 300000)
+
+    def test_an_absolute_threshold_needs_no_window_at_all(self):
+        ctl = restart_controller(context_window="auto", context_pct=0,
+                                 context_tokens=50000)
+        usage(ctl, 0, 60000, model="claude-something-9")
+        self.assertIsNone(ctl.window_unknown)
+        self.assertIsNone(ctl.badge_warn())
+        self.assertIsNotNone(self.tick(ctl, 60))
 
     def test_an_explicit_window_wins(self):
         ctl = restart_controller(context_window="300k")
@@ -1145,9 +1192,12 @@ class TestWhatCountsAsContext(RestartTestCase):
         self.assertEqual(ctl.context_window, 150000)
 
     def test_a_window_proved_too_small_is_raised(self):
+        # The table can be right about the model and wrong about this session:
+        # a 200k model served with a longer window still writes 200k's slug.
         ctl = restart_controller(context_window="auto")
-        usage(ctl, 0, 10, model="claude-something-9")
-        usage(ctl, 5, 260000, model="claude-something-9")
+        usage(ctl, 0, 10, model="claude-opus-4-5")
+        self.assertEqual(ctl.context_window, 200000)
+        usage(ctl, 5, 260000, model="claude-opus-4-5")
         self.assertEqual(ctl.context_window, 1000000)
         self.assertEqual(ctl.context_limit, 500000)
 

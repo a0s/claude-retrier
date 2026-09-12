@@ -276,8 +276,8 @@ class TestModelWindows(unittest.TestCase):
         self.assertEqual(cr.model_window("claude-opus-5[1m]"), 1000000)
 
     def test_an_unknown_slug_is_not_guessed(self):
-        # The caller turns this into the small window and says so in the log.
-        # Guessing large would be a trigger that never fires.
+        # The caller leaves the window unset and goes and looks it up; the rest
+        # of that story is in test_models.py.
         self.assertIsNone(cr.model_window("claude-something-9"))
         self.assertIsNone(cr.model_window(None))
 
