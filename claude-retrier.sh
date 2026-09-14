@@ -10,6 +10,7 @@
 # Usage:  claude-retrier.sh [claude args...]
 #         claude-retrier.sh --cmd <your-claude> [claude args...]
 #         claude-retrier.sh --agent codex --cmd codex [codex args...]
+#         codex-retrier [codex args...]          # the same file, codex by default
 #         claude-retrier.sh --cr-dump-python      # print the embedded Python (used by tests)
 #         claude-retrier.sh --cr-version
 #
@@ -33,7 +34,10 @@
 # really was written, clears the session and unfolds it from that file. Off
 # unless you set CR_CONTEXT_PCT — see the README. How large the window is comes
 # from the model slug; a model this file has never heard of is looked up rather
-# than guessed at (CR_MODEL_LOOKUP=0 to keep it off the network).
+# than guessed at (CR_MODEL_LOOKUP=0 to keep it off the network). codex states its
+# window in the rollout, and has thresholds of its own: CR_CODEX_CONTEXT_PCT,
+# counted the way its status line counts "Context N% used" (claude's percentage
+# unless set), and CR_CODEX_CONTEXT_TOKENS, which is never borrowed.
 #
 # While it runs there is a dim `◆ cr` in a corner of the screen — the wrapper's
 # only visible output. CR_BADGE=0 removes it.
@@ -47,7 +51,7 @@
 
 set -u
 
-CR_VERSION="1.10.0"
+CR_VERSION="1.11.0"
 # Which copy of this file is running. The update notice prints the command
 # that updates THIS one, and `brew upgrade` at someone running a git clone
 # would be advice that does nothing.
@@ -224,6 +228,7 @@ CR_ROSTER_PATTERNS=(
 # SECTION 2 — configuration (all overridable from the environment)
 # =============================================================================
 : "${CR_AGENT:=auto}"                  # auto | claude | codex — whose session this is
+: "${CR_CODEX_CMD:=}"                  # codex-retrier's command (default: codex)
 : "${CR_MESSAGE:=continue}"            # what to type when the limit lifts
 : "${CR_MARGIN_SEC:=45}"               # extra wait past the stated reset time
 : "${CR_MAX_ATTEMPTS:=3}"              # sends per incident before giving up
@@ -274,6 +279,34 @@ CR_ROSTER_PATTERNS=(
 : "${CR_CONTEXT_PCT:=0}"               # restart at this % of the window; 0 = feature off
 : "${CR_CONTEXT_TOKENS:=0}"            # absolute threshold; wins over the percentage
 : "${CR_CONTEXT_WINDOW:=auto}"         # auto | 200k | 1M | a plain number
+# codex has thresholds of its own, because the same percentage does not mean the
+# same session on both: a different window, a different rate of growth, and codex
+# compacting on its own schedule. The percentage is read the way codex's status
+# line reads it ("Context 19% used"), so the number to write here is the one you
+# see on that line; unset, it is claude's percentage, because a fraction of a
+# window means the same thing whatever the window is.
+#
+# An absolute count does not, so CR_CONTEXT_TOKENS is never carried over: 500k
+# chosen for a 1M claude window is past the end of a 258k codex one. Unset, codex
+# has no absolute threshold — and claude's does not overrule codex's percentage.
+: "${CR_CODEX_CONTEXT_PCT:=}"           # unset = CR_CONTEXT_PCT
+: "${CR_CODEX_CONTEXT_TOKENS:=}"        # unset = none; never CR_CONTEXT_TOKENS
+# A restart that codex's own compaction beats to it is no restart at all, so with
+# the restart on the wrapper keeps codex from compacting first. codex compacts at
+# 90% of the raw window (244.8k of 272k), counted from an estimate that runs ahead
+# of anything the rollout shows, and it does so in the middle of a turn. So:
+#   - its threshold is moved out of the way, passing codex
+#     -c model_auto_compact_token_limit_scope="body_after_prefix" and a huge
+#     model_auto_compact_token_limit, which leaves only its hard cap at 95% of
+#     the window (258.4k) — a cap nothing can move;
+#   - the count is read where codex writes the number it compares against that
+#     cap: the "post sampling token usage" rows of $CODEX_HOME/logs_*.sqlite;
+#   - a turn still running when the count gets within CR_CODEX_RESERVE_TOKENS of
+#     the cap is interrupted (Esc), so the fold has room to happen in.
+: "${CR_CODEX_HOLD_COMPACT:=1}"         # 0 = leave codex's compaction settings alone
+: "${CR_CODEX_RESERVE_TOKENS:=32k}"     # room kept under codex's cap for the fold
+: "${CR_CODEX_INTERRUPT:=1}"            # 0 = never interrupt a running turn
+: "${CR_CODEX_LOGS_DB:=}"               # default: the newest $CODEX_HOME/logs_*.sqlite
 # A model this file has never heard of has no window, and a guessed one is worse
 # than none: guessing small folds a session that is nowhere near full. So an
 # unfamiliar slug is looked up instead — the Models API when ANTHROPIC_API_KEY is
@@ -333,7 +366,7 @@ CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
 case "${1:-}" in
   --cr-version) echo "claude-retrier $CR_VERSION"; exit 0 ;;
   --cr-help|-h|--help-retrier)
-    sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
 esac
 
@@ -346,13 +379,28 @@ esac
 # It stays because it is the unambiguous spelling: should claude ever grow a
 # `--cmd` of its own, that one is still reachable through the prefixed form.
 CR_CMD_SPEC="$CR_CLAUDE_CMD"
+
+# Called as `codex-retrier` — the symlink an install puts next to this file, or a
+# copy under that name — it is the same wrapper with codex as the default: its
+# command is CR_CODEX_CMD or plain `codex`, never the CR_CLAUDE_CMD a claude user
+# keeps in their rc file. `--cmd` and `--agent` still win.
+CR_PROG=claude-retrier
+CR_CMD_DEFAULTED=0
+case "${CR_SELF##*/}" in
+  codex-retrier|codex-retrier.sh)
+    CR_PROG=codex-retrier
+    CR_CMD_SPEC="${CR_CODEX_CMD:-codex}"
+    [ -n "${CR_CODEX_CMD:-}" ] || CR_CMD_DEFAULTED=1
+    [ "$CR_AGENT" != auto ] || CR_AGENT=codex ;;
+esac
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --cmd|--cr-cmd)
-      [ "$#" -ge 2 ] || { echo "claude-retrier: $1 needs a command" >&2; exit 2; }
-      CR_CMD_SPEC="$2"; shift 2 ;;
-    --cmd=*) CR_CMD_SPEC="${1#--cmd=}"; shift ;;
-    --cr-cmd=*) CR_CMD_SPEC="${1#--cr-cmd=}"; shift ;;
+      [ "$#" -ge 2 ] || { echo "$CR_PROG: $1 needs a command" >&2; exit 2; }
+      CR_CMD_SPEC="$2"; CR_CMD_DEFAULTED=0; shift 2 ;;
+    --cmd=*) CR_CMD_SPEC="${1#--cmd=}"; CR_CMD_DEFAULTED=0; shift ;;
+    --cr-cmd=*) CR_CMD_SPEC="${1#--cr-cmd=}"; CR_CMD_DEFAULTED=0; shift ;;
     --agent|--cr-agent)
       [ "$#" -ge 2 ] || { echo "claude-retrier: $1 needs claude or codex" >&2; exit 2; }
       CR_AGENT="$2"; shift 2 ;;
@@ -693,6 +741,14 @@ CFG = dict(
     context_pct=_env("CR_CONTEXT_PCT", 0.0, float),
     context_tokens=parse_tokens(os.environ.get("CR_CONTEXT_TOKENS")) or 0,
     context_window=_env("CR_CONTEXT_WINDOW", "auto"),
+    # None means unset, which means "the same as claude's" (see `agent_cfg`).
+    codex_context_pct=_env("CR_CODEX_CONTEXT_PCT", None, float),
+    codex_context_tokens=(None if not os.environ.get("CR_CODEX_CONTEXT_TOKENS")
+                          else parse_tokens(os.environ["CR_CODEX_CONTEXT_TOKENS"]) or 0),
+    codex_hold_compact=_env("CR_CODEX_HOLD_COMPACT", "1") != "0",
+    codex_reserve=parse_tokens(os.environ.get("CR_CODEX_RESERVE_TOKENS") or "32k") or 0,
+    codex_interrupt=_env("CR_CODEX_INTERRUPT", "1") != "0",
+    codex_logs_db=_env("CR_CODEX_LOGS_DB", ""),
     handoff_file=_env("CR_HANDOFF_FILE", ".claude-retrier/handoff.md"),
     handoff_marker=_env("CR_HANDOFF_MARKER", "HANDOFF"),
     handoff_min_bytes=_env("CR_HANDOFF_MIN_BYTES", 200, int),
@@ -1208,15 +1264,25 @@ def record_text(rec):
 #
 # The rows that matter, all shaped `{"type": …, "payload": {"type": …}}`:
 #
+#   event_msg / task_started     a turn began, and the window it runs in.
 #   event_msg / task_complete    a turn ended. With no `error` it ended well;
 #                                with one, `codex_error_info` separates "the
 #                                account ran out" from "the server did".
+#   event_msg / turn_aborted     a turn ended because someone pressed Esc.
 #   event_msg / token_count      what the last request was sent with, and how
 #                                large the window is: the context trigger's two
 #                                numbers, in codex's own accounting.
 #   response_item / message      role "user" is the echo of what was typed;
 #                                role "assistant" is the session answering.
-#   event_msg / thread_settings_applied   which model, for the log.
+#   turn_context                 which model (0.154); older builds said it in
+#   event_msg / thread_settings_applied   instead.
+#
+# The turn boundaries are what a context restart leans on. Claude Code writes a
+# stop_reason into every answer and codex writes none, so "the folding turn
+# closed cleanly" is read off task_complete instead — the same fact, stated by
+# the runtime rather than the model — and "the session is mid-turn" is the span
+# between task_started and its ending, which stays true while the root sits for
+# minutes waiting on its agents without writing a byte.
 #
 # The error that prompted all of this is a turn ending with
 # `{"message": "Selected model is at capacity. …", "codex_error_info":
@@ -1249,7 +1315,8 @@ def codex_records(path, offset=0, echo=None):
 
     Emits the same five kinds the rest of the wrapper already speaks — limit,
     stall, echo, alive, and an alive marked `quiet` for a row that names the
-    model without proving anything is being served.
+    model without proving anything is being served. A row that opens or closes a
+    turn also carries `turn`: "open" or "closed".
 
     Rows are not collapsed the way Claude Code's assistant rows are. There, a
     dozen rows are one answer; here each row is a different statement about the
@@ -1263,6 +1330,8 @@ def codex_records(path, offset=0, echo=None):
         # Prefilters only, and deliberately spelling-insensitive: codex has
         # written these files both with and without spaces after the colons.
         interesting = (b"task_complete" in raw or b"token_count" in raw
+                       or b"task_started" in raw or b"turn_aborted" in raw
+                       or b"turn_context" in raw or b'"compacted"' in raw
                        or b'"assistant"' in raw or b"thread_settings_applied" in raw
                        or (echo_keys and any(k in raw for k in echo_keys)))
         if not interesting:
@@ -1274,25 +1343,50 @@ def codex_records(path, offset=0, echo=None):
         payload = rec.get("payload")
         if not isinstance(payload, dict):
             continue
-        kind = payload.get("type")
         ts = rec.get("timestamp")
-        if kind == "task_complete":
+        if rec.get("type") == "turn_context":
+            model = payload.get("model")
+            if model:
+                out.append(dict(kind="alive", ts=ts, quiet=True, sidechain=False,
+                                model=str(model)))
+            continue
+        if rec.get("type") == "compacted":
+            # codex compacted the thread itself. Written when it is over — nothing
+            # in the rollout announces one starting — so this can only be
+            # reported, never prevented from here.
+            out.append(dict(kind="alive", ts=ts, quiet=True, sidechain=False,
+                            compacted=True))
+            continue
+        kind = payload.get("type")
+        if kind == "task_started":
+            # Opens a turn and proves nothing else: a turn the server is about
+            # to refuse starts exactly like one it will serve.
+            window = payload.get("model_context_window")
+            out.append(dict(kind="alive", ts=ts, quiet=True, sidechain=False, turn="open",
+                            window=int(window) if isinstance(window, (int, float)) else None))
+        elif kind == "turn_aborted":
+            out.append(dict(kind="alive", ts=ts, quiet=True, sidechain=False,
+                            turn="closed", stop_reason="aborted"))
+        elif kind == "task_complete":
             err = payload.get("error")
             if not isinstance(err, dict) or not err:
                 # A turn that ended on its own terms. It says the session is
-                # alive AND that whatever was refusing turns has stopped.
-                out.append(dict(kind="alive", ts=ts, clean=True, sidechain=False))
+                # alive AND that whatever was refusing turns has stopped — and,
+                # for a restart, that the folding turn landed: end_turn is the
+                # word the rest of the wrapper already uses for that.
+                out.append(dict(kind="alive", ts=ts, clean=True, sidechain=False,
+                                turn="closed", stop_reason="end_turn"))
                 continue
             text = str(err.get("message") or "").strip()
             info = str(err.get("codex_error_info") or "").strip().lower()
             if info in CODEX_LIMIT_INFO or (not info and is_limit_line(text)):
-                out.append(dict(kind="limit", text=text, ts=ts,
+                out.append(dict(kind="limit", text=text, ts=ts, turn="closed",
                                 error=info or "usage_limit"))
             else:
                 # Everything else the server refused a turn over. The wait for
                 # one is ours to pick, so it does not matter which it was.
                 out.append(dict(kind="stall", text=text or info or "the turn was refused",
-                                ts=ts, error=info))
+                                ts=ts, turn="closed", error=info))
         elif kind == "token_count":
             info = payload.get("info")
             if not isinstance(info, dict):
@@ -1357,6 +1451,7 @@ class CodexAgent:
         self.dir = os.path.join(self.home, "sessions")
         self.cwd = os.path.realpath(cwd or os.getcwd())
         self._verdicts = {}          # path -> is this session's, once we can tell
+        self._threads = {}           # path -> the thread id its head names
 
     def paths(self, now=None):
         now = now if now is not None else time.time()
@@ -1403,6 +1498,8 @@ class CodexAgent:
         payload = rec.get("payload")
         if rec.get("type") != "session_meta" or not isinstance(payload, dict):
             return None
+        if payload.get("id"):
+            self._threads[path] = str(payload["id"])
         if payload.get("thread_source") == "subagent":
             return False
         if "subagent" in str(payload.get("source") or ""):
@@ -1417,6 +1514,137 @@ class CodexAgent:
 
     def records(self, path, offset, echo):
         return codex_records(path, offset, echo)
+
+    def thread_id(self, path):
+        """The thread a rollout belongs to, which is how codex's own log names it."""
+        if path and path not in self._threads:
+            self._classify(path)
+        return self._threads.get(path)
+
+
+# --------------------------------------------------------------------------- #
+# codex's own count — the number its compaction is decided on
+# --------------------------------------------------------------------------- #
+# The rollout says what the last request was sent with. codex decides whether to
+# compact on something larger: that figure, plus an estimate of every item added
+# since and of the reasoning it carries — 251,023 against a rollout reading of
+# 232,673 in one session that compacted. A threshold read off the rollout is
+# therefore a threshold codex can pass first. codex writes the number it actually
+# compares, and the limit it compares it with, into its log database after every
+# request (TRACE, on by default):
+#
+#   post sampling token usage turn_id=… total_usage_tokens=251023
+#     auto_compact_scope_tokens=251023 auto_compact_scope_limit=Some(244800)
+#     … full_context_window_limit=Some(258400) … token_limit_reached=true
+#
+# Compaction happens once the scope count reaches the scope limit or the total
+# reaches the full-window cap, so the total at which it happens is
+# min(full, total - scope + scope_limit): that one expression covers both scopes.
+_USAGE_ROW = re.compile(
+    r"post sampling token usage\b.*?\btotal_usage_tokens=(?P<total>\d+)"
+    r".*?\bauto_compact_scope_tokens=(?P<scope>\d+)"
+    r".*?\bauto_compact_scope_limit=(?:Some\((?P<limit>\d+)\)|None)"
+    r".*?\bfull_context_window_limit=(?:Some\((?P<full>\d+)\)|None)", re.S)
+
+
+def parse_usage_row(body):
+    """(total, compaction point) from one log row, or None when it is not one."""
+    m = _USAGE_ROW.search(body or "")
+    if not m:
+        return None
+    total, scope = int(m.group("total")), int(m.group("scope"))
+    caps = []
+    if m.group("limit"):
+        caps.append(total - scope + int(m.group("limit")))
+    if m.group("full"):
+        caps.append(int(m.group("full")))
+    return total, (min(caps) if caps else None)
+
+
+class CodexUsageLog:
+    """Follows codex's log database for one thread's usage rows.
+
+    Read-only, polled, and allowed to fail in every way a file owned by another
+    program can: missing, locked, migrated to a new name. Any of those leaves the
+    rollout's figures in charge, which is where things stood before this existed.
+    """
+
+    NEEDLE = "%post sampling token usage%"
+
+    def __init__(self, cfg, log, home=None):
+        self.log = log
+        self.path = cfg.get("codex_logs_db") or None
+        self.home = home or codex_home()
+        self.conn = None
+        self.last_id = {}            # thread -> newest row already read
+        self.failed = False
+        self.next_poll = 0.0
+        self.poll_every = cfg.get("poll", 2.0)
+
+    def _db(self):
+        if self.path:
+            return self.path
+        found = sorted(glob.glob(os.path.join(self.home, "logs_*.sqlite")),
+                       key=lambda p: int(re.sub(r"\D", "", os.path.basename(p)) or 0))
+        return found[-1] if found else None
+
+    def _connect(self):
+        if self.conn is not None:
+            return self.conn
+        path = self._db()
+        if not path or not os.path.exists(path):
+            return None
+        try:
+            import sqlite3
+            self.conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=0.2,
+                                        check_same_thread=False)
+        except Exception as exc:
+            if not self.failed:
+                self.log("cannot read codex's log database %s: %s" % (path, exc))
+            self.failed = True
+            return None
+        self.log("reading codex's own context count from %s" % path)
+        return self.conn
+
+    def poll(self, thread, now):
+        """[(total, compaction point)] written for `thread` since the last call."""
+        if not thread or now < self.next_poll:
+            return []
+        self.next_poll = now + self.poll_every
+        conn = self._connect()
+        if conn is None:
+            return []
+        try:
+            if thread not in self.last_id:
+                # A resumed thread can have thousands of these; only the newest
+                # says anything about now.
+                rows = conn.execute(
+                    "SELECT id, feedback_log_body FROM logs WHERE thread_id = ? "
+                    "AND feedback_log_body LIKE ? ORDER BY id DESC LIMIT 1",
+                    (thread, self.NEEDLE)).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, feedback_log_body FROM logs WHERE thread_id = ? "
+                    "AND id > ? AND feedback_log_body LIKE ? ORDER BY id",
+                    (thread, self.last_id[thread], self.NEEDLE)).fetchall()
+        except Exception as exc:
+            # Locked mid-write, or rotated away: drop the handle and ask again
+            # next time rather than holding on to a file that has moved.
+            self.log("codex's log database did not answer: %s" % exc)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            self.conn = None
+            return []
+        self.last_id.setdefault(thread, 0)
+        out = []
+        for row_id, body in rows:
+            self.last_id[thread] = max(self.last_id[thread], row_id)
+            parsed = parse_usage_row(body)
+            if parsed:
+                out.append(parsed)
+        return out
 
 
 # codex takes the directory to work in on the command line, and when it is given
@@ -1589,6 +1817,50 @@ CONTEXT_WINDOWS = {
 }
 SMALL_WINDOW = 200000
 BIG_WINDOW = 1000000
+
+# codex keeps this much of every window out of its "Context N% used": the system
+# prompt and tools a session carries before anyone has said anything. Its status
+# line reads (tokens - baseline) / (window - baseline), so a codex threshold is
+# read the same way — otherwise a restart set at 60% would fire while the line
+# the user is watching still says 57%. Measured, not remembered: 13,711 tokens
+# of a 258,400 window is "Context 1% used" on codex-cli 0.154, and 5% without
+# the baseline.
+CODEX_BASELINE_TOKENS = 12000
+
+
+def agent_cfg(cfg, agent):
+    """The config a controller for this agent runs with.
+
+    codex has thresholds of its own. An unset percentage is claude's: a fraction
+    of a window travels between windows. An absolute count does not — claude's
+    500k is past the end of a 258k codex window, and it would beat codex's
+    percentage besides — so claude's is never carried over.
+    """
+    cfg = dict(cfg, agent=agent)
+    if agent != "codex":
+        return cfg
+    pct, tokens = cfg.get("codex_context_pct"), cfg.get("codex_context_tokens")
+    if pct is not None:
+        cfg["context_pct"] = float(pct)
+    cfg["context_tokens"] = int(tokens or 0)
+    return cfg
+
+
+# What moves codex's own compaction threshold out of the restart's way. The scope
+# change is what lets the limit be raised at all: under the default "total" scope
+# a configured limit is clamped to 90% of the window. What remains is the hard cap
+# at the usable window, which no setting moves, and which the log reports.
+CODEX_HOLD_ARGS = ["-c", 'model_auto_compact_token_limit_scope="body_after_prefix"',
+                   "-c", "model_auto_compact_token_limit=1000000000"]
+
+
+def codex_launch_args(cfg):
+    """Arguments put in front of the user's own when the wrapper starts codex."""
+    if cfg.get("agent") != "codex" or not cfg.get("codex_hold_compact", True):
+        return []
+    if cfg.get("context_pct", 0) <= 0 and cfg.get("context_tokens", 0) <= 0:
+        return []                    # nothing is racing codex, so leave it be
+    return list(CODEX_HOLD_ARGS)
 
 
 def usage_tokens(usage):
@@ -2102,6 +2374,15 @@ class Controller:
         self.context_grew_at = 0.0    # ...and when it last gained a byte
         self.context_off = False      # a failure bad enough not to repeat
         self.last_stop_reason = None  # how the turn we are waiting on ended
+        # codex states where a turn starts and ends; None is "nobody said", which
+        # is all Claude Code's transcript ever says.
+        self.turn_open = None
+        self.codex = cfg.get("agent") == "codex"
+        self.context_baseline = CODEX_BASELINE_TOKENS if self.codex else 0
+        self.codex_cap = None         # where codex compacts, as its own log states it
+        self.counted_by_log = None    # the rollout whose count now comes from that log
+        self.interrupt_at = 0.0       # when a running turn was last interrupted
+        self.self_compactions = 0     # times codex got there first
         self.rstate = None            # None | HANDOFF_SENT | HANDOFF_OK | CLEARED | RESUME_SENT
         self.nonce = None             # the marker only this attempt can satisfy
         self.handoff_sent_at = 0.0
@@ -2560,6 +2841,7 @@ class Controller:
     RESTART_DROP = 0.5     # the context has to at least halve for /clear to have worked
     BADGE_NEAR = 0.8       # show the percentage only once the threshold is in sight
     GATE_RETRY = 5.0       # how long to sit on a held step before looking again
+    INTERRUPT_RETRY = 20.0 # between Escs, if the first did not close the turn
 
     @property
     def context_enabled(self):
@@ -2567,9 +2849,13 @@ class Controller:
             self.cfg["context_tokens"] > 0 or self.cfg["context_pct"] > 0)
 
     def context_pct(self):
+        """How full, in the accounting of the agent's own status line."""
         if not self.context_window or self.context_tokens is None:
             return None
-        return 100.0 * self.context_tokens / self.context_window
+        base = self.context_baseline
+        if self.context_window <= base:
+            return None
+        return 100.0 * max(0, self.context_tokens - base) / (self.context_window - base)
 
     # -- inputs ------------------------------------------------------------- #
     def on_context(self, rec, now):
@@ -2586,7 +2872,22 @@ class Controller:
             # or the very first row we have seen. Its figures replace, never mix.
             self.context_path = path
             self.context_tokens = None
-        self.context_grew_at = now
+            self.turn_open = None
+            self.codex_cap = None
+        from_log = rec.get("source") == "log"
+        if from_log:
+            # codex's own count, and where it will compact. Once one has arrived
+            # for this thread the rollout's smaller figure stops being the reading:
+            # alternating between the two would move the trigger back and forth.
+            self.counted_by_log = path
+            cap = rec.get("cap")
+            if cap and cap != self.codex_cap:
+                self.codex_cap = int(cap)
+                self._note_cap()
+        else:
+            self.context_grew_at = now
+        if rec.get("compacted"):
+            self._lost_the_race(now)
         if rec.get("sidechain"):
             return                       # a subagent's context, not the session's
         if rec.get("stop_reason") is not None:
@@ -2608,6 +2909,8 @@ class Controller:
         tokens = rec.get("tokens")
         if tokens is None:
             return
+        if not from_log and self.codex and self.counted_by_log == path:
+            return
         self.context_tokens = tokens
         if (self.context_window and tokens > self.context_window
                 and not self._window_bumped and not self.context_window_hint
@@ -2621,6 +2924,78 @@ class Controller:
                         self.context_model, human_tokens(BIG_WINDOW)))
             self.context_window = BIG_WINDOW
             self._recompute_limit()
+
+    def on_turn(self, state, now):
+        """codex opened or closed a turn in the rollout this session writes."""
+        self.turn_open = state == "open"
+
+    # -- codex's own compaction --------------------------------------------- #
+    def interrupt_line(self):
+        """The count past which a running codex turn is stopped, or None.
+
+        Far enough under codex's cap for the fold to be asked for and written:
+        the folding turn adds its own reply and a file write to a context that is
+        already nearly full, and a turn that reaches the cap is compacted by codex
+        halfway through.
+        """
+        if not self.codex or not self.codex_cap:
+            return None
+        return max(0, self.codex_cap - int(self.cfg.get("codex_reserve", 0) or 0))
+
+    def trigger_limit(self):
+        """The restart threshold, never past the point codex would get there first."""
+        line = self.interrupt_line()
+        if self.context_limit is None:
+            return None
+        return min(self.context_limit, line) if line is not None else self.context_limit
+
+    def _note_cap(self):
+        if not self.context_enabled:
+            return
+        line = self.interrupt_line()
+        self.log("codex compacts this thread at %s by its own count; restarting at %s, "
+                 "interrupting a running turn past %s"
+                 % (human_tokens(self.codex_cap), human_tokens(self.trigger_limit() or 0),
+                    human_tokens(line or 0)))
+        if self.context_limit and line is not None and self.context_limit > line:
+            self.log("the %s threshold is past the point codex would compact first; "
+                     "using %s instead" % (human_tokens(self.context_limit),
+                                           human_tokens(line)))
+
+    def _lost_the_race(self, now):
+        if not self.context_enabled:
+            return                       # nothing was racing it
+        self.self_compactions += 1
+        self.log("codex compacted the thread on its own before the restart could "
+                 "(%d this session) — the count stood at %s of a %s cap"
+                 % (self.self_compactions, human_tokens(self.context_tokens),
+                    human_tokens(self.codex_cap)))
+        # Whatever this thread's count was, it is gone, and a restart in flight is
+        # judging a context that no longer exists.
+        self.context_tokens = None
+        if self.rstate is not None:
+            self._abort_restart("codex compacted the thread itself during %s" % self.rstate,
+                                now)
+
+    def _maybe_interrupt(self, now):
+        """Stop a running codex turn that is about to be compacted, or None."""
+        if not (self.codex and self.turn_open and self.cfg.get("codex_interrupt", True)):
+            return None
+        line = self.interrupt_line()
+        if line is None or self.context_tokens is None or self.context_tokens < line:
+            return None
+        if now - self.interrupt_at < self.INTERRUPT_RETRY:
+            return None                  # one Esc, then give the turn time to close
+        why = self._blocked_by_human(now)
+        if why:
+            self._gate_note = why
+            return None
+        self.interrupt_at = now
+        self.log("context is %s, within %s of codex compacting at %s; interrupting the "
+                 "running turn to fold it up" % (human_tokens(self.context_tokens),
+                                                 human_tokens(self.codex_cap - line),
+                                                 human_tokens(self.codex_cap)))
+        return ("interrupt", "context is nearly full; interrupting the turn to fold it up")
 
     def note_growth(self, paths, now):
         """The transcript we follow gained bytes, so the session is mid-turn.
@@ -2685,6 +3060,11 @@ class Controller:
             model_slug(self.context_model))
         if forced:
             self.context_window, why = forced, "CR_CONTEXT_WINDOW"
+        elif self.codex:
+            # Claude Code's switches are not codex's, the table knows no codex
+            # model, and none is needed: every turn states its window.
+            self.context_window = self.context_window_hint
+            why = "the transcript" if self.context_window else "nothing stated yet"
         elif self.cfg["context_env_max"] > 0:
             self.context_window, why = (int(self.cfg["context_env_max"]),
                                         "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
@@ -2707,7 +3087,10 @@ class Controller:
             self.context_window, why = native, "the model"
         self._window_bumped = False
         self._recompute_limit()
-        self.window_unknown = self.context_model if self._needs_window() else None
+        # Nobody publishes a codex model's window where the lookup looks, and
+        # the rollout says it on the next turn anyway.
+        self.window_unknown = (self.context_model if self._needs_window()
+                               and not self.codex else None)
         if not self.context_enabled:
             return
         if self._needs_window():
@@ -2744,10 +3127,12 @@ class Controller:
         return True
 
     def _recompute_limit(self):
+        base = self.context_baseline
         if self.cfg["context_tokens"] > 0:
             self.context_limit = int(self.cfg["context_tokens"])
-        elif self.cfg["context_pct"] > 0 and self.context_window:
-            self.context_limit = int(self.context_window * self.cfg["context_pct"] / 100.0)
+        elif self.cfg["context_pct"] > 0 and self.context_window and self.context_window > base:
+            self.context_limit = int(base + (self.context_window - base)
+                                     * self.cfg["context_pct"] / 100.0)
         else:
             self.context_limit = None
 
@@ -2794,20 +3179,28 @@ class Controller:
         return why
 
     def _session_busy(self, now):
+        if self.turn_open:
+            # Said outright, and it outlasts the byte count: a codex root waiting
+            # on its agents can go minutes without writing anything.
+            return "a turn is still running"
         if self.context_grew_at and now - self.context_grew_at < self.cfg["root_idle"]:
             return "the session is still writing to its transcript"
         return None
 
     def _maybe_restart(self, now):
-        if not self.context_enabled or self.context_limit is None:
+        limit = self.trigger_limit() if self.context_enabled else None
+        if limit is None:
             return None
-        if self.context_tokens is None or self.context_tokens < self.context_limit:
+        if self.context_tokens is None or self.context_tokens < limit:
             return None
         if now < self.cooldown_until:
             return None
         cap = self.cfg["context_max_cycles"]
         if cap and self.cycles >= cap:
             return None
+        interrupt = self._maybe_interrupt(now)
+        if interrupt:
+            return interrupt
         if self._held(now):
             return None
         self.cycles += 1
@@ -2820,7 +3213,7 @@ class Controller:
         self.context_before = self.context_tokens
         self.log("context is %s of a %s window (%.0f%%, threshold %s); folding up"
                  % (human_tokens(self.context_tokens), human_tokens(self.context_window),
-                    self.context_pct() or 0.0, human_tokens(self.context_limit)))
+                    self.context_pct() or 0.0, human_tokens(limit)))
         return self._send_handoff(now, fresh=True)
 
     def _send_handoff(self, now, fresh):
@@ -3099,7 +3492,9 @@ class Badge:
             # being typed into the session over it.
             return ("%s %s %s" % (mark, self.label, warn), "2;31")
         if context is not None:
-            return ("%s %s %d%%" % (mark, self.label, int(context)), "2;32")
+            # Rounded, not truncated: codex's status line rounds, and a corner
+            # saying 4% under a line saying 5% reads as two different sessions.
+            return ("%s %s %d%%" % (mark, self.label, int(context + 0.5)), "2;32")
         return ("%s %s" % (mark, self.label), "2")
 
     # -- when it says it ---------------------------------------------------- #
@@ -3374,11 +3769,17 @@ def main(argv):
             log("%s — %s" % (headline, how))
             time.sleep(max(0.0, CFG["update_notice"]))
 
+    run_cfg = agent_cfg(CFG, agent_name)
+    extra = codex_launch_args(run_cfg)
+    if extra:
+        log("holding codex's own compaction back for the context restart: %s"
+            % " ".join(extra))
+
     rows, cols = get_winsize(stdout_fd) if interactive else (24, 80)
     pid, master = fork_pty(rows, cols)
     if pid == 0:
         try:
-            os.execvp(launch[0], launch + argv)
+            os.execvp(launch[0], launch + extra + argv)
         except Exception as exc:
             sys.stderr.write("claude-retrier: cannot exec %s: %s\n" % (claude, exc))
             os._exit(127)
@@ -3425,18 +3826,19 @@ def main(argv):
     # this thread's whole purpose is to be ready by the NEXT launch anyway.
     updater.refresh()
 
-    ctl = Controller(CFG, log)
+    ctl = Controller(run_cfg, log)
     lookup = WindowLookup(CFG, log)
     badge = Badge(CFG)
     if not interactive:
         badge.enabled = False      # nothing to paint on when stdout is a pipe
+    usage_log = CodexUsageLog(CFG, log) if agent_name == "codex" and ctl.context_enabled else None
     watcher = TranscriptWatcher(poll=CFG["poll"], agent=build_agent(agent_name, argv),
                                 echo=[CFG["message"], ctl.resume_text])
     if ctl.context_enabled:
         log("context restart armed: handoff -> %s, %s"
             % (ctl.handoff_path,
-               ("%d tokens" % CFG["context_tokens"]) if CFG["context_tokens"] > 0
-               else "%g%% of the window" % CFG["context_pct"]))
+               ("%d tokens" % ctl.cfg["context_tokens"]) if ctl.cfg["context_tokens"] > 0
+               else "%g%% of the window" % ctl.cfg["context_pct"]))
         # The Write tool would create it, but a directory that is already there
         # is one fewer thing for the folding turn to get wrong.
         parent = os.path.dirname(ctl.handoff_path)
@@ -3607,6 +4009,8 @@ def main(argv):
                     # session's context.
                     if rec.get("path") == watcher.current:
                         ctl.on_context(rec, now)
+                        if rec.get("turn"):
+                            ctl.on_turn(rec["turn"], now)
                     if rec.get("clean"):
                         ctl.on_turn_done(now)
                     # A row that only names the model says nothing about whether
@@ -3618,6 +4022,8 @@ def main(argv):
                     if ctl.on_alive(now, "transcript"):
                         wait_cancelled()
                     continue
+                if rec.get("turn") and rec.get("path") == watcher.current:
+                    ctl.on_turn(rec["turn"], now)     # a turn that died of it
                 if rec.get("kind") == "stall":
                     pending_scrape = None        # the structured channel wins
                     if ctl.on_stall(rec["text"], now, "transcript"):
@@ -3631,6 +4037,10 @@ def main(argv):
             # a tool call and its result can be minutes: bytes are what say the
             # session is still mid-turn.
             ctl.note_growth(watcher.grown, now)
+            if usage_log is not None and watcher.current:
+                for total, cap in usage_log.poll(watcher.agent.thread_id(watcher.current), now):
+                    ctl.on_context(dict(kind="alive", source="log", path=watcher.current,
+                                        sidechain=False, tokens=total, cap=cap), now)
 
             # A model the shipped table cannot size. Asking is off the hot path
             # in a worker thread, so this is only ever "post the question" and
@@ -3667,6 +4077,11 @@ def main(argv):
                 notify(ctl.inject_note())
             elif action and action[0] == "resume":
                 wait_cancelled()
+            elif action and action[0] == "interrupt":
+                # Esc stops a running codex turn; the turn_aborted row it writes is
+                # what lets the fold go out.
+                pending.append((now, b"\x1b"))
+                notify(action[1])
             elif action and action[0] == "notify":
                 notify(action[1])
 
@@ -3785,8 +4200,12 @@ cr_resolve_cmd "$CR_CMD_SPEC" || {
     echo "about '$CR_CMD_SPEC'. An rc file that prompts (zsh's compinit asks about insecure" >&2
     echo "directories) will do that. Name a path or a full command line instead, or raise" >&2
     echo "CR_PROBE_TIMEOUT_SEC." >&2
+  elif [ "$CR_CMD_DEFAULTED" = 1 ]; then
+    # The one failure a codex-retrier installed on a machine with no codex has.
+    echo "codex-retrier: codex not found on PATH — install it, or name yours with" >&2
+    echo "--cmd (or CR_CODEX_CMD)" >&2
   elif [ -n "$CR_CMD_SPEC" ]; then
-    echo "claude-retrier: cannot run '$CR_CMD_SPEC' — not a runnable file, and your" >&2
+    echo "$CR_PROG: cannot run '$CR_CMD_SPEC' — not a runnable file, and your" >&2
     echo "shell does not know it as a command, alias or function" >&2
   else
     echo "claude-retrier: claude not found on PATH" >&2
@@ -3857,6 +4276,8 @@ export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC
 export CR_AGENT
 export CR_STALL_WAIT_SEC CR_STALL_BACKOFF CR_STALL_MAX_WAIT_SEC CR_STALL_MAX_ATTEMPTS
 export CR_CONTEXT_PCT CR_CONTEXT_TOKENS CR_CONTEXT_WINDOW
+export CR_CODEX_CONTEXT_PCT CR_CODEX_CONTEXT_TOKENS
+export CR_CODEX_HOLD_COMPACT CR_CODEX_RESERVE_TOKENS CR_CODEX_INTERRUPT CR_CODEX_LOGS_DB
 export CR_UPDATE_CHECK CR_UPDATE_REPO CR_UPDATE_URL CR_UPDATE_BREW_FORMULA
 export CR_UPDATE_CACHE CR_UPDATE_TTL_SEC CR_UPDATE_TIMEOUT_SEC CR_UPDATE_NOTICE_SEC
 export CR_VERSION CR_SELF

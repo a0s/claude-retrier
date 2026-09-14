@@ -170,6 +170,50 @@ class TestReadingARollout(unittest.TestCase):
         self.assertEqual([r["kind"] for r in got], ["alive"])
 
 
+class TestWhereATurnStartsAndEnds(unittest.TestCase):
+    """What a context restart reads off a rollout, in the shape codex-cli 0.154
+    writes it. Claude Code states how a turn ended in every answer; codex states
+    it once, in the row that closes the turn."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-codex-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def read(self, rows):
+        return cr.codex_records(rollout(self.dir, rows=rows), 0)[1]
+
+    def test_a_turn_opens_with_its_window(self):
+        got = self.read([("event_msg", {"type": "task_started", "turn_id": "t1",
+                                        "model_context_window": 258400})])
+        self.assertEqual(got[0]["turn"], "open")
+        self.assertEqual(got[0]["window"], 258400)
+        # A turn the server is about to refuse starts exactly like one it serves.
+        self.assertTrue(got[0]["quiet"])
+
+    def test_a_turn_that_finished_closed_with_end_turn(self):
+        got = self.read([task_complete()])
+        self.assertEqual(got[0]["turn"], "closed")
+        self.assertEqual(got[0]["stop_reason"], "end_turn")
+
+    def test_esc_closes_a_turn_without_end_turn(self):
+        got = self.read([("event_msg", {"type": "turn_aborted", "turn_id": "t1"})])
+        self.assertEqual(got[0]["turn"], "closed")
+        self.assertEqual(got[0]["stop_reason"], "aborted")
+        self.assertTrue(got[0]["quiet"])
+
+    def test_a_refused_turn_is_closed_too(self):
+        got = self.read([task_complete(
+            error={"message": CAPACITY, "codex_error_info": "server_overloaded"}, last=None)])
+        self.assertEqual(got[0]["turn"], "closed")
+        self.assertNotIn("stop_reason", got[0])
+
+    def test_turn_context_names_the_model(self):
+        got = self.read([("turn_context", {"turn_id": "t1", "model": "gpt-5.6-sol",
+                                           "effort": "high"})])
+        self.assertEqual(got[0]["model"], "gpt-5.6-sol")
+        self.assertTrue(got[0]["quiet"])
+
+
 class TestWhichRolloutsAreOurs(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="cr-codex-home-")
@@ -366,6 +410,365 @@ class TestStalling(unittest.TestCase):
         self.assertIsNone(ctl.tick(61))
 
 
+RESTART = dict(
+    context_pct=0, context_tokens=0, context_window="auto",
+    context_env_max=0, context_no_1m=False,
+    handoff_file="H.md", handoff_marker="HANDOFF", handoff_min_bytes=20,
+    handoff_attempts=2,
+    handoff_msg="Fold into `{file}` and end it with {marker}.",
+    clear_cmd="/clear", resume_msg="Read `{file}` and continue from it.",
+    root_idle=20, handoff_timeout=900, step_gap=3,
+    context_cooldown=600, context_max_cycles=0,
+)
+WINDOW = 258400
+ROLL = "/codex/sessions/rollout-mine.jsonl"
+
+
+class Handoff:
+    def __init__(self):
+        self.state = None
+
+    def write(self, ctl, at):
+        text = "everything you need to know\n" * 4 + ctl.nonce + "\n"
+        self.state = dict(size=len(text), mtime=at, tail=text[-512:])
+
+    def __call__(self, _path):
+        return self.state
+
+
+def codex_controller(agent="codex", **over):
+    cfg = dict(CFG)
+    cfg.update(RESTART)
+    cfg.update(over)
+    logs = []
+    hand = Handoff()
+    ctl = cr.Controller(cr.agent_cfg(cfg, agent), logs.append, now=0, probe=hand)
+    ctl.log_lines = logs
+    ctl.handoff = hand
+    return ctl
+
+
+def feed(ctl, at, path=ROLL, **rec):
+    """One rollout record, the way the main loop hands it over."""
+    rec = dict(kind="alive", path=path, sidechain=False, **rec)
+    ctl.on_context(rec, at)
+    if rec.get("turn"):
+        ctl.on_turn(rec["turn"], at)
+
+
+class TestTheCodexThreshold(unittest.TestCase):
+    """The percentage is the one on codex's status line, and the setting is its
+    own — defaulting to claude's, so one export still covers both."""
+
+    def test_the_percentage_is_the_one_the_status_line_shows(self):
+        # Measured on codex-cli 0.154: 13,711 of a 258,400 window reads
+        # "Context 1% used". Without the baseline it would be 5%.
+        ctl = codex_controller(context_pct=50)
+        feed(ctl, 1, window=WINDOW, tokens=13711)
+        self.assertEqual(round(ctl.context_pct()), 1)
+        claude = codex_controller(agent="claude", context_pct=50, context_window="258400")
+        claude.on_context(dict(kind="alive", path=ROLL, tokens=13711,
+                               model="claude-opus-5"), 1)
+        self.assertEqual(round(claude.context_pct()), 5)
+
+    def test_the_corner_rounds_the_way_the_status_line_does(self):
+        # 23,440 of 258,400 is 4.64%: codex says "Context 5% used".
+        ctl = codex_controller(context_pct=5)
+        feed(ctl, 1, window=WINDOW, tokens=23440)
+        badge = cr.Badge(dict(badge=1, badge_pos="bottom-right", badge_label="cr"))
+        text, _ = badge.frame(cr.IDLE, 0, 0, 3, now=0, context=ctl.badge_context())
+        self.assertIn("5%", text)
+
+    def test_the_threshold_is_read_the_same_way(self):
+        ctl = codex_controller(context_pct=60)
+        feed(ctl, 1, window=WINDOW)
+        self.assertEqual(ctl.context_limit, 12000 + int((WINDOW - 12000) * 0.6))
+
+    def test_unset_it_is_claudes(self):
+        ctl = codex_controller(context_pct=60, codex_context_pct=None,
+                               codex_context_tokens=None)
+        self.assertEqual(ctl.cfg["context_pct"], 60)
+
+    def test_set_it_is_its_own(self):
+        ctl = codex_controller(context_pct=60, codex_context_pct=40)
+        self.assertEqual(ctl.cfg["context_pct"], 40)
+        # ...and claude's is untouched by it.
+        claude = codex_controller(agent="claude", context_pct=60, codex_context_pct=40)
+        self.assertEqual(claude.cfg["context_pct"], 60)
+
+    def test_claudes_absolute_count_is_never_codexs(self):
+        # 500k chosen for a 1M claude window is past the end of a 258k codex
+        # one, and an absolute count would beat the percentage besides.
+        ctl = codex_controller(context_tokens=500000, context_pct=60)
+        self.assertEqual(ctl.cfg["context_tokens"], 0)
+        self.assertEqual(ctl.cfg["context_pct"], 60)
+        feed(ctl, 1, window=WINDOW)
+        self.assertEqual(ctl.context_limit, 12000 + int((WINDOW - 12000) * 0.6))
+
+    def test_claudes_absolute_count_alone_leaves_codex_off(self):
+        ctl = codex_controller(context_tokens=500000)
+        self.assertFalse(ctl.context_enabled)
+
+    def test_codex_may_have_an_absolute_count_of_its_own(self):
+        ctl = codex_controller(codex_context_tokens=200000)
+        feed(ctl, 1, window=WINDOW)
+        self.assertEqual(ctl.context_limit, 200000)
+
+    def test_zero_switches_codex_off_alone(self):
+        ctl = codex_controller(context_pct=60, codex_context_pct=0)
+        self.assertFalse(ctl.context_enabled)
+
+    def test_the_environment_spells_it(self):
+        from helper import load as reload_impl
+        mod = reload_impl(CR_CODEX_CONTEXT_PCT="45", CR_CODEX_CONTEXT_TOKENS="300k")
+        self.assertEqual(mod.CFG["codex_context_pct"], 45.0)
+        self.assertEqual(mod.CFG["codex_context_tokens"], 300000)
+        mod = reload_impl(CR_CODEX_CONTEXT_TOKENS="0")
+        self.assertEqual(mod.CFG["codex_context_tokens"], 0)   # set, and off
+        mod = reload_impl()
+        self.assertIsNone(mod.CFG["codex_context_pct"])
+        self.assertIsNone(mod.CFG["codex_context_tokens"])
+
+    def test_claude_codes_switches_are_not_codexs(self):
+        ctl = codex_controller(context_pct=50, context_env_max=100000)
+        feed(ctl, 1, window=WINDOW, model="gpt-5.6-sol")
+        self.assertEqual(ctl.context_window, WINDOW)
+
+    def test_a_codex_model_is_never_looked_up(self):
+        # The model can be named before any turn has stated its window. The
+        # lookup reads Anthropic's models table, which has no GPT in it.
+        ctl = codex_controller(context_pct=50)
+        feed(ctl, 1, model="gpt-5.6-sol")
+        self.assertIsNone(ctl.window_unknown)
+        feed(ctl, 2, window=WINDOW)
+        self.assertEqual(ctl.context_window, WINDOW)
+
+
+class TestACodexRestart(unittest.TestCase):
+    """The machine itself is shared with claude. What differs is where its facts
+    come from, and the one that was missing was how the folding turn ended."""
+
+    def full(self, ctl, at=1):
+        feed(ctl, at, turn="open", window=WINDOW)
+        feed(ctl, at, model="gpt-5.6-sol")
+        feed(ctl, at, tokens=200000)
+        feed(ctl, at, turn="closed", stop_reason="end_turn")
+
+    def test_a_clean_task_complete_lets_the_clear_go_out(self):
+        ctl = codex_controller(context_pct=50)
+        self.full(ctl)
+        action = ctl.tick(30)
+        self.assertEqual(action[0], "inject")
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        # The folding turn.
+        feed(ctl, 31, turn="open", window=WINDOW)
+        ctl.handoff.write(ctl, at=40)
+        feed(ctl, 40, tokens=201000)
+        feed(ctl, 41, turn="closed", stop_reason="end_turn")
+        self.assertEqual(ctl.tick(70), ("inject", "/clear", False))
+        # The new chat is a new rollout, and it answers small.
+        self.assertEqual(ctl.tick(74)[1], "Read `H.md` and continue from it.")
+        feed(ctl, 80, path="/codex/sessions/rollout-new.jsonl", turn="open", window=WINDOW)
+        feed(ctl, 82, path="/codex/sessions/rollout-new.jsonl", tokens=14000)
+        action = ctl.tick(83)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("restarted", action[1])
+
+    def test_an_open_turn_holds_the_fold_back_however_quiet_it_is(self):
+        # A root waiting on its agents writes nothing for minutes. The byte
+        # count would call that idle and type into a running turn.
+        ctl = codex_controller(context_pct=50)
+        feed(ctl, 1, turn="open", window=WINDOW)
+        feed(ctl, 1, tokens=200000)
+        self.assertIsNone(ctl.tick(600))
+        self.assertIn("a turn is still running", " ".join(ctl.log_lines))
+        feed(ctl, 601, turn="closed", stop_reason="end_turn")
+        self.assertEqual(ctl.tick(630)[0], "inject")
+
+    def test_an_open_folding_turn_is_not_cleared_under(self):
+        ctl = codex_controller(context_pct=50)
+        self.full(ctl)
+        ctl.tick(30)
+        feed(ctl, 31, turn="open", window=WINDOW)
+        ctl.handoff.write(ctl, at=40)          # the file is done, the turn is not
+        self.assertIsNone(ctl.tick(200))
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+
+    def test_an_aborted_folding_turn_is_not_a_handoff(self):
+        ctl = codex_controller(context_pct=50, handoff_attempts=1)
+        self.full(ctl)
+        ctl.tick(30)
+        feed(ctl, 31, turn="open", window=WINDOW)
+        ctl.handoff.write(ctl, at=40)
+        feed(ctl, 41, turn="closed", stop_reason="aborted")
+        action = ctl.tick(70)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("stop_reason=aborted", action[1])
+        self.assertIsNone(ctl.rstate)
+
+    def test_a_new_rollout_forgets_the_old_turn(self):
+        ctl = codex_controller(context_pct=50)
+        feed(ctl, 1, turn="open", window=WINDOW)
+        feed(ctl, 2, path="/codex/sessions/rollout-new.jsonl", tokens=1000)
+        self.assertIsNone(ctl.turn_open)
+
+
+REAL_ROW = ("session_loop{thread_id=01a09fb0}:run_turn: post sampling token usage "
+            "turn_id=01a09fb9 total_usage_tokens=251023 auto_compact_scope_tokens=251023 "
+            "auto_compact_scope_limit=Some(244800) auto_compact_limit_scope=Total "
+            "auto_compact_window_prefill_tokens=None full_context_window_limit=Some(258400) "
+            "full_context_window_limit_reached=false token_limit_reached=true "
+            "model_needs_follow_up=true")
+HELD_ROW = ("post sampling token usage turn_id=01a09feb total_usage_tokens=13486 "
+            "auto_compact_scope_tokens=5 auto_compact_scope_limit=Some(1000000000) "
+            "auto_compact_limit_scope=BodyAfterPrefix auto_compact_window_prefill_tokens=Some(13481) "
+            "full_context_window_limit=Some(258400) full_context_window_limit_reached=false")
+
+
+class TestCodexsOwnCount(unittest.TestCase):
+    """codex decides to compact on a count of its own, larger than anything the
+    rollout shows, and writes it to its log database. Both rows below are copied
+    from a real ~/.codex/logs_2.sqlite on codex-cli 0.154."""
+
+    def test_the_default_scope_compacts_at_ninety_percent_of_the_raw_window(self):
+        self.assertEqual(cr.parse_usage_row(REAL_ROW), (251023, 244800))
+
+    def test_with_the_threshold_held_back_only_the_hard_cap_is_left(self):
+        self.assertEqual(cr.parse_usage_row(HELD_ROW), (13486, 258400))
+
+    def test_other_rows_are_not_usage(self):
+        self.assertIsNone(cr.parse_usage_row("turn{model=gpt-5.6-sol}: sampling request sent"))
+        self.assertIsNone(cr.parse_usage_row(None))
+
+    def test_the_database_is_followed_one_thread_at_a_time(self):
+        import sqlite3
+        home = tempfile.mkdtemp(prefix="cr-codex-logs-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        db = sqlite3.connect(os.path.join(home, "logs_2.sqlite"))
+        db.execute("CREATE TABLE logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, "
+                   "feedback_log_body TEXT, thread_id TEXT)")
+        add = lambda body, thread: (db.execute(
+            "INSERT INTO logs (ts, feedback_log_body, thread_id) VALUES (0, ?, ?)",
+            (body, thread)), db.commit())
+        add(HELD_ROW.replace("13486", "9000"), "mine")
+        add(HELD_ROW, "mine")
+        add(REAL_ROW, "someone-else")
+        logs = []
+        follow = cr.CodexUsageLog(dict(poll=0), logs.append, home=home)
+        # First look: only the newest row, not a resumed thread's whole history.
+        self.assertEqual(follow.poll("mine", 1), [(13486, 258400)])
+        self.assertEqual(follow.poll("mine", 2), [])
+        add(HELD_ROW.replace("13486", "20000"), "mine")
+        self.assertEqual(follow.poll("mine", 3), [(20000, 258400)])
+
+    def test_no_database_is_no_reading(self):
+        follow = cr.CodexUsageLog(dict(poll=0), lambda *_: None, home="/nonexistent")
+        self.assertEqual(follow.poll("mine", 1), [])
+
+    def test_a_compacted_row_is_reported(self):
+        d = tempfile.mkdtemp(prefix="cr-codex-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        got = cr.codex_records(rollout(d, rows=[("compacted", {"message": ""})]), 0)[1]
+        self.assertTrue(got[0]["compacted"])
+        self.assertTrue(got[0]["quiet"])
+
+
+class TestHoldingCodexsCompactionBack(unittest.TestCase):
+    def test_codex_is_started_with_its_threshold_moved(self):
+        args = cr.codex_launch_args(dict(agent="codex", context_pct=60, context_tokens=0,
+                                         codex_hold_compact=True))
+        self.assertIn('model_auto_compact_token_limit_scope="body_after_prefix"', args)
+        self.assertEqual(args[0], "-c")
+
+    def test_not_without_a_restart_to_make_room_for(self):
+        self.assertEqual(cr.codex_launch_args(dict(agent="codex", context_pct=0,
+                                                   context_tokens=0)), [])
+
+    def test_not_when_told_not_to(self):
+        self.assertEqual(cr.codex_launch_args(dict(agent="codex", context_pct=60,
+                                                   codex_hold_compact=False)), [])
+
+    def test_never_for_claude(self):
+        self.assertEqual(cr.codex_launch_args(dict(agent="claude", context_pct=60)), [])
+
+
+def logged_usage(ctl, at, tokens, cap=258400, path=ROLL):
+    ctl.on_context(dict(kind="alive", source="log", path=path, sidechain=False,
+                        tokens=tokens, cap=cap), at)
+
+
+class TestStayingAheadOfCodex(unittest.TestCase):
+    def ctl(self, **over):
+        cfg = dict(context_pct=60, codex_reserve=32000, codex_interrupt=True)
+        cfg.update(over)
+        ctl = codex_controller(**cfg)
+        feed(ctl, 0, window=WINDOW, model="gpt-5.6-sol")
+        return ctl
+
+    def test_codexs_count_replaces_the_rollouts(self):
+        ctl = self.ctl()
+        logged_usage(ctl, 1, 150000)
+        feed(ctl, 2, tokens=132000)             # the rollout's smaller figure, later
+        self.assertEqual(ctl.context_tokens, 150000)
+
+    def test_the_threshold_never_sits_past_the_interrupt_line(self):
+        ctl = self.ctl(context_pct=95)
+        logged_usage(ctl, 1, 1000)
+        self.assertEqual(ctl.interrupt_line(), 258400 - 32000)
+        self.assertEqual(ctl.trigger_limit(), 258400 - 32000)
+        self.assertIn("past the point codex would compact first", " ".join(ctl.log_lines))
+
+    def test_a_running_turn_is_left_alone_under_the_line(self):
+        ctl = self.ctl()
+        feed(ctl, 1, turn="open")
+        logged_usage(ctl, 2, 200000)            # past 60%, short of 226k
+        self.assertIsNone(ctl.tick(100))
+
+    def test_a_running_turn_past_the_line_is_interrupted(self):
+        ctl = self.ctl()
+        feed(ctl, 1, turn="open")
+        logged_usage(ctl, 2, 230000)
+        action = ctl.tick(100)
+        self.assertEqual(action[0], "interrupt")
+        self.assertIsNone(ctl.tick(105))        # one Esc, then time for it to land
+        # The Esc lands: turn_aborted. The fold goes out once the rollout is quiet.
+        feed(ctl, 106, turn="closed", stop_reason="aborted")
+        self.assertIsNone(ctl.tick(110))
+        action = ctl.tick(130)
+        self.assertEqual(action[0], "inject")
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+
+    def test_nobody_is_interrupted_mid_sentence(self):
+        ctl = self.ctl()
+        feed(ctl, 1, turn="open")
+        logged_usage(ctl, 2, 230000)
+        ctl.on_user_bytes(b"wait", 99)
+        self.assertIsNone(ctl.tick(100))
+
+    def test_interrupting_can_be_switched_off(self):
+        ctl = self.ctl(codex_interrupt=False)
+        feed(ctl, 1, turn="open")
+        logged_usage(ctl, 2, 230000)
+        self.assertIsNone(ctl.tick(100))
+
+    def test_codex_getting_there_first_is_said_and_ends_the_restart(self):
+        ctl = self.ctl()
+        logged_usage(ctl, 1, 230000)
+        ctl.tick(30)
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        feed(ctl, 40, compacted=True)
+        self.assertIsNone(ctl.rstate)
+        self.assertEqual(ctl.self_compactions, 1)
+        self.assertIn("compacted the thread on its own", " ".join(ctl.log_lines))
+
+    def test_without_the_log_the_rollout_still_counts(self):
+        ctl = self.ctl()
+        feed(ctl, 1, tokens=200000)
+        self.assertEqual(ctl.context_tokens, 200000)
+        self.assertIsNone(ctl.interrupt_line())
+        self.assertEqual(ctl.trigger_limit(), ctl.context_limit)
+
+
 class TestFindingAStallOnScreen(unittest.TestCase):
     def test_the_capacity_line_is_found(self):
         self.assertEqual(cr.find_stall("⚠ " + CAPACITY), "⚠ " + CAPACITY)
@@ -467,6 +870,66 @@ class TestCodexSubcommands(unittest.TestCase):
         self.assertTrue(self.wrapped(["exec the plan and report back"]))
 
 
+class TestCalledAsCodexRetrier(unittest.TestCase):
+    """`codex-retrier` is this same file under another name, with codex as the
+    default. The install puts the name there whether or not codex is, so the
+    name has to cope with a machine that has only claude."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-codex-name-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.log = os.path.join(self.dir, "log")
+        self.prog = os.path.join(self.dir, "codex-retrier")
+        os.symlink(os.path.join(ROOT, "claude-retrier.sh"), self.prog)
+        self.codex_dir = os.path.dirname(FAKE_CODEX)     # holds an executable `codex`
+
+    def call(self, args, path=None, **over):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("CR_")
+               and k not in ("CLAUDE_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+        env.update({"PATH": path or (self.codex_dir + ":/usr/bin:/bin"),
+                    "SHELL": "/bin/sh", "CR_LOG": self.log, "CODEX_HOME": self.dir,
+                    "CR_NOTIFY": "0", "CR_UPDATE_CHECK": "0"})
+        env.update(over)
+        return subprocess.run([self.prog, *args], env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_it_runs_codex(self):
+        r = self.call(["--cr-dump-argv"])
+        self.assertEqual(r.stdout.strip(), FAKE_CODEX)
+
+    def test_claudes_command_is_not_its_command(self):
+        # CR_CLAUDE_CMD lives in people's rc files, for claude-retrier.
+        r = self.call(["--cr-dump-argv"], CR_CLAUDE_CMD="claude-work")
+        self.assertEqual(r.stdout.strip(), FAKE_CODEX)
+
+    def test_cr_codex_cmd_names_yours(self):
+        mine = os.path.join(self.dir, "codex-work")
+        shutil.copy(FAKE_CODEX, mine)
+        r = self.call(["--cr-dump-argv"], CR_CODEX_CMD=mine)
+        self.assertEqual(r.stdout.strip(), mine)
+
+    def test_cmd_still_wins(self):
+        mine = os.path.join(self.dir, "codex-work")
+        shutil.copy(FAKE_CODEX, mine)
+        r = self.call(["--cmd", mine, "--cr-dump-argv"])
+        self.assertEqual(r.stdout.strip(), mine)
+
+    def test_a_machine_with_no_codex_is_told_so(self):
+        r = self.call([], path="/usr/bin:/bin")
+        self.assertEqual(r.returncode, 127)
+        self.assertIn("codex-retrier: codex not found on PATH", r.stderr)
+
+    def test_the_agent_is_codex_whatever_the_command_is_called(self):
+        # Nothing in `agent-work` says codex. The name the wrapper was called by
+        # does, which is what sends `exec` straight through unwrapped.
+        mine = os.path.join(self.dir, "agent-work")
+        shutil.copy(FAKE_CODEX, mine)
+        r = self.call(["exec", "do the thing"], CR_CODEX_CMD=mine)
+        self.assertIn("fake-codex ready", r.stdout)
+        self.assertFalse(os.path.exists(self.log))
+
+
 class TestCodexEndToEnd(PtyTestCase):
     """The whole thing on a pty: a rollout file the wrapper follows, a turn that
     dies in it, and `continue` typed into the session that was left sitting."""
@@ -540,6 +1003,87 @@ class TestCodexEndToEnd(PtyTestCase):
         self.assertTrue(s.read_until("GOT:hello there", timeout=10))
         s.drain(3)
         self.assertNotIn("GOT:continue", s.buf)
+
+    def restart_env(self, **over):
+        e = {"CR_CONTEXT_PCT": "50",
+             "CR_HANDOFF_FILE": "handoff.md",
+             "CR_ROOT_IDLE_SEC": "1",
+             "CR_HANDOFF_TIMEOUT_SEC": "45",
+             "CR_STEP_GAP_SEC": "0.5",
+             "CR_VERIFY_SEC": "8",
+             "CR_SLASH_GAP_SEC": "0.2",
+             "CR_SLASH_ENTER_GAP_SEC": "0.2",
+             "FAKE_USAGE": "200000",
+             "FAKE_USAGE_DELAY": "1.0"}
+        e.update(over)
+        return self.env(**e)
+
+    def test_a_full_context_is_folded_cleared_and_unfolded(self):
+        s = self.session(env=self.restart_env(), cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_for_log("context restarted", s), self.logged())
+        self.assertIn("handoff accepted", self.logged())
+        with open(os.path.join(self.work, "handoff.md")) as fh:
+            self.assertTrue(fh.read().rstrip().split("\n")[-1].startswith("HANDOFF-"))
+
+    def test_codex_has_a_threshold_of_its_own(self):
+        # claude's is off; codex's alone arms it.
+        s = self.session(env=self.restart_env(CR_CONTEXT_PCT="0", CR_CODEX_CONTEXT_PCT="50"),
+                         cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertIn("context restart armed", self.logged())
+        self.assertIn("50% of the window", self.logged())
+        # Read it through to the end. Torn down mid-restart, the wrapper is
+        # killed holding output nobody read, and on macOS the kernel keeps a
+        # process that exits that way until the terminal drains (see
+        # Session.wait) — longer than close() waits for it.
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+
+    def test_and_it_can_be_off_while_claudes_is_on(self):
+        s = self.session(env=self.restart_env(CR_CODEX_CONTEXT_PCT="0"), cwd=self.work)
+        s.read_until("ready", timeout=10)
+        s.drain(6)
+        self.assertNotIn("GOT:handoff", s.buf)
+        self.assertNotIn("context restart armed", self.logged())
+
+    def test_nothing_is_cleared_while_the_folding_turn_is_still_open(self):
+        s = self.session(env=self.restart_env(FAKE_TURN_HOLD="5"), cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:turn-closed", timeout=15), s.buf[-500:])
+        before = s.buf.index("GOT:turn-closed")
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertGreater(s.buf.index("GOT:/clear"), before)
+
+    def test_an_interrupted_fold_never_clears_anything(self):
+        s = self.session(env=self.restart_env(FAKE_HANDOFF_STOP="aborted",
+                                              CR_HANDOFF_ATTEMPTS="1"),
+                         cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_for_log("stop_reason=aborted", s), self.logged())
+        s.drain(3)
+        self.assertNotIn("GOT:/clear", s.buf)
+
+    def test_codex_is_started_with_its_own_compaction_held_back(self):
+        s = self.session(env=self.restart_env(FAKE_USAGE="1000"), cwd=self.work)
+        self.assertTrue(s.read_until("ready", timeout=10))
+        self.assertIn("model_auto_compact_token_limit_scope", s.buf)
+        self.assertIn("holding codex's own compaction back", self.logged())
+
+    def test_codexs_own_count_and_cap_are_read_from_its_log(self):
+        s = self.session(env=self.restart_env(FAKE_USAGE="1000", FAKE_LOG="1"), cwd=self.work)
+        self.assertTrue(self.wait_for_log("codex compacts this thread at 258k", s),
+                        self.logged())
+
+    def test_codex_getting_there_first_is_logged(self):
+        s = self.session(env=self.restart_env(FAKE_USAGE="1000", FAKE_COMPACT="1"),
+                         cwd=self.work)
+        s.read_until("ready", timeout=10)
+        s.drain(2)
+        s.send("compact\r")
+        self.assertTrue(self.wait_for_log("compacted the thread on its own", s),
+                        self.logged())
 
     def test_the_context_window_comes_from_the_rollout(self):
         s = self.session(

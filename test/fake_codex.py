@@ -29,9 +29,23 @@ answers with numbers rather than words:
                      (used to prove the wrapper ignores other agents' rollouts)
   FAKE_CWD           the cwd written into session_meta (default os.getcwd())
   FAKE_HANDOFF       what to do when asked to fold up: ok | short | nomarker | none
-  FAKE_HANDOFF_STOP  kept for symmetry with fake_claude.py; codex has no
-                     stop_reason, so this is ignored
+  FAKE_HANDOFF_STOP  how the folding turn ends: complete (task_complete, the
+                     default) or aborted (turn_aborted — someone pressed Esc)
+  FAKE_TURN_HOLD     seconds the folding turn stays open after the file is
+                     written, writing nothing — a root waiting on its agents
   FAKE_USAGE_AFTER   context the record written after the resume phrase claims
+  FAKE_MODEL         the model turn_context names (default gpt-5.6-sol)
+  FAKE_LOG           when set, every token_count is also written the way codex
+                     logs the count its compaction is decided on: a "post sampling
+                     token usage" row in $CODEX_HOME/logs_2.sqlite, FAKE_LOG_EXTRA
+                     tokens above the rollout's figure (default 18000), under
+                     whichever compaction scope the -c arguments asked for
+  FAKE_COMPACT       when set, `compact` writes a `compacted` row: codex compacting
+                     the thread on its own
+
+A turn it serves is framed the way codex-cli 0.154 frames one: task_started
+(carrying the window), turn_context (carrying the model), the turn's rows, and
+task_complete or turn_aborted.
 
 `/clear` (or FAKE_CLEAR_CMD) moves the fake to a whole new rollout file, which
 is what a new chat does and what the wrapper's "did the context actually
@@ -50,6 +64,7 @@ _MARKER = re.compile(r"must be exactly (\S+) and nothing else")
 _TARGET = re.compile(r"handoff to `([^`]+)`")
 
 SESSION = [None]   # [current rollout file path]
+THREAD = [None]    # [current thread id]
 ORDINAL = [0]      # resets to 0 whenever a new rollout file is started
 
 
@@ -84,6 +99,7 @@ def new_rollout():
                       time.strftime("%Y", now), time.strftime("%m", now), time.strftime("%d", now))
     os.makedirs(d, exist_ok=True)
     sid = str(uuid.uuid4())
+    THREAD[0] = sid
     name = "rollout-%s-%s.jsonl" % (time.strftime("%Y-%m-%dT%H-%M-%S", now), sid)
     SESSION[0] = os.path.join(d, name)
     ORDINAL[0] = 0
@@ -124,7 +140,35 @@ def write_assistant_message(text):
     })
 
 
+def write_usage_log(tokens):
+    """One row of codex's own accounting, in its log database."""
+    import sqlite3
+    total = int(tokens) + int(os.environ.get("FAKE_LOG_EXTRA", "18000"))
+    full = window()
+    if "body_after_prefix" in " ".join(sys.argv[1:]):
+        scope, limit, scope_name = max(0, total - 5000), "Some(1000000000)", "BodyAfterPrefix"
+    else:
+        scope, limit, scope_name = total, "Some(%d)" % (full * 100 // 95 * 9 // 10), "Total"
+    body = ("session_loop{thread_id=%s}:run_turn: post sampling token usage turn_id=t "
+            "total_usage_tokens=%d auto_compact_scope_tokens=%d auto_compact_scope_limit=%s "
+            "auto_compact_limit_scope=%s auto_compact_window_prefill_tokens=None "
+            "full_context_window_limit=Some(%d) full_context_window_limit_reached=false "
+            "token_limit_reached=false model_needs_follow_up=false"
+            % (THREAD[0], total, scope, limit, scope_name, full))
+    db = sqlite3.connect(os.path.join(codex_home(), "logs_2.sqlite"))
+    db.execute("CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "ts INTEGER NOT NULL, ts_nanos INTEGER NOT NULL, level TEXT NOT NULL, "
+               "target TEXT NOT NULL, feedback_log_body TEXT, thread_id TEXT, "
+               "estimated_bytes INTEGER NOT NULL DEFAULT 0)")
+    db.execute("INSERT INTO logs (ts, ts_nanos, level, target, feedback_log_body, thread_id) "
+               "VALUES (?, 0, 'TRACE', 'codex_core', ?, ?)", (int(time.time()), body, THREAD[0]))
+    db.commit()
+    db.close()
+
+
 def write_token_count(tokens):
+    if os.environ.get("FAKE_LOG"):
+        write_usage_log(tokens)
     tokens = int(tokens)
     usage = {
         "input_tokens": tokens,
@@ -149,6 +193,27 @@ def write_token_count(tokens):
             "rate_limit_reached_type": None,
         },
     })
+
+
+def write_task_started():
+    write_record("event_msg", {
+        "type": "task_started",
+        "turn_id": str(uuid.uuid4()),
+        "started_at": int(time.time()),
+        "model_context_window": window(),
+        "collaboration_mode_kind": "default",
+    })
+    write_record("turn_context", {
+        "turn_id": str(uuid.uuid4()),
+        "cwd": os.environ.get("FAKE_CWD") or os.getcwd(),
+        "model": os.environ.get("FAKE_MODEL", "gpt-5.6-sol"),
+        "effort": "high",
+    })
+
+
+def write_turn_aborted():
+    write_record("event_msg", {"type": "turn_aborted", "turn_id": str(uuid.uuid4()),
+                               "reason": "interrupted"})
 
 
 def write_task_complete(last_agent_message, error=None):
@@ -250,10 +315,17 @@ def main():
         if line.startswith("quit"):
             break
         if line == "answer":
+            write_task_started()
             write_assistant_message("an ordinary answer")
             write_token_count(100)
             write_task_complete("an ordinary answer")
             out.write("GOT:answer\r\n")
+            out.flush()
+            continue
+        if line == "compact" and os.environ.get("FAKE_COMPACT"):
+            write_record("compacted", {"message": "", "window_number": 2})
+            write_token_count(20000)
+            out.write("GOT:compact\r\n")
             out.flush()
             continue
         if line == "winsize":
@@ -265,6 +337,7 @@ def main():
             out.flush()
             continue
         if _MARKER.search(line) or "Write a complete handoff" in line:
+            write_task_started()
             fold_up(line)
             write_assistant_message("handoff written")
             if os.environ.get("FAKE_USAGE"):
@@ -272,8 +345,14 @@ def main():
                 # full session, which is what the wrapper compares against once
                 # the new chat has started.
                 write_token_count(os.environ["FAKE_USAGE"])
-            write_task_complete("handoff written")
             out.write("GOT:handoff\r\n")
+            out.flush()
+            time.sleep(float(os.environ.get("FAKE_TURN_HOLD", "0")))
+            if os.environ.get("FAKE_HANDOFF_STOP") == "aborted":
+                write_turn_aborted()
+            else:
+                write_task_complete("handoff written")
+            out.write("GOT:turn-closed\r\n")
             out.flush()
             continue
         if line == os.environ.get("FAKE_CLEAR_CMD", "/clear"):
@@ -284,6 +363,7 @@ def main():
             out.flush()
             continue
         if os.environ.get("FAKE_RESUME_MATCH", "continue from it") in line:
+            write_task_started()
             write_assistant_message("picked the handoff up")
             write_token_count(os.environ.get("FAKE_USAGE_AFTER", "5000"))
             write_task_complete("picked the handoff up")

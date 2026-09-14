@@ -7,6 +7,54 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [1.11.0] - 2026-09-14
+
+The context restart never once worked on codex, and now does — with a threshold
+of its own, and ahead of codex's own compaction rather than behind it. And
+`codex-retrier` is `claude-retrier` with codex as the default.
+
+### Fixed
+- The context restart on codex asked for a handoff, got a good one, and then
+  sat on it until the step timed out: the check that the folding turn ended
+  cleanly waited for a `stop_reason` of `end_turn`, which is a Claude Code field
+  that codex never writes. The turn's ending is now read off codex's own rows —
+  `task_complete` is a clean end, `turn_aborted` (Esc) is not — and the whole
+  fold, `/clear` and unfold have been run against a live codex-cli 0.154.
+- A codex session is mid-turn from `task_started` until the row that closes it.
+  It used to be "mid-turn until the rollout goes quiet for 20 seconds", which a
+  root waiting minutes on its agents satisfies while its turn is still running.
+- A codex model name is no longer sent to Anthropic's models table to be sized.
+  The rollout states the window, now from the first row of a turn, and Claude
+  Code's `CLAUDE_CODE_MAX_CONTEXT_TOKENS` and `CLAUDE_CODE_DISABLE_1M_CONTEXT`
+  no longer narrow a codex window.
+- The percentage in the corner is rounded rather than truncated, so it agrees
+  with the status line under it.
+
+### Added
+- The restart on codex gets there before codex's own compaction. codex compacts
+  at 90% of its raw window (244.8k of 272k), on a count that runs ~18k ahead of
+  anything the rollout shows, and in the middle of a turn — a threshold read off
+  the rollout loses that race. With the restart on, codex is now started with
+  `-c model_auto_compact_token_limit_scope="body_after_prefix"` and a huge
+  limit, which leaves only its hard cap at 258.4k; the wrapper reads the count
+  and the cap codex itself logs to `logs_2.sqlite`; the threshold never goes
+  past the cap minus `CR_CODEX_RESERVE_TOKENS` (32k); and a turn still running
+  past that line is interrupted with Esc and folded up. Checked against a live
+  codex-cli 0.154: the turn was aborted mid-task, the handoff recorded the step
+  still in flight, and the new thread started with the threshold held back
+  again. `CR_CODEX_HOLD_COMPACT=0` and `CR_CODEX_INTERRUPT=0` turn the two
+  halves off; a compaction that happens anyway is logged.
+- `codex-retrier`: the same file under a second name, with codex as its default
+  — `CR_CODEX_CMD` or plain `codex`, never the `CR_CLAUDE_CMD` meant for claude.
+  Installed alongside `claude-retrier` whatever agents the machine has; without
+  codex it says `codex not found on PATH` and exits 127.
+- codex has context thresholds of its own: `CR_CODEX_CONTEXT_PCT` and
+  `CR_CODEX_CONTEXT_TOKENS`. The percentage defaults to claude's; the absolute
+  count never does, since a count picked for a 1M window says nothing about a
+  258k one. The percentage is counted the way codex's status line
+  counts `Context N% used`, leaving out the 12,000 tokens it treats as a
+  baseline, so 60% fires when that line says 60% rather than a few points early.
+
 ## [1.10.0] - 2026-09-12
 
 A model this file had never heard of was assumed to be small, and a session that
