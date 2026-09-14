@@ -1,0 +1,185 @@
+# codex
+
+Wrapping codex: `codex-retrier`, which rollout the wrapper reads, which
+subcommands are wrapped, and the codex context-restart threshold.
+
+[← back to README](../README.md)
+
+- [Running it](#running-it)
+- [Which agent: `--agent`](#which-agent---agent)
+- [Rollouts: what the wrapper reads](#rollouts-what-the-wrapper-reads)
+- [Subcommands](#subcommands)
+- [Context restart on codex](#context-restart-on-codex)
+- [How it differs from claude underneath](#how-it-differs-from-claude-underneath)
+- [Staying ahead of codex's own compaction](#staying-ahead-of-codexs-own-compaction)
+
+## Running it
+
+Run `codex-retrier` where you would have run `codex`:
+
+```sh
+codex-retrier                                    # instead of: codex
+codex-retrier resume --last                      # any codex arguments work
+CR_CODEX_CMD='codex --model gpt-5.6-sol' codex-retrier
+```
+
+It is `claude-retrier` under another name: a symlink the install puts next to
+it, which runs the same file with codex as the default. Its command is
+`CR_CODEX_CMD`, or plain `codex` — never `CR_CLAUDE_CMD`, so a claude command in
+your rc file stays claude's. `--cmd` and `--agent` still work and still win.
+
+Both names are installed whichever agents you have. On a machine without codex
+all `codex-retrier` does is say so — which also means installing codex later
+needs nothing reinstalled. See [Install](../README.md#install).
+
+## Which agent: `--agent`
+
+The long way round is the same thing:
+
+```sh
+claude-retrier --cmd codex
+claude-retrier --agent codex --cmd 'codex --model gpt-5.6-sol'
+```
+
+`--agent` (or `CR_AGENT`) says which one you are running; the default, `auto`,
+works it out from the command, so `claude-retrier --cmd codex` needs nothing
+else. `--cr-agent` is the same flag under the prefix the other wrapper options
+carry. `claude` and `codex` are the only two values.
+
+## Rollouts: what the wrapper reads
+
+codex writes one JSONL "rollout" per thread under
+`$CODEX_HOME/sessions/<yyyy>/<mm>/<dd>/` (`CODEX_HOME` defaults to `~/.codex`),
+and it states outright several things Claude Code's transcript only implies:
+where a turn started and ended, the exact size of the context window
+(`model_context_window`), what the last request was sent with, and the reason a
+turn ended. So on codex the context window is read rather than guessed from a
+model name, and `CR_CONTEXT_WINDOW` is not needed.
+
+Every project's rollouts share one tree, and a codex subagent gets a rollout of
+its own. The wrapper reads only the rollout whose head says `thread_source:
+user` and whose `cwd` is the directory it is running in — reading a subagent's
+would report a limit this terminal never hit, and a context that is not ours to
+restart. When codex is given `--cd`, that directory is the one followed.
+
+## Subcommands
+
+Most of what codex can be asked to do is not a session at all. `codex exec`,
+`codex login`, `codex mcp` and the rest run untouched, the way `claude -p`
+already does; `codex resume` and `codex fork` are sessions, and are wrapped.
+
+## Context restart on codex
+
+The [context restart](context-restart.md) works on codex the same way it does
+on claude, with a threshold of its own:
+
+```sh
+CR_CODEX_CONTEXT_PCT=60 claude-retrier --cmd codex
+```
+
+`CR_CODEX_CONTEXT_PCT` defaults to `CR_CONTEXT_PCT`: a fraction of a window
+means the same thing whatever the window is, so one export covers both agents
+until you want them to differ. `CR_CODEX_CONTEXT_PCT=0` turns it off for codex
+alone.
+
+`CR_CODEX_CONTEXT_TOKENS` has no default and never borrows `CR_CONTEXT_TOKENS`.
+An absolute count is tied to a window — 500k picked for a 1M claude session is
+past the end of a 258k codex one — and it would overrule codex's percentage.
+
+### The percentage matches codex's status line
+
+The percentage is the one codex's status line shows — `Context 19% used`. codex
+leaves a fixed 12,000 tokens (the prompt a session carries before anyone speaks)
+out of both sides of that fraction, and the wrapper does the same, so 60% fires
+when the status line says 60%, not a few points earlier. Nothing is read off the
+screen: the window comes from the rollout, and the count from codex's own log
+(see [below](#staying-ahead-of-codexs-own-compaction)).
+
+## How it differs from claude underneath
+
+Two things differ from claude underneath. Claude Code writes a `stop_reason` into
+every answer and codex writes none, so "the folding turn finished" is read off
+the row that closes it: `task_complete` counts as a clean end, `turn_aborted`
+(somebody pressed Esc) does not. And "the session is mid-turn" is the span
+between `task_started` and that closing row, rather than the transcript going
+quiet for `CR_ROOT_IDLE_SEC` — a codex root waiting on its agents can write
+nothing for minutes while its turn is very much still running. `/clear` starts
+a new chat in codex too, and that chat's rollout is a new file, which is how the
+wrapper confirms the context really fell.
+
+That is also why, in the log, `restart step held: a turn is still running` can
+last as long as the turn does on codex, however quiet it is — that is a root
+waiting on its agents.
+
+A refused turn (`Selected model is at capacity`) on codex ends the whole turn
+and every agent with it; the wrapper [nudges it](stalls.md).
+
+## Staying ahead of codex's own compaction
+
+A restart that codex's own compaction beats to it is no restart at all — the
+history is already summarised away by the time the handoff is asked for. So when
+the context restart is on for codex, the wrapper makes sure it gets there first.
+
+### Where codex compacts
+
+Read from the codex-cli 0.154 source and checked against real sessions:
+
+- **The window is 272k, not 1M.** gpt-5.6-sol is capable of 1.05M through the
+  API, but codex uses `context_window: 272000` from its model list unless
+  `model_context_window` says otherwise (the most it accepts for sol is 872k).
+  95% of that is usable: the rollout's `model_context_window` is 258,400.
+- **It compacts at 90% of the raw window — 244,800 tokens** — or at the 258,400
+  hard cap, whichever comes first.
+- **It counts more than the rollout shows.** The number compared is the last
+  request's tokens plus an estimate of everything added since, reasoning
+  included: 251,023 in one session whose rollout said 232,673. That is why
+  sessions compact while the status line still says the mid 80s.
+- **It compacts in the middle of a turn**, after any model response that is
+  followed by a tool call. Waiting for a turn to end is not enough.
+- **Nothing is written before it starts.** The rollout's `compacted` row appears
+  once it is over.
+
+### What the wrapper does about it
+
+1. **Moves codex's threshold out of the way.** codex is started with
+   `-c model_auto_compact_token_limit_scope="body_after_prefix"
+   -c model_auto_compact_token_limit=1000000000`. Under the default scope a
+   configured limit is clamped to 90%; under this one it is not, which leaves
+   only the hard cap (258,400), a limit no setting moves. Your `config.toml` is
+   not touched. `CR_CODEX_HOLD_COMPACT=0` leaves codex's settings alone.
+2. **Reads the count codex decides on.** After every request codex writes
+   `post sampling token usage … total_usage_tokens=… full_context_window_limit=…`
+   into `$CODEX_HOME/logs_2.sqlite`. The wrapper follows those rows for its own
+   thread, read-only, so both the count and the cap are codex's figures, not an
+   estimate of them. Without the database it falls back on the rollout.
+3. **Keeps room for the fold.** The restart threshold is never allowed past the
+   cap minus `CR_CODEX_RESERVE_TOKENS` (32k): the folding turn adds its own reply
+   and a file write to a context that is already nearly full. A higher threshold
+   is lowered to that line, and the log says so.
+4. **Interrupts a turn that is about to be compacted.** If a turn is still
+   running when the count crosses that line, the wrapper presses Esc — codex
+   records `turn_aborted` — and folds the session up straight away. The handoff
+   phrase asks for what was in flight, so the interrupted work is written down
+   rather than lost. The usual gates apply: nothing is pressed while you are
+   typing. `CR_CODEX_INTERRUPT=0` turns this off, and the restart then only ever
+   happens between turns.
+
+Below the line, a running turn is left to finish and the restart waits for it.
+
+### If codex still gets there first
+
+The log says `codex compacted the thread on its own before the restart could`,
+with the count and the cap at the time, and any restart in flight is dropped
+(the context it was judging no longer exists). A larger `CR_CODEX_RESERVE_TOKENS`
+or a lower `CR_CODEX_CONTEXT_PCT` gives the next one more room.
+
+### Why not a PreCompact hook
+
+codex does run a `PreCompact` hook just before compacting, and it can say
+`continue: false`. But that aborts the turn rather than skipping the compaction,
+and the next turn — the one asking for the handoff — hits the same check before
+it starts, so the hook would refuse it too. It would also need to be trusted in
+`/hooks` before codex runs it at all.
+
+See also: [configuration](configuration.md#codex),
+[context restart](context-restart.md), [stalls](stalls.md).

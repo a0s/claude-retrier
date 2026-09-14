@@ -1,0 +1,132 @@
+# How it works
+
+Design notes: the pty, the two detection channels, the corner badge, the update
+check, requirements and tests.
+
+[← back to README](../README.md)
+
+- [One pty instead of tmux](#one-pty-instead-of-tmux)
+- [Transcripts and the screen](#transcripts-and-the-screen)
+- [Typing safely](#typing-safely)
+- [Getting out of the way](#getting-out-of-the-way)
+- [A sign of life](#a-sign-of-life)
+- [Updates](#updates)
+- [Requirements](#requirements)
+- [Tests](#tests)
+
+## One pty instead of tmux
+
+`claude-retrier.sh` runs your claude on a pty it owns, so it can read the output
+and write input at the same time. That single fact removes the need for tmux
+(`capture-pane` plus `send-keys`), a detached monitor process, event marker
+files, and a launchd or systemd reconciler.
+
+It passes everything else through: keys, colours, window resizes, exit codes,
+and any flag you would have handed to `claude`.
+
+## Transcripts and the screen
+
+It detects a limit on two channels. The first is the transcript: Claude Code
+writes `{"error":"rate_limit","isApiErrorMessage":true}` into
+`~/.claude/projects/<project>/<session>.jsonl`, and codex writes its own JSONL
+"rollout" under `$CODEX_HOME/sessions/<yyyy>/<mm>/<dd>/`, stating outright the
+reason a turn ended and the size of the context window. Either is structured,
+unambiguous, and the one the wrapper trusts. The second is the screen, matched
+against patterns, and it is only used when the transcript is unavailable.
+
+The full detail — `claude agents`, and how a screen-scheduled wait can be
+corrected — is in [usage-limits.md](usage-limits.md#how-a-limit-is-detected).
+Which codex rollout is followed is in
+[codex.md](codex.md#rollouts-what-the-wrapper-reads).
+
+## Typing safely
+
+Before typing anything it checks that Claude is not mid-turn and that you are
+not typing yourself. It can see your keystrokes, so an unsent draft in the
+prompt box is never overwritten.
+
+A wait also ends when the limit does. Log into another account with `/login`,
+upgrade the plan, or simply get your quota back early: nothing announces any of
+that, so the wrapper takes the session answering again as the answer.
+
+## Getting out of the way
+
+Nothing goes into your shell config, no background process outlives the session,
+and the only file it writes under your home directory is the log.
+
+No python3, a `claude -p` batch run, `CR_DISABLE=1`: any of those and it execs
+plain claude rather than becoming the reason your session will not start.
+
+## A sign of life
+
+A wrapper you cannot see is indistinguishable from a wrapper that died an hour
+ago. So there is one mark, dim, in a corner of the screen: `◆ cr` while it is
+watching, the time left while it is waiting out a limit, and `◆ cr held` when
+the reset has passed but you are still at the keyboard. With the
+[context restart](context-restart.md#what-you-will-see) on, it also shows the
+percentage (`◆ cr 47%`) as the session nears the threshold.
+
+<p align="center">
+  <img src="badge.svg" width="620"
+       alt="Two terminal frames: an idle session with a dim '◆ cr' in the bottom-right corner, and the same session after a limit, showing '◆ cr 1h59m'">
+</p>
+
+Nothing is reserved from Claude. The badge is painted over the finished frame in
+the gaps between repaints, with the cursor saved and restored around it and the
+last column left empty so it can never wrap the screen. Claude paints over it
+and it comes back a moment later: about forty bytes, a few times a second at
+most, and never a byte into the session itself.
+
+```sh
+CR_BADGE=0 claude-retrier                  # off
+CR_BADGE_POS=top-right claude-retrier      # any of the four corners
+CR_BADGE_LABEL=retrier claude-retrier      # your own word next to the mark
+```
+
+The picture above is not a mockup. `python3 docs/badge-shot.py` runs the real
+wrapper over a stand-in that prints one Claude-shaped frame, replays what the
+wrapper wrote through the terminal emulator the tests use, and renders the
+screen that came out.
+
+## Updates
+
+It checks once a day whether there is a newer release, and says so in two dim
+lines before the session starts:
+
+```
+[claude-retrier] claude-retrier 1.9.0 → 1.10.0 is out
+                 brew upgrade a0s/claude-retrier/claude-retrier
+```
+
+The command is the one that updates the copy you are running — `brew upgrade`
+from a cellar install, `git -C <clone> pull` from a clone, the releases page for
+a file you downloaded. Nothing waits on the network for it: the notice is read
+out of a cache the previous run wrote, and the check that refreshes it runs in
+the background after claude is already up, so the first run after installing
+says nothing at all.
+
+`CR_UPDATE_CHECK=0` never checks and never mentions it. The rest of the update
+settings are in [configuration.md](configuration.md#updates).
+
+## Requirements
+
+`bash` and `python3` (3.9 or newer, standard library only). If either is
+missing, or claude is invoked with `-p`, the wrapper execs claude unchanged. It
+never becomes the reason your session will not start.
+
+Windows is not supported (no pty).
+
+## Tests
+
+```sh
+./test/run.sh              # 429 tests: patterns, time parsing, transcript, model
+                           # windows, update checks, state machine, the badge, custom
+                           # commands, degradation, and end-to-end runs on a real pty
+                           # (rendered through a terminal emulator, so "what the user
+                           # sees" is asserted)
+./test/run.sh --docker     # the same suite on Linux, from anywhere with docker
+./test/run.sh test_time.py # just one file
+```
+
+Prior art: [claude-auto-retry](https://github.com/cheapestinference/claude-auto-retry),
+whose issue tracker supplied most of the edge cases tested here.
