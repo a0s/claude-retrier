@@ -274,11 +274,22 @@ CR_ROSTER_PATTERNS=(
 # a fresh one.
 #
 # OFF by default, and it has to be: this types into a live session and throws its
-# history away. Nothing below happens until CR_CONTEXT_PCT (or CR_CONTEXT_TOKENS)
-# is set to something other than 0.
-: "${CR_CONTEXT_PCT:=0}"               # restart at this % of the window; 0 = feature off
+# history away. Nothing below happens until CR_CONTEXT_PCT (or CR_CONTEXT_TOKENS,
+# or CR_CONTEXT_RESTART) is set.
+#
+# Left empty here rather than defaulted to 0: that default is DEFAULT_RESTART_PCT's
+# job (Python side, next to CFG), which needs to tell "never set" apart from "set
+# to 0 on purpose" to know whether CR_CONTEXT_RESTART gets a say. Resolving it to a
+# concrete "0" here, the way most other settings default themselves, would erase
+# that distinction before Python ever saw it.
+: "${CR_CONTEXT_PCT:=}"                # restart at this % of the window; 0 = feature off
 : "${CR_CONTEXT_TOKENS:=0}"            # absolute threshold; wins over the percentage
 : "${CR_CONTEXT_WINDOW:=auto}"         # auto | 200k | 1M | a plain number
+# Turns the restart on without asking you to pick a number first: unset,
+# CR_CONTEXT_PCT falls back to DEFAULT_RESTART_PCT (51) instead of 0. Set
+# CR_CONTEXT_PCT or CR_CONTEXT_TOKENS yourself — 0 included — and that still
+# wins outright, exactly as if this were never set.
+: "${CR_CONTEXT_RESTART:=0}"           # 1 = on, at DEFAULT_RESTART_PCT unless overridden
 # codex has thresholds of its own, because the same percentage does not mean the
 # same session on both: a different window, a different rate of growth, and codex
 # compacting on its own schedule. The percentage is read the way codex's status
@@ -724,6 +735,13 @@ def _env(name, default, cast=str):
         return default
 
 
+# No single number is "the" community consensus — recommendations run 40-70%,
+# with "around 60%" and "half the window" both common — but 51% is what this
+# project's own docs have suggested from the start and what every session in
+# its own logs has actually restarted at, so it is the one CR_CONTEXT_RESTART
+# reaches for rather than inventing a second number nobody has run yet.
+DEFAULT_RESTART_PCT = 51.0
+
 CFG = dict(
     agent=_env("CR_AGENT", "auto"),
     message=_env("CR_MESSAGE", "continue"),
@@ -752,7 +770,12 @@ CFG = dict(
     stall_max_wait=_env("CR_STALL_MAX_WAIT_SEC", 600.0, float),
     stall_max_attempts=_env("CR_STALL_MAX_ATTEMPTS", 8, int),
     # -- context restart --
-    context_pct=_env("CR_CONTEXT_PCT", 0.0, float),
+    # CR_CONTEXT_RESTART=1 turns the restart on at DEFAULT_RESTART_PCT without
+    # making you pick a number; CR_CONTEXT_PCT, set to anything (0 included),
+    # still wins outright, exactly as if CR_CONTEXT_RESTART did not exist.
+    context_pct=_env("CR_CONTEXT_PCT",
+                     DEFAULT_RESTART_PCT if _env("CR_CONTEXT_RESTART", "0") != "0" else 0.0,
+                     float),
     context_tokens=parse_tokens(os.environ.get("CR_CONTEXT_TOKENS")) or 0,
     context_window=_env("CR_CONTEXT_WINDOW", "auto"),
     # None means unset, which means "the same as claude's" (see `agent_cfg`).
@@ -1903,6 +1926,17 @@ def model_slug(model):
     slug = (model or "").strip().lower()
     slug = re.sub(r"\[[^\]]*\]$", "", slug)      # "claude-opus-5[1m]"
     return re.sub(r"-\d{8}$", "", slug)          # "claude-haiku-4-5-20251001"
+
+
+def model_env_slug(slug):
+    """A model slug in the shape an environment variable name can hold.
+
+    "gpt-5.6-sol" -> "GPT_5_6_SOL", "claude-opus-5" -> "CLAUDE_OPUS_5". Used to
+    build CR_CLAUDE_TOKENS_<X>/CR_CODEX_TOKENS_<X> — a per-model override in
+    absolute tokens, because once the model's own window is known a number is
+    unambiguous where a second percentage would only be one more conversion.
+    """
+    return re.sub(r"[^A-Za-z0-9]+", "_", slug).strip("_").upper()
 
 
 def model_window(model):
@@ -3167,9 +3201,27 @@ class Controller:
         self._resolve_window()
         return True
 
+    def _model_tokens_override(self):
+        """CR_CLAUDE_TOKENS_<SLUG>/CR_CODEX_TOKENS_<SLUG> for the current model.
+
+        The finest-grained knob there is: one specific model, one absolute
+        number, read fresh from the environment rather than carried in `cfg`,
+        because which model is on the other end of the session is not known
+        until its first turn — everything cfg holds is fixed before that.
+        """
+        slug = model_slug(self.context_model)
+        if not slug:
+            return None
+        name = "CR_%s_TOKENS_%s" % ("CODEX" if self.codex else "CLAUDE",
+                                    model_env_slug(slug))
+        return parse_tokens(os.environ.get(name))
+
     def _recompute_limit(self):
         base = self.context_baseline
-        if self.cfg["context_tokens"] > 0:
+        override = self._model_tokens_override()
+        if override:
+            self.context_limit = override
+        elif self.cfg["context_tokens"] > 0:
             self.context_limit = int(self.cfg["context_tokens"])
         elif self.cfg["context_pct"] > 0 and self.context_window and self.context_window > base:
             self.context_limit = int(base + (self.context_window - base)
@@ -4316,7 +4368,7 @@ export CR_BADGE CR_BADGE_POS CR_BADGE_LABEL
 export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC
 export CR_AGENT
 export CR_STALL_WAIT_SEC CR_STALL_BACKOFF CR_STALL_MAX_WAIT_SEC CR_STALL_MAX_ATTEMPTS
-export CR_CONTEXT_PCT CR_CONTEXT_TOKENS CR_CONTEXT_WINDOW
+export CR_CONTEXT_PCT CR_CONTEXT_TOKENS CR_CONTEXT_WINDOW CR_CONTEXT_RESTART
 export CR_CODEX_CONTEXT_PCT CR_CODEX_CONTEXT_TOKENS
 export CR_CODEX_HOLD_COMPACT CR_CODEX_RESERVE_TOKENS CR_CODEX_INTERRUPT CR_CODEX_LOGS_DB
 export CR_UPDATE_CHECK CR_UPDATE_REPO CR_UPDATE_URL CR_UPDATE_BREW_FORMULA

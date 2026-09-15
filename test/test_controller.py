@@ -9,6 +9,7 @@ and the "don't type over a half-written prompt" case, which the tmux design
 listed as unsolvable by scraping (DESIGN-NOTES §6) but is trivial here: we are
 the terminal, so we see the keystrokes.
 """
+import os
 import unittest
 
 from helper import load
@@ -1219,6 +1220,62 @@ class TestWhatCountsAsContext(RestartTestCase):
         self.assertEqual(ctl.context_tokens, 9000)
 
 
+class TestAPerModelTokenOverride(RestartTestCase):
+    """CR_CLAUDE_TOKENS_<SLUG>/CR_CODEX_TOKENS_<SLUG>: one specific model, one
+    absolute number, read live because the model is not known until its first
+    turn — everything else in `cfg` is fixed before that."""
+
+    ENV = "CR_CLAUDE_TOKENS_CLAUDE_OPUS_5"
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(os.environ.pop, self.ENV, None)
+
+    def test_it_wins_over_the_percentage(self):
+        os.environ[self.ENV] = "300000"
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 1000000)   # the window is untouched
+        self.assertEqual(ctl.context_limit, 300000)      # only the threshold moves
+
+    def test_it_wins_over_an_absolute_threshold_too(self):
+        os.environ[self.ENV] = "300000"
+        ctl = restart_controller(context_pct=0, context_tokens=999999)
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_limit, 300000)
+
+    def test_it_reaches_through_a_1m_suffix_and_a_dated_snapshot(self):
+        # model_slug() is what both sides key on: "claude-opus-5[1m]" and
+        # "claude-opus-5-20260101" are this override's model too.
+        os.environ[self.ENV] = "300000"
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-opus-5[1m]")
+        self.assertEqual(ctl.context_limit, 300000)
+
+    def test_it_only_applies_to_the_model_it_names(self):
+        os.environ[self.ENV] = "300000"
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-sonnet-5")
+        self.assertNotEqual(ctl.context_limit, 300000)
+        self.assertEqual(ctl.context_limit, 500000)
+
+    def test_a_codex_override_does_not_touch_claude(self):
+        os.environ["CR_CODEX_TOKENS_CLAUDE_OPUS_5"] = "300000"
+        self.addCleanup(os.environ.pop, "CR_CODEX_TOKENS_CLAUDE_OPUS_5", None)
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_limit, 500000)
+
+    def test_unset_falls_back_to_the_percentage(self):
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_limit, 500000)
+
+    def test_the_env_slug_matches_a_dotted_hyphenated_name(self):
+        self.assertEqual(cr.model_env_slug("gpt-5.6-sol"), "GPT_5_6_SOL")
+        self.assertEqual(cr.model_env_slug("claude-opus-5"), "CLAUDE_OPUS_5")
+
+
 class TestSettingsAsPeopleWriteThem(unittest.TestCase):
     """The thresholds are typed by hand into a shell, and a value that fails to
     parse falls back on the default — which for this feature is "off". Silently
@@ -1233,6 +1290,26 @@ class TestSettingsAsPeopleWriteThem(unittest.TestCase):
     def test_nonsense_is_not_a_threshold(self):
         from helper import load as reload_impl
         self.assertEqual(reload_impl(CR_CONTEXT_TOKENS="lots").CFG["context_tokens"], 0)
+
+    def test_context_restart_is_off_by_default(self):
+        from helper import load as reload_impl
+        self.assertEqual(reload_impl().CFG["context_pct"], 0.0)
+
+    def test_context_restart_flag_picks_the_default_percentage(self):
+        from helper import load as reload_impl
+        mod = reload_impl(CR_CONTEXT_RESTART="1")
+        self.assertEqual(mod.CFG["context_pct"], mod.DEFAULT_RESTART_PCT)
+        self.assertEqual(mod.DEFAULT_RESTART_PCT, 51.0)
+
+    def test_an_explicit_percentage_still_wins_over_the_flag(self):
+        from helper import load as reload_impl
+        mod = reload_impl(CR_CONTEXT_RESTART="1", CR_CONTEXT_PCT="30")
+        self.assertEqual(mod.CFG["context_pct"], 30.0)
+
+    def test_an_explicit_zero_still_turns_it_off_with_the_flag_set(self):
+        from helper import load as reload_impl
+        mod = reload_impl(CR_CONTEXT_RESTART="1", CR_CONTEXT_PCT="0")
+        self.assertEqual(mod.CFG["context_pct"], 0.0)
 
 
 class TestWhatTheCornerSays(RestartTestCase):

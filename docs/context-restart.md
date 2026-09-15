@@ -35,6 +35,14 @@ nothing below happens without it:
 CR_CONTEXT_PCT=51 claude-retrier          # restart at 51% of the context window
 ```
 
+`CR_CONTEXT_RESTART=1` is the same thing without having to pick a number: it
+turns the restart on at 51% (`DEFAULT_RESTART_PCT`, half the window and this
+project's own long-standing recommendation) unless `CR_CONTEXT_PCT` or
+`CR_CONTEXT_TOKENS` says otherwise. Either way arms both agents, exactly like
+setting `CR_CONTEXT_PCT` by hand does — see
+[codex](codex.md#context-restart-on-codex) for how codex's own threshold
+relates to it.
+
 Two more make it fit a project you actually work in:
 
 ```sh
@@ -173,6 +181,19 @@ work done. Watch the badge for a day and move it.
 
 `CR_CONTEXT_TOKENS` sets an absolute threshold instead (`500k` is fine), and it
 beats the percentage.
+
+One model behaving differently from the rest of its own fleet does not need a
+whole new threshold for everyone: `CR_CLAUDE_TOKENS_<SLUG>` and
+`CR_CODEX_TOKENS_<SLUG>` set an absolute threshold for one model by name —
+`<SLUG>` is that model's slug, uppercased, with anything that is not a letter
+or digit turned into `_` (`claude-opus-5` → `CLAUDE_OPUS_5`, `gpt-5.6-sol` →
+`GPT_5_6_SOL`). It outranks the percentage and `CR_CONTEXT_TOKENS` both, but
+only for that one model — every other model still reads off whichever of those
+two is set.
+
+```sh
+export CR_CLAUDE_TOKENS_CLAUDE_HAIKU_4_5=90000   # this one model folds sooner
+```
 
 ## The context window
 

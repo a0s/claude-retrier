@@ -543,6 +543,28 @@ class TestTheCodexThreshold(unittest.TestCase):
         feed(ctl, 2, window=WINDOW)
         self.assertEqual(ctl.context_window, WINDOW)
 
+    def test_a_per_model_override_reaches_a_dotted_codex_slug(self):
+        env = "CR_CODEX_TOKENS_GPT_5_6_SOL"
+        os.environ[env] = "140000"
+        self.addCleanup(os.environ.pop, env, None)
+        ctl = codex_controller(context_pct=50)
+        feed(ctl, 1, model="gpt-5.6-sol", window=WINDOW)
+        self.assertEqual(ctl.context_limit, 140000)
+
+    def test_a_claude_override_does_not_reach_codex(self):
+        env = "CR_CLAUDE_TOKENS_GPT_5_6_SOL"
+        os.environ[env] = "140000"
+        self.addCleanup(os.environ.pop, env, None)
+        ctl = codex_controller(context_pct=50)
+        feed(ctl, 1, model="gpt-5.6-sol", window=WINDOW)
+        self.assertNotEqual(ctl.context_limit, 140000)
+
+    def test_the_restart_flag_reaches_codex_through_the_shared_default(self):
+        from helper import load as reload_impl
+        mod = reload_impl(CR_CONTEXT_RESTART="1")
+        codex_cfg = mod.agent_cfg(mod.CFG, "codex")
+        self.assertEqual(codex_cfg["context_pct"], mod.DEFAULT_RESTART_PCT)
+
 
 class TestPerAgentMessages(unittest.TestCase):
     """A phrase that names a command cannot travel between agents — claude and
@@ -1124,6 +1146,29 @@ class TestCodexEndToEnd(PtyTestCase):
         self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
         self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
         self.assertIn("@supervisor continue from", s.buf)
+
+    def test_the_restart_flag_reaches_codex_through_bash_too(self):
+        # Same round trip as the claude version: CR_CONTEXT_RESTART has to
+        # survive bash's own `:=` defaults, not just agent_cfg()'s in-process
+        # fallback, and codex inherits it the same way it inherits the percentage.
+        s = self.session(env=self.restart_env(CR_CONTEXT_PCT="", CR_CONTEXT_RESTART="1"),
+                         cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertIn("restarting at 137k", self.logged())   # 51% of a 258.4k window
+        # Read it through to the end — see test_codex_has_a_threshold_of_its_own
+        # above for why: torn down mid-restart, the kernel can hold the killed
+        # process past what close() waits for.
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+
+    # A per-model override's own round trip through bash is covered by the
+    # claude version above (test_a_per_model_override_is_read_straight_from_the_
+    # environment in test_pty.py) — the mechanism is agent-agnostic. codex's own
+    # slug-matching is covered directly against the controller in
+    # TestTheCodexThreshold (test_a_per_model_override_reaches_a_dotted_codex_
+    # slug) — fake_codex.py's FAKE_USAGE shortcut writes token_count straight
+    # off, without ever running write_task_started(), so the fold here fires
+    # before any model name is on record and there is no clean way to exercise
+    # both at once on this harness.
 
     def test_and_it_can_be_off_while_claudes_is_on(self):
         s = self.session(env=self.restart_env(CR_CODEX_CONTEXT_PCT="0"), cwd=self.work)

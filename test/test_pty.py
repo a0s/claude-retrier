@@ -664,6 +664,25 @@ class TestContextRestart(PtyTestCase):
         self.assertNotIn("GOT:handoff", s.buf)
         self.assertNotIn("context restart armed", self.logged())
 
+    def test_the_restart_flag_turns_it_on_at_the_default_percentage(self):
+        # No CR_CONTEXT_PCT of its own — CR_CONTEXT_RESTART alone has to be
+        # enough, and has to survive the round trip through bash's own `:=`
+        # defaults (which is where an implementation reading only the Python
+        # side would quietly do nothing).
+        s = self.session(env=self.env(CR_CONTEXT_PCT="", CR_CONTEXT_RESTART="1"),
+                         cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertIn("restarting at 510k", self.logged())   # 51% of a 1M window
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+
+    def test_a_per_model_override_is_read_straight_from_the_environment(self):
+        s = self.session(env=self.env(CR_CONTEXT_PCT="", CR_CONTEXT_RESTART="1",
+                                      CR_CLAUDE_TOKENS_CLAUDE_OPUS_5="300000"),
+                         cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertIn("restarting at 300k", self.logged())
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

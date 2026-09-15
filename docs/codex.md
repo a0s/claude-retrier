@@ -80,11 +80,16 @@ CR_CODEX_CONTEXT_PCT=60 claude-retrier --cmd codex
 `CR_CODEX_CONTEXT_PCT` defaults to `CR_CONTEXT_PCT`: a fraction of a window
 means the same thing whatever the window is, so one export covers both agents
 until you want them to differ. `CR_CODEX_CONTEXT_PCT=0` turns it off for codex
-alone.
+alone. `CR_CONTEXT_RESTART=1` reaches codex the same way, at the same 51%
+default, when neither percentage is set by hand — see
+[context-restart.md](context-restart.md#turning-it-on).
 
 `CR_CODEX_CONTEXT_TOKENS` has no default and never borrows `CR_CONTEXT_TOKENS`.
 An absolute count is tied to a window — 500k picked for a 1M claude session is
 past the end of a 258k codex one — and it would overrule codex's percentage.
+`CR_CODEX_TOKENS_<SLUG>` sits above both: an absolute threshold for one codex
+model by name (`gpt-5.6-sol` → `CR_CODEX_TOKENS_GPT_5_6_SOL`), useful once more
+than one codex model is in play and they do not compact at the same point.
 
 ### The percentage matches codex's status line
 

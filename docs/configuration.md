@@ -60,13 +60,15 @@ More in [stalls.md](stalls.md).
 ## Context restart
 
 More in [context-restart.md](context-restart.md). All of these do nothing until
-`CR_CONTEXT_PCT` is set.
+`CR_CONTEXT_PCT`, `CR_CONTEXT_TOKENS` or `CR_CONTEXT_RESTART` is set.
 
 | variable | default | |
 |---|---|---|
+| `CR_CONTEXT_RESTART` | `0` | `1` turns the restart on at `CR_CONTEXT_PCT`'s own default (51%) without making you pick a number; an explicit `CR_CONTEXT_PCT`/`CR_CONTEXT_TOKENS` — `0` included — still wins outright |
 | `CR_CONTEXT_PCT` | `0` | restart at this % of the window; `0` is off |
 | `CR_CONTEXT_TOKENS` | `0` | absolute threshold (`500k` is fine); beats the % |
 | `CR_CONTEXT_WINDOW` | `auto` | `auto` \| `200k` \| `1M` \| a number |
+| `CR_CLAUDE_TOKENS_<SLUG>`, `CR_CODEX_TOKENS_<SLUG>` | unset | absolute threshold for one model by name, e.g. `CR_CLAUDE_TOKENS_CLAUDE_OPUS_5=510000` or `CR_CODEX_TOKENS_GPT_5_6_SOL=140000` (`<SLUG>` = the model slug, uppercased, non-alphanumerics turned to `_`) — outranks everything above, for that model only |
 | `CR_MODEL_LOOKUP` | `1` | look an unfamiliar model up; `0` never touches the network |
 | `CR_MODEL_CACHE` | `~/.claude-retrier/windows.json` | what the lookup learned |
 | `CR_MODEL_CACHE_TTL_SEC` | `604800` | a week |
