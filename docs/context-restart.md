@@ -37,11 +37,12 @@ CR_CONTEXT_PCT=51 claude-retrier          # restart at 51% of the context window
 
 `CR_CONTEXT_RESTART=1` is the same thing without having to pick a number: it
 turns the restart on at 51% (`DEFAULT_RESTART_PCT`, half the window and this
-project's own long-standing recommendation) unless `CR_CONTEXT_PCT` or
-`CR_CONTEXT_TOKENS` says otherwise. Either way arms both agents, exactly like
-setting `CR_CONTEXT_PCT` by hand does — see
-[codex](codex.md#context-restart-on-codex) for how codex's own threshold
-relates to it.
+project's own long-standing recommendation) for claude, unless `CR_CONTEXT_PCT`
+or `CR_CONTEXT_TOKENS` says otherwise. Codex does **not** inherit that 51% —
+its own hard cap and reserve already give it a number of its own, tuned for
+that cap rather than borrowed from claude's window; see
+[codex](codex.md#context-restart-on-codex) for what actually decides codex's
+threshold under this flag.
 
 Two more make it fit a project you actually work in:
 

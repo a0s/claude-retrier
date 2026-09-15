@@ -737,10 +737,28 @@ def _env(name, default, cast=str):
 
 # No single number is "the" community consensus — recommendations run 40-70%,
 # with "around 60%" and "half the window" both common — but 51% is what this
-# project's own docs have suggested from the start and what every session in
-# its own logs has actually restarted at, so it is the one CR_CONTEXT_RESTART
-# reaches for rather than inventing a second number nobody has run yet.
+# project's own docs have suggested from the start and what every claude
+# session in its own logs has actually restarted at, so it is the one
+# CR_CONTEXT_RESTART reaches for rather than inventing a second number nobody
+# has run yet.
 DEFAULT_RESTART_PCT = 51.0
+
+# codex's OWN number, not claude's borrowed one: a flat fraction-of-window means
+# nothing on codex, which restarts against a hard cap under CR_CODEX_RESERVE_TOKENS
+# tuned specifically for this, not against "half the window". 90% mirrors codex's
+# own documented soft-compaction point (see docs/codex.md) purely as a ceiling that
+# never binds ahead of the reserve — trigger_limit() already takes the smaller of
+# the two, so as long as this stays comfortably above cap - CR_CODEX_RESERVE_TOKENS
+# the reserve is what actually decides, and this only matters as a fallback for
+# the rare case codex's own count cannot be read at all.
+DEFAULT_CODEX_RESTART_PCT = 90.0
+
+# CR_CONTEXT_PCT stays empty by default (see its declaration above) precisely so
+# this can tell "the user typed a number" apart from "nothing was ever set" —
+# collapsing both into a concrete 0 here would erase that distinction before
+# either CR_CONTEXT_RESTART's default or codex's own default could apply.
+_CONTEXT_PCT_SET = os.environ.get("CR_CONTEXT_PCT") not in (None, "")
+_CONTEXT_RESTART_ON = _env("CR_CONTEXT_RESTART", "0") != "0"
 
 CFG = dict(
     agent=_env("CR_AGENT", "auto"),
@@ -774,12 +792,19 @@ CFG = dict(
     # making you pick a number; CR_CONTEXT_PCT, set to anything (0 included),
     # still wins outright, exactly as if CR_CONTEXT_RESTART did not exist.
     context_pct=_env("CR_CONTEXT_PCT",
-                     DEFAULT_RESTART_PCT if _env("CR_CONTEXT_RESTART", "0") != "0" else 0.0,
+                     DEFAULT_RESTART_PCT if _CONTEXT_RESTART_ON else 0.0,
                      float),
     context_tokens=parse_tokens(os.environ.get("CR_CONTEXT_TOKENS")) or 0,
     context_window=_env("CR_CONTEXT_WINDOW", "auto"),
-    # None means unset, which means "the same as claude's" (see `agent_cfg`).
-    codex_context_pct=_env("CR_CODEX_CONTEXT_PCT", None, float),
+    # None means unset, which means "the same as claude's" (see `agent_cfg`) —
+    # exactly what you get from an explicit CR_CONTEXT_PCT, because a number you
+    # typed yourself is meant for both agents until told otherwise. Only when
+    # CR_CONTEXT_RESTART is the one supplying the default does codex get its own
+    # DEFAULT_CODEX_RESTART_PCT instead of inheriting claude's.
+    codex_context_pct=_env("CR_CODEX_CONTEXT_PCT",
+                           None if (_CONTEXT_PCT_SET or not _CONTEXT_RESTART_ON)
+                           else DEFAULT_CODEX_RESTART_PCT,
+                           float),
     codex_context_tokens=(None if not os.environ.get("CR_CODEX_CONTEXT_TOKENS")
                           else parse_tokens(os.environ["CR_CODEX_CONTEXT_TOKENS"]) or 0),
     codex_hold_compact=_env("CR_CODEX_HOLD_COMPACT", "1") != "0",

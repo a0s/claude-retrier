@@ -77,11 +77,25 @@ on claude, with a threshold of its own:
 CR_CODEX_CONTEXT_PCT=60 claude-retrier --cmd codex
 ```
 
-`CR_CODEX_CONTEXT_PCT` defaults to `CR_CONTEXT_PCT`: a fraction of a window
-means the same thing whatever the window is, so one export covers both agents
-until you want them to differ. `CR_CODEX_CONTEXT_PCT=0` turns it off for codex
-alone. `CR_CONTEXT_RESTART=1` reaches codex the same way, at the same 51%
-default, when neither percentage is set by hand — see
+`CR_CODEX_CONTEXT_PCT` defaults to `CR_CONTEXT_PCT`: type an explicit
+percentage and it covers both agents, exactly as if you had set
+`CR_CODEX_CONTEXT_PCT` to the same number yourself — a fraction of a window
+means the same thing whatever the window is. `CR_CODEX_CONTEXT_PCT=0` turns it
+off for codex alone.
+
+`CR_CONTEXT_RESTART=1` does **not** hand codex that same borrowed percentage,
+though. Codex restarts against a hard cap under `CR_CODEX_RESERVE_TOKENS` — a
+number already tuned for exactly that cap — not against a fraction of its own
+window the way claude does, so a flat 51% would mean something different, and
+arguably worse, for codex than it does for claude. Under the flag, with no
+percentage set by hand, codex's `context_pct` defaults instead to
+`DEFAULT_CODEX_RESTART_PCT` (90%, codex's own documented soft-compaction point
+— see [below](#where-codex-compacts)), and that number is meant to sit far
+enough above `cap - CR_CODEX_RESERVE_TOKENS` that `trigger_limit()`'s `min()`
+of the two always picks the reserve line: the log says `... threshold is past
+the point codex would compact first; using X instead` when that happens, which
+under normal operation is always. The 90% only actually decides anything if
+codex's own count cannot be read at all (no `logs_*.sqlite` reachable) — see
 [context-restart.md](context-restart.md#turning-it-on).
 
 `CR_CODEX_CONTEXT_TOKENS` has no default and never borrows `CR_CONTEXT_TOKENS`.

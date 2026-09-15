@@ -559,11 +559,30 @@ class TestTheCodexThreshold(unittest.TestCase):
         feed(ctl, 1, model="gpt-5.6-sol", window=WINDOW)
         self.assertNotEqual(ctl.context_limit, 140000)
 
-    def test_the_restart_flag_reaches_codex_through_the_shared_default(self):
+    def test_the_restart_flag_reaches_codex_with_its_own_default(self):
+        # Not claude's 51%: codex restarts against a hard cap under a reserve
+        # tuned for that, not against a flat fraction of its own window.
         from helper import load as reload_impl
         mod = reload_impl(CR_CONTEXT_RESTART="1")
+        claude_cfg = mod.agent_cfg(mod.CFG, "claude")
         codex_cfg = mod.agent_cfg(mod.CFG, "codex")
-        self.assertEqual(codex_cfg["context_pct"], mod.DEFAULT_RESTART_PCT)
+        self.assertEqual(claude_cfg["context_pct"], mod.DEFAULT_RESTART_PCT)
+        self.assertEqual(codex_cfg["context_pct"], mod.DEFAULT_CODEX_RESTART_PCT)
+        self.assertNotEqual(mod.DEFAULT_CODEX_RESTART_PCT, mod.DEFAULT_RESTART_PCT)
+
+    def test_an_explicit_shared_percentage_still_covers_both_agents(self):
+        # CR_CONTEXT_RESTART only gets a say when nobody picked a number. Type
+        # one yourself and "one export covers both agents" still holds.
+        from helper import load as reload_impl
+        mod = reload_impl(CR_CONTEXT_RESTART="1", CR_CONTEXT_PCT="51")
+        codex_cfg = mod.agent_cfg(mod.CFG, "codex")
+        self.assertEqual(codex_cfg["context_pct"], 51.0)
+
+    def test_an_explicit_codex_percentage_still_wins(self):
+        from helper import load as reload_impl
+        mod = reload_impl(CR_CONTEXT_RESTART="1", CR_CODEX_CONTEXT_PCT="60")
+        codex_cfg = mod.agent_cfg(mod.CFG, "codex")
+        self.assertEqual(codex_cfg["context_pct"], 60.0)
 
 
 class TestPerAgentMessages(unittest.TestCase):
@@ -1150,11 +1169,16 @@ class TestCodexEndToEnd(PtyTestCase):
     def test_the_restart_flag_reaches_codex_through_bash_too(self):
         # Same round trip as the claude version: CR_CONTEXT_RESTART has to
         # survive bash's own `:=` defaults, not just agent_cfg()'s in-process
-        # fallback, and codex inherits it the same way it inherits the percentage.
-        s = self.session(env=self.restart_env(CR_CONTEXT_PCT="", CR_CONTEXT_RESTART="1"),
+        # fallback. Codex does NOT inherit claude's 51% here, though — with its
+        # own count readable (FAKE_LOG), the reserve/cap mechanism is what
+        # actually decides, and DEFAULT_CODEX_RESTART_PCT (90%) sits far enough
+        # above it to never bind.
+        s = self.session(env=self.restart_env(CR_CONTEXT_PCT="", CR_CONTEXT_RESTART="1",
+                                              FAKE_LOG="1"),
                          cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
-        self.assertIn("restarting at 137k", self.logged())   # 51% of a 258.4k window
+        self.assertIn("restarting at 194k", self.logged())   # cap(258k) - reserve(64k)
+        self.assertIn("using 194k instead", self.logged())   # not the 90% fallback (233k)
         # Read it through to the end — see test_codex_has_a_threshold_of_its_own
         # above for why: torn down mid-restart, the kernel can hold the killed
         # process past what close() waits for.
