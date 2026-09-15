@@ -2973,9 +2973,24 @@ class Controller:
         # Whatever this thread's count was, it is gone, and a restart in flight is
         # judging a context that no longer exists.
         self.context_tokens = None
-        if self.rstate is not None:
-            self._abort_restart("codex compacted the thread itself during %s" % self.rstate,
-                                now)
+        if self.rstate is None:
+            return
+        if self.rstate in (HANDOFF_SENT, HANDOFF_OK) and self._handoff_fault(
+                self.probe(self.handoff_path)) is None:
+            # codex reached its own cap before the wrapper's /clear did, but the
+            # handoff it was racing had already landed — the file passes every
+            # layer `_check_handoff` would have accepted. codex did the clearing
+            # for us; sending `/clear` again would only retype into a context
+            # that is already gone, so what is missing is the unfold, not
+            # another restart from scratch.
+            self.log("the handoff had already landed when codex compacted; "
+                     "skipping straight to unfold instead of aborting")
+            self.rstate = CLEARED
+            self.restart_left = self.cfg["handoff_timeout"]
+            self.rwake = now
+            return
+        self._abort_restart("codex compacted the thread itself during %s" % self.rstate,
+                            now)
 
     def _maybe_interrupt(self, now):
         """Stop a running codex turn that is about to be compacted, or None."""

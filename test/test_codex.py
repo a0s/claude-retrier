@@ -761,6 +761,31 @@ class TestStayingAheadOfCodex(unittest.TestCase):
         self.assertEqual(ctl.self_compactions, 1)
         self.assertIn("compacted the thread on its own", " ".join(ctl.log_lines))
 
+    def test_codex_getting_there_first_does_not_lose_a_landed_handoff(self):
+        ctl = self.ctl()
+        logged_usage(ctl, 1, 230000)
+        ctl.tick(30)
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        ctl.handoff.write(ctl, 35)               # the file is already valid...
+        feed(ctl, 36, turn="closed", stop_reason="end_turn")
+        feed(ctl, 40, compacted=True)            # ...when codex compacts first
+        self.assertEqual(ctl.rstate, cr.CLEARED)
+        self.assertEqual(ctl.self_compactions, 1)
+        self.assertIn("skipping straight to unfold", " ".join(ctl.log_lines))
+        action = ctl.tick(65)                    # past root_idle, session quiet
+        self.assertEqual(action[0], "inject")
+        self.assertEqual(ctl.rstate, cr.RESUME_SENT)
+
+    def test_codex_getting_there_first_with_no_handoff_still_aborts(self):
+        ctl = self.ctl()
+        logged_usage(ctl, 1, 230000)
+        ctl.tick(30)
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        feed(ctl, 40, compacted=True)            # no file was ever written
+        self.assertIsNone(ctl.rstate)
+        self.assertEqual(ctl.self_compactions, 1)
+        self.assertIn("compacted the thread on its own", " ".join(ctl.log_lines))
+
     def test_without_the_log_the_rollout_still_counts(self):
         ctl = self.ctl()
         feed(ctl, 1, tokens=200000)
