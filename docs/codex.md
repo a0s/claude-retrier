@@ -153,9 +153,11 @@ Read from the codex-cli 0.154 source and checked against real sessions:
    thread, read-only, so both the count and the cap are codex's figures, not an
    estimate of them. Without the database it falls back on the rollout.
 3. **Keeps room for the fold.** The restart threshold is never allowed past the
-   cap minus `CR_CODEX_RESERVE_TOKENS` (32k): the folding turn adds its own reply
-   and a file write to a context that is already nearly full. A higher threshold
-   is lowered to that line, and the log says so.
+   cap minus `CR_CODEX_RESERVE_TOKENS` (64k): the folding turn adds its own reply
+   and a file write to a context that is already nearly full, and a heavy one —
+   reading files, running shell commands before it writes — can burn most of a
+   smaller reserve on its own. A higher threshold is lowered to that line, and
+   the log says so.
 4. **Interrupts a turn that is about to be compacted.** If a turn is still
    running when the count crosses that line, the wrapper presses Esc — codex
    records `turn_aborted` — and folds the session up straight away. The handoff
@@ -169,9 +171,13 @@ Below the line, a running turn is left to finish and the restart waits for it.
 ### If codex still gets there first
 
 The log says `codex compacted the thread on its own before the restart could`,
-with the count and the cap at the time, and any restart in flight is dropped
-(the context it was judging no longer exists). A larger `CR_CODEX_RESERVE_TOKENS`
-or a lower `CR_CODEX_CONTEXT_PCT` gives the next one more room.
+with the count and the cap at the time (the context it was judging no longer
+exists either way). If the handoff it was racing had not yet landed, the
+restart is dropped and the session falls back on codex's own compaction. If it
+had — the file already passes every check `/clear` would have waited for — the
+wrapper skips straight to sending the resume phrase instead of aborting, since
+codex already did the clearing for it. A larger `CR_CODEX_RESERVE_TOKENS` or a
+lower `CR_CODEX_CONTEXT_PCT` gives the next one more room either way.
 
 ### Why not a PreCompact hook
 

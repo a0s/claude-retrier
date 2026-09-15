@@ -153,6 +153,16 @@ is the only thing standing between a half-written note and a cleared session.
 A slash command works as a resume phrase. It goes out with the extra care
 described under [`CR_SLASH_ENTER`](#slash-commands-and-cr_slash_enter) below.
 
+A command is not portable between agents, though — `/my-skill` above is a
+Claude Code skill, and codex has never heard of it. Running both agents in the
+same project with `CR_HANDOFF_FILE` shared (it can be — it is just a path) and
+a command in `CR_HANDOFF_MSG` or `CR_RESUME_MSG` needs
+`CR_CLAUDE_HANDOFF_MSG`/`CR_CODEX_HANDOFF_MSG` and
+`CR_CLAUDE_RESUME_MSG`/`CR_CODEX_RESUME_MSG` instead: set for one agent only,
+each overrides the shared phrase for that agent alone, and the other keeps
+using it unchanged. `CR_CLAUDE_CLEAR_CMD`/`CR_CODEX_CLEAR_CMD` exist for the
+same reason, though `/clear` itself works on both.
+
 ## Choosing a threshold
 
 Half the window is a good place to start for a threshold. It leaves the folding

@@ -74,6 +74,9 @@ More in [context-restart.md](context-restart.md). All of these do nothing until
 | `CR_HANDOFF_MSG` | (see `--cr-help`) | the folding phrase; `{file}`, `{marker}` |
 | `CR_RESUME_MSG` | ``Read `{file}` and continue from it.`` | the unfolding phrase |
 | `CR_CLEAR_CMD` | `/clear` | |
+| `CR_CLAUDE_HANDOFF_MSG`, `CR_CODEX_HANDOFF_MSG` | unset = `CR_HANDOFF_MSG` | override for one agent only — a phrase that names a command (a skill, a custom prompt) cannot be shared, because claude and codex do not recognize the same ones |
+| `CR_CLAUDE_RESUME_MSG`, `CR_CODEX_RESUME_MSG` | unset = `CR_RESUME_MSG` | same, for the unfolding phrase |
+| `CR_CLAUDE_CLEAR_CMD`, `CR_CODEX_CLEAR_CMD` | unset = `CR_CLEAR_CMD` | same, for the clear command |
 | `CR_HANDOFF_MARKER` | `HANDOFF` | prefix; a nonce is appended to it |
 | `CR_HANDOFF_MIN_BYTES` | `200` | a shorter file is not a handoff |
 | `CR_HANDOFF_ATTEMPTS` | `2` | folds attempted before giving up |
@@ -94,7 +97,7 @@ context-restart settings above apply to codex too.
 | `CR_CODEX_CONTEXT_PCT` | `CR_CONTEXT_PCT` | the same, for codex, as its status line counts it |
 | `CR_CODEX_CONTEXT_TOKENS` | `0` | absolute threshold for codex; never taken from claude |
 | `CR_CODEX_HOLD_COMPACT` | `1` | start codex with its own compaction threshold moved out of the restart's way; `0` leaves it alone |
-| `CR_CODEX_RESERVE_TOKENS` | `32k` | room kept under codex's compaction cap for the fold; the threshold never goes past it |
+| `CR_CODEX_RESERVE_TOKENS` | `64k` | room kept under codex's compaction cap for the fold; the threshold never goes past it |
 | `CR_CODEX_INTERRUPT` | `1` | press Esc on a running turn that crosses that line; `0` = only restart between turns |
 | `CR_CODEX_LOGS_DB` | newest `$CODEX_HOME/logs_*.sqlite` | where codex logs the count its compaction is decided on |
 

@@ -544,6 +544,52 @@ class TestTheCodexThreshold(unittest.TestCase):
         self.assertEqual(ctl.context_window, WINDOW)
 
 
+class TestPerAgentMessages(unittest.TestCase):
+    """A phrase that names a command cannot travel between agents — claude and
+    codex do not recognize the same ones. CR_CLAUDE_<X>/CR_CODEX_<X>, unset by
+    default, override CR_<X> for one agent only."""
+
+    def test_unset_both_agents_keep_the_shared_phrase(self):
+        mod = load(CR_RESUME_MSG="Read `{file}` and continue.")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "codex")["resume_msg"],
+                         "Read `{file}` and continue.")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "claude")["resume_msg"],
+                         "Read `{file}` and continue.")
+
+    def test_codex_override_does_not_touch_claude(self):
+        mod = load(CR_RESUME_MSG="Read `{file}` and continue.",
+                  CR_CODEX_RESUME_MSG="@supervisor continue from `{file}`")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "codex")["resume_msg"],
+                         "@supervisor continue from `{file}`")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "claude")["resume_msg"],
+                         "Read `{file}` and continue.")
+
+    def test_claude_override_does_not_touch_codex(self):
+        mod = load(CR_RESUME_MSG="Read `{file}` and continue.",
+                  CR_CLAUDE_RESUME_MSG="/supervisor continue from `{file}`")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "claude")["resume_msg"],
+                         "/supervisor continue from `{file}`")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "codex")["resume_msg"],
+                         "Read `{file}` and continue.")
+
+    def test_handoff_msg_and_clear_cmd_follow_the_same_rule(self):
+        mod = load(CR_CODEX_HANDOFF_MSG="fold it, codex-style: {file} / {marker}",
+                  CR_CLAUDE_CLEAR_CMD="/clear-please")
+        codex_cfg = mod.agent_cfg(mod.CFG, "codex")
+        claude_cfg = mod.agent_cfg(mod.CFG, "claude")
+        self.assertEqual(codex_cfg["handoff_msg"], "fold it, codex-style: {file} / {marker}")
+        self.assertEqual(claude_cfg["handoff_msg"], mod.CFG["handoff_msg"])
+        self.assertEqual(claude_cfg["clear_cmd"], "/clear-please")
+        self.assertEqual(codex_cfg["clear_cmd"], mod.CFG["clear_cmd"])
+
+    def test_an_empty_override_is_the_same_as_unset(self):
+        # The shell's ${VAR:=default} treats an explicitly empty value as unset
+        # too, so an override left blank in an rc file must read the same way.
+        mod = load(CR_RESUME_MSG="Read `{file}` and continue.", CR_CODEX_RESUME_MSG="")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "codex")["resume_msg"],
+                         "Read `{file}` and continue.")
+
+
 class TestACodexRestart(unittest.TestCase):
     """The machine itself is shared with claude. What differs is where its facts
     come from, and the one that was missing was how the folding turn ended."""
@@ -1065,6 +1111,19 @@ class TestCodexEndToEnd(PtyTestCase):
         # process that exits that way until the terminal drains (see
         # Session.wait) — longer than close() waits for it.
         self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+
+    def test_codex_resume_msg_can_be_overridden_for_codex_alone(self):
+        # The env var has to survive the round trip through the bash wrapper —
+        # declared, exported, and read back out of os.environ by the python it
+        # hands the pty to — not just be understood by agent_cfg() in isolation.
+        s = self.session(env=self.restart_env(
+            CR_CODEX_RESUME_MSG="@supervisor continue from `{file}`",
+            FAKE_RESUME_MATCH="continue from `"),
+            cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+        self.assertIn("@supervisor continue from", s.buf)
 
     def test_and_it_can_be_off_while_claudes_is_on(self):
         s = self.session(env=self.restart_env(CR_CODEX_CONTEXT_PCT="0"), cwd=self.work)

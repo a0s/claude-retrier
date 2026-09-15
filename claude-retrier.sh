@@ -304,7 +304,11 @@ CR_ROSTER_PATTERNS=(
 #   - a turn still running when the count gets within CR_CODEX_RESERVE_TOKENS of
 #     the cap is interrupted (Esc), so the fold has room to happen in.
 : "${CR_CODEX_HOLD_COMPACT:=1}"         # 0 = leave codex's compaction settings alone
-: "${CR_CODEX_RESERVE_TOKENS:=32k}"     # room kept under codex's cap for the fold
+# 32k was measured against a light fold; a heavy one (a handoff message that
+# has the model read files or run shell commands before it writes) can burn
+# close to that on its own, leaving the interrupt no room to land ahead of the
+# hard cap. 64k is the reserve a fold like that needs to land in.
+: "${CR_CODEX_RESERVE_TOKENS:=64k}"     # room kept under codex's cap for the fold
 : "${CR_CODEX_INTERRUPT:=1}"            # 0 = never interrupt a running turn
 : "${CR_CODEX_LOGS_DB:=}"               # default: the newest $CODEX_HOME/logs_*.sqlite
 # A model this file has never heard of has no window, and a guessed one is worse
@@ -345,6 +349,16 @@ CR_HANDOFF_MSG_DEFAULT='Wrap up now. Do not start new work. Write a complete han
 : "${CR_CLEAR_CMD:=/clear}"            # the built-in that starts a new session in place
 CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
 : "${CR_RESUME_MSG:=$CR_RESUME_MSG_DEFAULT}"
+# claude and codex do not speak the same commands, so a phrase that names one —
+# a slash command, a skill, a custom prompt — cannot be shared between them.
+# CR_CLAUDE_<X>/CR_CODEX_<X> override CR_<X> for one agent only; unset (the
+# default), the agent uses the plain phrase above, exactly as before.
+: "${CR_CLAUDE_HANDOFF_MSG:=}"
+: "${CR_CODEX_HANDOFF_MSG:=}"
+: "${CR_CLAUDE_CLEAR_CMD:=}"
+: "${CR_CODEX_CLEAR_CMD:=}"
+: "${CR_CLAUDE_RESUME_MSG:=}"
+: "${CR_CODEX_RESUME_MSG:=}"
 : "${CR_ROOT_IDLE_SEC:=20}"            # transcript quiet this long => the turn is over
 : "${CR_HANDOFF_TIMEOUT_SEC:=900}"     # per restart step, and frozen while a limit runs
 : "${CR_STEP_GAP_SEC:=3}"              # between /clear and the resume phrase
@@ -746,7 +760,7 @@ CFG = dict(
     codex_context_tokens=(None if not os.environ.get("CR_CODEX_CONTEXT_TOKENS")
                           else parse_tokens(os.environ["CR_CODEX_CONTEXT_TOKENS"]) or 0),
     codex_hold_compact=_env("CR_CODEX_HOLD_COMPACT", "1") != "0",
-    codex_reserve=parse_tokens(os.environ.get("CR_CODEX_RESERVE_TOKENS") or "32k") or 0,
+    codex_reserve=parse_tokens(os.environ.get("CR_CODEX_RESERVE_TOKENS") or "64k") or 0,
     codex_interrupt=_env("CR_CODEX_INTERRUPT", "1") != "0",
     codex_logs_db=_env("CR_CODEX_LOGS_DB", ""),
     handoff_file=_env("CR_HANDOFF_FILE", ".claude-retrier/handoff.md"),
@@ -1828,6 +1842,14 @@ BIG_WINDOW = 1000000
 CODEX_BASELINE_TOKENS = 12000
 
 
+# A phrase that names a command cannot travel between agents — claude and codex
+# do not recognize the same ones. CR_CLAUDE_<X>/CR_CODEX_<X>, unset by default,
+# override CR_<X> for one agent only; unset, the agent keeps the shared phrase.
+AGENT_MESSAGE_KEYS = (("handoff_msg", "HANDOFF_MSG"),
+                      ("clear_cmd", "CLEAR_CMD"),
+                      ("resume_msg", "RESUME_MSG"))
+
+
 def agent_cfg(cfg, agent):
     """The config a controller for this agent runs with.
 
@@ -1837,6 +1859,10 @@ def agent_cfg(cfg, agent):
     percentage besides — so claude's is never carried over.
     """
     cfg = dict(cfg, agent=agent)
+    for key, env_suffix in AGENT_MESSAGE_KEYS:
+        override = os.environ.get("CR_%s_%s" % (agent.upper(), env_suffix))
+        if override:
+            cfg[key] = override
     if agent != "codex":
         return cfg
     pct, tokens = cfg.get("codex_context_pct"), cfg.get("codex_context_tokens")
@@ -4300,6 +4326,9 @@ export CR_MODEL_LOOKUP CR_MODEL_LOOKUP_TIMEOUT_SEC CR_MODEL_CACHE
 export CR_MODEL_CACHE_TTL_SEC CR_MODELS_DOC_URL CR_MODELS_API_URL
 export CR_HANDOFF_FILE CR_HANDOFF_MARKER CR_HANDOFF_MIN_BYTES CR_HANDOFF_ATTEMPTS
 export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG
+export CR_CLAUDE_HANDOFF_MSG CR_CODEX_HANDOFF_MSG
+export CR_CLAUDE_CLEAR_CMD CR_CODEX_CLEAR_CMD
+export CR_CLAUDE_RESUME_MSG CR_CODEX_RESUME_MSG
 export CR_ROOT_IDLE_SEC CR_HANDOFF_TIMEOUT_SEC CR_STEP_GAP_SEC
 export CR_CONTEXT_COOLDOWN_SEC CR_CONTEXT_MAX_CYCLES
 export CR_SLASH_GAP_SEC CR_SLASH_ENTER CR_SLASH_ENTER_GAP_SEC
