@@ -3798,8 +3798,14 @@ def get_winsize(fd):
 
 
 class Logger:
-    def __init__(self, path):
+    """Writes to the one log file every wrapper on the machine shares.
+
+    `tag` names which process wrote a line — without it, two sessions in the
+    same project interleave into an unreadable log (T01).
+    """
+    def __init__(self, path, tag=""):
         self.path = path
+        self.tag = tag
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             self.fh = open(path, "a", buffering=1)
@@ -3807,7 +3813,9 @@ class Logger:
             self.fh = None
 
     def __call__(self, msg):
-        line = "[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = "[%s] [%s] %s" % (stamp, self.tag, msg) if self.tag \
+            else "[%s] %s" % (stamp, msg)
         if self.fh:
             try:
                 self.fh.write(line + "\n")
@@ -3865,9 +3873,11 @@ def main(argv):
 
     launch = launch_vector()
     claude = launch[0]
-    log = Logger(CFG["log"])
     agent_name = pick_agent(CFG["agent"], launch)
-    log("start: %s %s (agent: %s)" % (" ".join(launch), " ".join(argv), agent_name))
+    log = Logger(CFG["log"], tag="cr %d %s" % (os.getpid(), agent_name))
+    session_start = time.time()
+    log("start: %s %s (agent: %s) cwd=%s"
+        % (" ".join(launch), " ".join(argv), agent_name, os.getcwd()))
 
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
@@ -4277,7 +4287,7 @@ def main(argv):
                 exit_code = os.waitstatus_to_exitcode(status) if status else 0
                 break
             time.sleep(0.02)
-    log("exit: %d" % exit_code)
+    log("exit: %d after %s" % (exit_code, human_left(time.time() - session_start)))
     return exit_code
 
 

@@ -10,6 +10,11 @@ limitations.
 `~/.claude-retrier/log` (or `CR_LOG`) has the whole story with numbers. It is
 the only file the wrapper writes under your home directory.
 
+Two sessions in the same project write into the same log, so every line
+carries `[cr <pid> <agent>]` right after the timestamp — the pid is the
+supervisor process, printed on `start:`. `grep 'cr 48213'` isolates one
+session's own `start: … → … → exit:` sequence out of the interleaved file.
+
 ## Common checks
 
 - **The context restart never fires.** See

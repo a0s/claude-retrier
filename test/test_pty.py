@@ -205,6 +205,43 @@ class TestTransparency(PtyTestCase):
         s.wait()
 
 
+class TestLogTag(PtyTestCase):
+    """Two wrappers writing into one CR_LOG must stay untangled by pid."""
+
+    def test_two_concurrent_wrappers_are_distinguishable_by_pid(self):
+        log_path = os.path.join(tempfile.mkdtemp(prefix="cr-log-"), "shared.log")
+        s1 = self.session(env={"CR_LOG": log_path})
+        s2 = self.session(env={"CR_LOG": log_path})
+        self.assertTrue(s1.read_until("ready"))
+        self.assertTrue(s2.read_until("ready"))
+        s1.send("quit\r")
+        s2.send("quit\r")
+        s1.wait()
+        s2.wait()
+        self.assertNotEqual(s1.proc.pid, s2.proc.pid)
+
+        with open(log_path) as fh:
+            lines = fh.read().splitlines()
+        tag1, tag2 = "[cr %d claude]" % s1.proc.pid, "[cr %d claude]" % s2.proc.pid
+        own1 = [l for l in lines if tag1 in l]
+        own2 = [l for l in lines if tag2 in l]
+
+        # grep by one pid gives a connected start -> ... -> exit sequence,
+        # with nothing from the other process mixed in.
+        self.assertTrue(any(" start: " in l for l in own1))
+        self.assertTrue(any(" exit: " in l for l in own1))
+        self.assertTrue(any(" start: " in l for l in own2))
+        self.assertTrue(any(" exit: " in l for l in own2))
+        self.assertFalse(any(tag2 in l for l in own1))
+        self.assertFalse(any(tag1 in l for l in own2))
+        start1 = next(l for l in own1 if " start: " in l)
+        exit1 = next(l for l in own1 if " exit: " in l)
+        self.assertLess(own1.index(start1), own1.index(exit1))
+
+        self.assertIn("cwd=", start1)
+        self.assertRegex(exit1, r"exit: \d+ after ")
+
+
 class TestScrapeChannel(PtyTestCase):
     """The fallback channel: the banner is only ever seen on screen."""
 
