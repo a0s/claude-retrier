@@ -912,5 +912,74 @@ class TestContextRestart(PtyTestCase):
         self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
 
 
+class TestUniqueHandoffFile(PtyTestCase):
+    """T05, single-session end: `{id}` resolves to a real file, and a custom
+    phrase missing `{file}` is flagged once at startup."""
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp(prefix="cr-cfg-")
+        self.work = tempfile.mkdtemp(prefix="cr-work-")
+        self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        self.log = os.path.join(self.cfg, "log")
+
+    def env(self, **over):
+        e = {
+            "CLAUDE_CONFIG_DIR": self.cfg,
+            "CR_LOG": self.log,
+            "CR_SCRAPE": "never",
+            "CR_CONTEXT_PCT": "51",
+            "CR_HANDOFF_FILE": "handoff.md",
+            "CR_ROOT_IDLE_SEC": "1",
+            "CR_HANDOFF_TIMEOUT_SEC": "45",
+            "CR_STEP_GAP_SEC": "0.5",
+            "CR_VERIFY_SEC": "8",
+            "CR_USER_IDLE_SEC": "0",
+            "CR_POLL_SEC": "0.3",
+            "CR_SLASH_GAP_SEC": "0.2",
+            "CR_SLASH_ENTER_GAP_SEC": "0.2",
+            "FAKE_USAGE": "700000",
+            "FAKE_USAGE_DELAY": "1.0",
+            "FAKE_MODEL": "claude-opus-5",
+        }
+        e.update(over)
+        return e
+
+    def logged(self):
+        try:
+            with open(self.log) as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def wait_log(self, needle, session, timeout=25):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if needle in self.logged():
+                return True
+            session.drain(0.3)
+        return needle in self.logged()
+
+    def test_the_id_placeholder_resolves_to_a_real_file_and_still_restarts(self):
+        s = self.session(env=self.env(CR_HANDOFF_FILE="scratchpad/RESUME-{id}.md"),
+                         cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_log("context restarted", s), self.logged())
+        names = os.listdir(os.path.join(self.work, "scratchpad"))
+        self.assertEqual(len(names), 1, names)
+        self.assertRegex(names[0], r"^RESUME-[0-9a-f]{8}\.md$")
+
+    def test_a_resume_phrase_without_file_warns_once_at_startup(self):
+        s = self.session(env=self.env(CR_RESUME_MSG="Read the notes and continue."),
+                         cwd=self.work)
+        self.assertTrue(self.wait_log(
+            "CR_RESUME_MSG does not contain {file}; a per-session handoff "
+            "path cannot be passed to it", s))
+        s.drain(1)
+        self.assertEqual(
+            self.logged().count("CR_RESUME_MSG does not contain {file}"), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

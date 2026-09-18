@@ -10,6 +10,10 @@ listed as unsolvable by scraping (DESIGN-NOTES §6) but is trivial here: we are
 the terminal, so we see the keystrokes.
 """
 import os
+import shutil
+import signal
+import tempfile
+import time
 import unittest
 
 from helper import load
@@ -628,12 +632,13 @@ class Handoff:
 
 
 def restart_controller(**over):
+    session_id = over.pop("session_id", None)
     cfg = dict(CFG)
     cfg.update(CTX)
     cfg.update(over)
     logs = []
     hand = Handoff()
-    ctl = cr.Controller(cfg, logs.append, now=0, probe=hand)
+    ctl = cr.Controller(cfg, logs.append, now=0, probe=hand, session_id=session_id)
     ctl.log_lines = logs
     ctl.handoff = hand
     return ctl
@@ -1361,6 +1366,94 @@ class TestWhatTheCornerSays(RestartTestCase):
         badge = cr.Badge(dict(badge=1, badge_pos="bottom-right", badge_label="cr"))
         text, _ = badge.frame(cr.WAITING, 3600, 0, 3, now=0, restart=cr.HANDOFF_SENT)
         self.assertIn("1h00m", text)
+
+
+# --------------------------------------------------------------------------- #
+# T05: a unique handoff file per session
+# --------------------------------------------------------------------------- #
+class TestTheIdPlaceholder(unittest.TestCase):
+    """`{id}` in CR_HANDOFF_FILE makes a shared path unique per session without
+    any registry involved — the controller resolves it on its own."""
+
+    def test_it_is_substituted_in_both_the_path_and_the_resume_text(self):
+        ctl = restart_controller(handoff_file="scratchpad/RESUME-{id}.md")
+        base = os.path.basename(ctl.handoff_path)
+        self.assertRegex(base, r"^RESUME-[0-9a-f]{8}\.md$")
+        self.assertNotIn("{id}", ctl.handoff_path)
+        self.assertIn(base, ctl.resume_text)
+
+    def test_a_caller_supplied_id_is_used_verbatim(self):
+        ctl = restart_controller(handoff_file="R-{id}.md", session_id="deadbeef")
+        self.assertTrue(ctl.handoff_path.endswith("R-deadbeef.md"), ctl.handoff_path)
+
+    def test_a_plain_path_is_left_untouched(self):
+        ctl = restart_controller(handoff_file="H.md")
+        self.assertTrue(ctl.handoff_path.endswith("H.md"), ctl.handoff_path)
+
+
+class TestHandoffRegistry(unittest.TestCase):
+    """`{id}`-free paths rely on `~/.claude-retrier/sessions/<pid>.json`
+    (`CR_HANDOFF_REGISTRY_DIR`) to notice a live collision and move aside."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-handoff-reg-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.registry = cr.HandoffRegistry(self.dir)
+
+    def _alive_pid(self):
+        """A real, live pid this test controls and reaps on cleanup."""
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(30)
+            os._exit(0)
+        self.addCleanup(self._kill, pid)
+        return pid
+
+    @staticmethod
+    def _kill(pid):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+
+    def test_a_second_claim_on_the_same_path_is_suffixed_and_logged(self):
+        holder = self._alive_pid()
+        logs = []
+        first = self.registry.claim("H.md", "aaaa1111", holder, "/proj", "claude", 0, logs.append)
+        self.assertEqual(first, "H.md")
+        second = self.registry.claim("H.md", "bbbb2222", os.getpid(), "/proj", "claude", 0,
+                                     logs.append)
+        self.assertEqual(second, "H-bbbb2222.md")
+        self.assertTrue(any("is taken by pid %d" % holder in ln for ln in logs), logs)
+
+    def test_an_id_path_never_touches_the_registry(self):
+        logs = []
+        first = self.registry.claim("H-{id}.md", "aaaa1111", 111111, "/proj", "claude", 0,
+                                    logs.append)
+        second = self.registry.claim("H-{id}.md", "bbbb2222", 222222, "/proj", "claude", 0,
+                                     logs.append)
+        self.assertEqual(first, "H-aaaa1111.md")
+        self.assertEqual(second, "H-bbbb2222.md")
+        self.assertEqual(logs, [])
+
+    def test_a_dead_pids_entry_is_not_a_conflict_and_is_removed(self):
+        dead = self._alive_pid()
+        self._kill(dead)
+        self.registry.register(dead, "/proj", os.path.abspath("H.md"), "claude", 0)
+        entry = os.path.join(self.dir, "%d.json" % dead)
+        self.assertTrue(os.path.exists(entry))
+        conflict = self.registry.find_conflict(os.path.abspath("H.md"), exclude_pid=os.getpid())
+        self.assertIsNone(conflict)
+        self.assertFalse(os.path.exists(entry))
+
+    def test_unregister_removes_the_entry(self):
+        self.registry.register(os.getpid(), "/proj", "/proj/H.md", "claude", 0)
+        self.registry.unregister(os.getpid())
+        self.assertEqual(os.listdir(self.dir), [])
 
 
 if __name__ == "__main__":

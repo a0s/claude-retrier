@@ -5,6 +5,7 @@ over one project dir at once — the shape every "wrong session's numbers" bug
 """
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -145,6 +146,61 @@ class TestTwoWrappers(TwoWrappersTestCase):
         self.assertFalse(b.read_until("GOT:handoff", timeout=3))
         self.assertIn("folding up", "".join(a.log_lines()))
         self.assertNotIn("folding up", "".join(b.log_lines()))
+
+    def test_two_sessions_sharing_a_handoff_file_get_two_different_ones(self):
+        # T05: without this, the second wrapper to reach the fold overwrites
+        # the first one's handoff.md mid-write, and the fold that reads it
+        # back (or the one that never gets written at all) is a coin flip.
+        #
+        # Started one after the other's "ready" (its registry claim is made
+        # before that point, well before the pty is even forked) rather than
+        # via `two_wrappers()`'s simultaneous start: the registry has no lock,
+        # by design (same "two sessions can race" tradeoff the model cache
+        # makes), so two claims within the same instant can both see no
+        # conflict — exactly the gap the evidence itself was not testing (its
+        # two nonces landed two seconds apart, not the same millisecond).
+        d = tempfile.mkdtemp(prefix="cr-two-handoff-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        shared = tempfile.mkdtemp(prefix="cr-two-handoff-cfg-")
+        self.addCleanup(shutil.rmtree, shared, ignore_errors=True)
+        log = os.path.join(shared, "shared.log")
+        base = {
+            "CLAUDE_CONFIG_DIR": os.path.join(shared, "claude-config"),
+            "CODEX_HOME": os.path.join(shared, "codex-home"),
+            "agent": "claude",
+            "CR_SCRAPE": "never",
+            "CR_CONTEXT_PCT": "51",
+            "CR_HANDOFF_FILE": "handoff.md",
+            "CR_HANDOFF_REGISTRY_DIR": os.path.join(shared, "handoff-registry"),
+            "CR_ROOT_IDLE_SEC": "1",
+            "CR_HANDOFF_TIMEOUT_SEC": "45",
+            "CR_STEP_GAP_SEC": "0.5",
+            "CR_VERIFY_SEC": "8",
+            "CR_USER_IDLE_SEC": "0",
+            "CR_POLL_SEC": "0.2",
+            "CR_SLASH_GAP_SEC": "0.2",
+            "CR_SLASH_ENTER_GAP_SEC": "0.2",
+            "FAKE_MODEL": "claude-opus-5",
+            "FAKE_USAGE": "700000",
+            "FAKE_USAGE_DELAY": "0.3",
+        }
+        a = helper.WrapperSession(cwd=d, log=log, env=dict(base))
+        self.addCleanup(a.close)
+        self.assertTrue(a.read_until("ready"))
+
+        b = helper.WrapperSession(cwd=d, log=log, env=dict(base))
+        self.addCleanup(b.close)
+        self.assertTrue(b.read_until("ready"))
+
+        self.assertTrue(a.read_until("GOT:handoff", timeout=20), a.buf[-500:])
+        self.assertTrue(b.read_until("GOT:handoff", timeout=20), b.buf[-500:])
+
+        files = sorted(f for f in os.listdir(d) if f.startswith("handoff") and f.endswith(".md"))
+        self.assertEqual(len(files), 2, files)
+        self.assertIn("handoff.md", files)
+
+        combined = "".join(a.log_lines()) + "".join(b.log_lines())
+        self.assertIn("is taken by pid", combined)
 
 
 if __name__ == "__main__":
