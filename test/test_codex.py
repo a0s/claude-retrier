@@ -566,16 +566,37 @@ class TestTheCodexThreshold(unittest.TestCase):
         feed(ctl, 1, model="gpt-5.6-sol", window=WINDOW)
         self.assertNotEqual(ctl.context_limit, 140000)
 
-    def test_the_restart_flag_reaches_codex_with_its_own_default(self):
-        # Not claude's 51%: codex restarts against a hard cap under a reserve
-        # tuned for that, not against a flat fraction of its own window.
+    def test_the_bare_flag_no_longer_hands_cfg_a_percentage(self):
+        # T18: the flag alone used to default codex's context_pct to
+        # DEFAULT_CODEX_RESTART_PCT (90%). That number is gone from cfg
+        # entirely now — the flag just arms context_restart_on, and
+        # model_restart_at answers with the model's own profile instead (see
+        # test_the_bare_flag_reaches_the_profile_threshold below).
         from helper import load as reload_impl
         mod = reload_impl(CR_CONTEXT_RESTART="1")
         claude_cfg = mod.agent_cfg(mod.CFG, "claude")
         codex_cfg = mod.agent_cfg(mod.CFG, "codex")
-        self.assertEqual(claude_cfg["context_pct"], mod.DEFAULT_RESTART_PCT)
-        self.assertEqual(codex_cfg["context_pct"], mod.DEFAULT_CODEX_RESTART_PCT)
-        self.assertNotEqual(mod.DEFAULT_CODEX_RESTART_PCT, mod.DEFAULT_RESTART_PCT)
+        self.assertEqual(claude_cfg["context_pct"], 0.0)
+        self.assertEqual(codex_cfg["context_pct"], 0.0)
+        self.assertTrue(codex_cfg["context_restart_on"])
+
+    def test_the_bare_flag_reaches_the_profile_threshold(self):
+        # AC: no CR_CONTEXT_PCT/CR_CONTEXT_TOKENS of any kind, just the flag —
+        # the rollout reporting the profile's own window (258,400) is what
+        # arms gpt-5.6-sol's 194,400 (= cap - the default 64k reserve).
+        ctl = codex_controller(context_pct=0, context_tokens=0, context_restart_on=True)
+        feed(ctl, 1, model="gpt-5.6-sol", window=258400)
+        self.assertEqual(ctl.context_limit, 194400)
+        self.assertEqual(ctl.trigger_limit(), 194400)
+
+    def test_a_raised_window_leaves_the_profile_sitting_out(self):
+        # AC: model_context_window=872000 in the rollout is not the window the
+        # profile was written for, so the profile does not answer at all — an
+        # explicit CR_CODEX_CONTEXT_PCT is what decides, at the REPORTED window.
+        ctl = codex_controller(context_pct=0, context_tokens=0, context_restart_on=True,
+                               codex_context_pct=50)
+        feed(ctl, 1, model="gpt-5.6-sol", window=872000)
+        self.assertEqual(ctl.context_limit, 12000 + int((872000 - 12000) * 0.5))
 
     def test_an_explicit_shared_percentage_still_covers_both_agents(self):
         # CR_CONTEXT_RESTART only gets a say when nobody picked a number. Type
@@ -812,6 +833,14 @@ class TestHoldingCodexsCompactionBack(unittest.TestCase):
     def test_not_without_a_restart_to_make_room_for(self):
         self.assertEqual(cr.codex_launch_args(dict(agent="codex", context_pct=0,
                                                    context_tokens=0)), [])
+
+    def test_the_bare_flag_makes_room_too(self):
+        # T18: CR_CONTEXT_RESTART=1 alone arms the model's profile, not a
+        # percentage — codex's own compaction still has to be moved out of the
+        # way for that threshold to mean anything.
+        args = cr.codex_launch_args(dict(agent="codex", context_pct=0, context_tokens=0,
+                                         context_restart_on=True))
+        self.assertIn('model_auto_compact_token_limit_scope="body_after_prefix"', args)
 
     def test_not_when_told_not_to(self):
         self.assertEqual(cr.codex_launch_args(dict(agent="codex", context_pct=60,
@@ -1211,16 +1240,20 @@ class TestCodexEndToEnd(PtyTestCase):
     def test_the_restart_flag_reaches_codex_through_bash_too(self):
         # Same round trip as the claude version: CR_CONTEXT_RESTART has to
         # survive bash's own `:=` defaults, not just agent_cfg()'s in-process
-        # fallback. Codex does NOT inherit claude's 51% here, though — with its
-        # own count readable (FAKE_LOG), the reserve/cap mechanism is what
-        # actually decides, and DEFAULT_CODEX_RESTART_PCT (90%) sits far enough
-        # above it to never bind.
+        # fallback. Codex does NOT inherit claude's 51% here, though — the
+        # flag arms gpt-5.6-sol's own profile row instead (T18), which answers
+        # 194,400 (= the 258,400 cap minus the default 64k reserve) directly,
+        # matching what the log-based cap/reserve mechanism would have clamped
+        # a percentage down to anyway. With the profile already at that number,
+        # `_note_cap`'s "using X instead" only logs when something ABOVE it
+        # needed clamping — nothing does here, so it is silent, which is
+        # itself confirmation nothing is racing past the reserve line.
         s = self.session(env=self.restart_env(CR_CONTEXT_PCT="", CR_CONTEXT_RESTART="1",
                                               FAKE_LOG="1"),
                          cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertIn("restarting at 194k", self.logged())   # cap(258k) - reserve(64k)
-        self.assertIn("using 194k instead", self.logged())   # not the 90% fallback (233k)
+        self.assertNotIn("using 194k instead", self.logged())   # nothing needed clamping
         # Read it through to the end — see test_codex_has_a_threshold_of_its_own
         # above for why: torn down mid-restart, the kernel can hold the killed
         # process past what close() waits for.
@@ -1231,10 +1264,7 @@ class TestCodexEndToEnd(PtyTestCase):
     # environment in test_pty.py) — the mechanism is agent-agnostic. codex's own
     # slug-matching is covered directly against the controller in
     # TestTheCodexThreshold (test_a_per_model_override_reaches_a_dotted_codex_
-    # slug) — fake_codex.py's FAKE_USAGE shortcut writes token_count straight
-    # off, without ever running write_task_started(), so the fold here fires
-    # before any model name is on record and there is no clean way to exercise
-    # both at once on this harness.
+    # slug).
 
     def test_and_it_can_be_off_while_claudes_is_on(self):
         s = self.session(env=self.restart_env(CR_CODEX_CONTEXT_PCT="0"), cwd=self.work)

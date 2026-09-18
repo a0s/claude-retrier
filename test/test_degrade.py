@@ -61,6 +61,15 @@ class TestCli(unittest.TestCase):
             self.assertIn("### CR_PAT_%s" % name, out)
         self.assertIn("hit your", out)
 
+    def test_cr_models_prints_the_profile_table(self):
+        # T18. Needs no claude/codex installed at all — it never resolves a
+        # command, so the fake-claude launcher this file's tests otherwise
+        # rely on is beside the point here.
+        out = run(["--cr-models"]).stdout
+        self.assertIn("claude-opus-5", out)
+        self.assertIn("gpt-5.6-sol", out)
+        self.assertIn("restart_at", out)   # the header, so a truncated table fails loudly
+
     def test_shell_syntax_is_valid_under_bash(self):
         self.assertEqual(subprocess.run(["bash", "-n", WRAP]).returncode, 0)
 

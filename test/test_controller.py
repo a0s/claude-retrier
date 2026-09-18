@@ -1644,11 +1644,16 @@ class TestSettingsAsPeopleWriteThem(unittest.TestCase):
         from helper import load as reload_impl
         self.assertEqual(reload_impl().CFG["context_pct"], 0.0)
 
-    def test_context_restart_flag_picks_the_default_percentage(self):
+    def test_context_restart_flag_arms_the_profile_not_a_percentage(self):
+        # T18: the flag used to default CFG["context_pct"] to DEFAULT_RESTART_PCT
+        # outright. Now it just sets context_restart_on, and it is
+        # model_restart_at (via MODEL_PROFILES) that answers with a number —
+        # see test_models.py's TestTheThresholdResolutionOrder for that.
         from helper import load as reload_impl
         mod = reload_impl(CR_CONTEXT_RESTART="1")
-        self.assertEqual(mod.CFG["context_pct"], mod.DEFAULT_RESTART_PCT)
-        self.assertEqual(mod.DEFAULT_RESTART_PCT, 51.0)
+        self.assertEqual(mod.CFG["context_pct"], 0.0)
+        self.assertTrue(mod.CFG["context_restart_on"])
+        self.assertEqual(mod.DEFAULT_RESTART_PCT, 51.0)   # still the number the table bakes in
 
     def test_an_explicit_percentage_still_wins_over_the_flag(self):
         from helper import load as reload_impl

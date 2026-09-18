@@ -86,17 +86,18 @@ off for codex alone.
 `CR_CONTEXT_RESTART=1` does **not** hand codex that same borrowed percentage,
 though. Codex restarts against a hard cap under `CR_CODEX_RESERVE_TOKENS` — a
 number already tuned for exactly that cap — not against a fraction of its own
-window the way claude does, so a flat 51% would mean something different, and
-arguably worse, for codex than it does for claude. Under the flag, with no
-percentage set by hand, codex's `context_pct` defaults instead to
-`DEFAULT_CODEX_RESTART_PCT` (90%, codex's own documented soft-compaction point
-— see [below](#where-codex-compacts)), and that number is meant to sit far
-enough above `cap - CR_CODEX_RESERVE_TOKENS` that `trigger_limit()`'s `min()`
-of the two always picks the reserve line: the log says `... threshold is past
-the point codex would compact first; using X instead` when that happens, which
-under normal operation is always. The 90% only actually decides anything if
-codex's own count cannot be read at all (no `logs_*.sqlite` reachable) — see
-[context-restart.md](context-restart.md#turning-it-on).
+window the way claude does, so a flat percentage would mean something
+different, and arguably worse, for codex than it does for claude. Under the
+flag, with no percentage set by hand, codex reads its own row out of
+`MODEL_PROFILES` (T18; `--cr-models` prints the table): for the 5.6-class
+models that row is `258,400 / 194,400 / 258,400` (window / restart_at /
+compact_at), i.e. the cap minus the same 64k `CR_CODEX_RESERVE_TOKENS`
+default — reclamped against whatever you actually set that to, not the frozen
+number. That row only answers at all when the rollout's window matches the
+one it was written for; a `model_context_window` raised in `config.toml`
+reports a different window, the row sits out, and an explicit
+`CR_CODEX_CONTEXT_PCT` is what decides at that point (see
+[context-restart.md](context-restart.md#the-context-window)).
 
 `CR_CODEX_CONTEXT_TOKENS` has no default and never borrows `CR_CONTEXT_TOKENS`.
 An absolute count is tied to a window — 500k picked for a 1M claude session is

@@ -15,6 +15,8 @@ import time
 import unittest
 
 from helper import load
+from test_codex import codex_controller, feed
+from test_controller import restart_controller, usage
 
 cr = load()
 
@@ -225,6 +227,85 @@ class TestTheCache(LookupTestCase):
         look._work("claude-fable-5-1")
         self.assertEqual(look.take(),
                          [("claude-fable-5-1", 1000000, "the models docs")])
+
+
+class TestTheModelProfileTable(unittest.TestCase):
+    """MODEL_PROFILES (T18) is the one place stating, per model, what its
+    window is, where the agent folds it on its own, and where the wrapper
+    should restart. Self-consistency here is what stops a typo in one of
+    those three numbers from shipping unnoticed."""
+
+    def test_every_entry_leaves_room_between_restart_and_compaction(self):
+        for agent, models in cr.MODEL_PROFILES.items():
+            for slug, prof in models.items():
+                with self.subTest(agent=agent, slug=slug):
+                    self.assertLess(prof.restart_at, prof.compact_at)
+                    self.assertLessEqual(prof.compact_at, prof.window)
+                    self.assertGreaterEqual(prof.restart_at, 0.3 * prof.window)
+
+    def test_the_two_names_cr_models_is_checked_against_are_in_the_table(self):
+        # test_degrade.py checks --cr-models' output for exactly these two.
+        self.assertIn("claude-opus-5", cr.MODEL_PROFILES["claude"])
+        self.assertIn("gpt-5.6-sol", cr.MODEL_PROFILES["codex"])
+
+    def test_model_window_reads_the_profile_table_now(self):
+        # CONTEXT_WINDOWS used to be kept apart from the profiles; now it is
+        # derived from them, and model_window's own behavior must not move.
+        for slug, prof in cr.MODEL_PROFILES["claude"].items():
+            self.assertEqual(cr.model_window(slug), prof.window, slug)
+
+
+class TestTheThresholdResolutionOrder(unittest.TestCase):
+    """`_recompute_limit`'s whole order, one stage at a time — the same order
+    documented on `model_restart_at`, which is only the last of the five."""
+
+    def test_stage_1_the_per_model_override_wins_over_everything(self):
+        env = "CR_CLAUDE_TOKENS_CLAUDE_OPUS_5"
+        os.environ[env] = "300000"
+        self.addCleanup(os.environ.pop, env, None)
+        ctl = restart_controller(context_pct=50, context_restart_on=True)
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_limit, 300000)
+
+    def test_stage_2_an_absolute_threshold_wins_over_the_percentage(self):
+        ctl = restart_controller(context_pct=50, context_tokens=400000,
+                                 context_restart_on=True)
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_limit, 400000)
+
+    def test_stage_3_an_explicit_percentage_wins_over_the_profile(self):
+        ctl = restart_controller(context_pct=30, context_restart_on=True)
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_limit, 300000)   # 30% of 1M, not the profile's 510k
+
+    def test_stage_4_the_bare_flag_arms_the_models_own_profile(self):
+        ctl = restart_controller(context_pct=0, context_tokens=0, context_restart_on=True)
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_limit, 510000)
+
+    def test_stage_5_an_unmatched_model_stays_disarmed(self):
+        ctl = restart_controller(context_pct=0, context_tokens=0, context_restart_on=True,
+                                 context_window="auto")
+        usage(ctl, 0, 10, model="claude-something-new")
+        self.assertIsNone(ctl.context_limit)
+
+    def test_the_flag_alone_does_nothing_for_a_model_with_no_profile(self):
+        # Same as stage 5, spelled out for codex: the flag arms the trigger,
+        # but a model this table has never heard of gets nothing to restart
+        # against — not a guess.
+        ctl = codex_controller(context_pct=0, context_tokens=0, context_restart_on=True)
+        feed(ctl, 1, model="gpt-9-nonexistent", window=999999)
+        self.assertIsNone(ctl.context_limit)
+
+    def test_the_profile_is_reclamped_under_compact_minus_the_live_reserve(self):
+        # The profile's own restart_at (194,400) already bakes in the DEFAULT
+        # 64k reserve; raising CR_CODEX_RESERVE_TOKENS has to move the real
+        # number even though the frozen one in the table does not change.
+        os.environ["CR_CODEX_RESERVE_TOKENS"] = "200000"
+        self.addCleanup(os.environ.pop, "CR_CODEX_RESERVE_TOKENS", None)
+        ctl = codex_controller(context_pct=0, context_tokens=0, context_restart_on=True)
+        feed(ctl, 1, model="gpt-5.6-sol", window=258400)
+        self.assertEqual(ctl.context_limit, 58400)   # 258400 - 200000, not the baked 194400
 
 
 if __name__ == "__main__":

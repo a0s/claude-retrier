@@ -64,7 +64,7 @@ More in [context-restart.md](context-restart.md). All of these do nothing until
 
 | variable | default | |
 |---|---|---|
-| `CR_CONTEXT_RESTART` | `0` | `1` turns the restart on without making you pick a number: 51% for claude, codex's own reserve/cap mechanism for codex (see [codex](codex.md#context-restart-on-codex)); an explicit `CR_CONTEXT_PCT`/`CR_CONTEXT_TOKENS`/`CR_CODEX_CONTEXT_PCT` — `0` included — still wins outright |
+| `CR_CONTEXT_RESTART` | `0` | `1` turns the restart on without making you pick a number: the model's own row in the profile table (`--cr-models`, [context-restart.md](context-restart.md#the-context-window)) answers instead; an explicit `CR_CONTEXT_PCT`/`CR_CONTEXT_TOKENS`/`CR_CODEX_CONTEXT_PCT` — `0` included — still wins outright |
 | `CR_CONTEXT_PCT` | `0` | restart at this % of the window; `0` is off |
 | `CR_CONTEXT_TOKENS` | `0` | absolute threshold (`500k` is fine); beats the % |
 | `CR_CONTEXT_WINDOW` | `auto` | `auto` \| `200k` \| `1M` \| a number |
