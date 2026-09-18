@@ -456,6 +456,13 @@ def feed(ctl, at, path=ROLL, **rec):
         ctl.on_turn(rec["turn"], at)
 
 
+def moved(ctl, path, at, why="new rollout"):
+    """T04: `bind_transcript` is the only thing allowed to move `context_path`
+    — what `main()` does once it notices a new rollout file, before handing
+    its first row over to `feed()`."""
+    ctl.bind_transcript(path, why, at)
+
+
 class TestTheCodexThreshold(unittest.TestCase):
     """The percentage is the one on codex's status line, and the setting is its
     own — defaulting to claude's, so one export still covers both."""
@@ -655,6 +662,7 @@ class TestACodexRestart(unittest.TestCase):
         self.assertEqual(ctl.tick(70), ("inject", "/clear", False))
         # The new chat is a new rollout, and it answers small.
         self.assertEqual(ctl.tick(74)[1], "Read `H.md` and continue from it.")
+        moved(ctl, "/codex/sessions/rollout-new.jsonl", 80)
         feed(ctl, 80, path="/codex/sessions/rollout-new.jsonl", turn="open", window=WINDOW)
         feed(ctl, 82, path="/codex/sessions/rollout-new.jsonl", tokens=14000)
         action = ctl.tick(83)
@@ -696,6 +704,7 @@ class TestACodexRestart(unittest.TestCase):
     def test_a_new_rollout_forgets_the_old_turn(self):
         ctl = codex_controller(context_pct=50)
         feed(ctl, 1, turn="open", window=WINDOW)
+        moved(ctl, "/codex/sessions/rollout-new.jsonl", 2)
         feed(ctl, 2, path="/codex/sessions/rollout-new.jsonl", tokens=1000)
         self.assertIsNone(ctl.turn_open)
 

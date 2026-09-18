@@ -117,6 +117,23 @@ class TestTwoWrappers(TwoWrappersTestCase):
         self.assertEqual(entries[a_pid]["cwd"], entries[b_pid]["cwd"])
         self.assertNotEqual(entries[a_pid]["sessionId"], entries[b_pid]["sessionId"])
 
+    def test_a_neighbours_answer_does_not_cancel_our_wait(self):
+        # T04: `on_alive("transcript")` used to fire for ANY growing file in the
+        # project dir, not just the one this wrapper owns — so b answering
+        # cleared a's wait, which was waiting out a's own limit.
+        base = {"agent": "claude", "CR_SCRAPE": "never", "CR_WAIT_SCALE": "3600",
+                "CR_MARGIN_SEC": "0", "CR_USER_IDLE_SEC": "0", "CR_POLL_SEC": "0.2",
+                "CR_NOTIFY": "1"}
+        a, b = self.two(dict(base, FAKE_TRANSCRIPT="You've hit your weekly limit - resets in 40 hours"),
+                        dict(base))
+        self.assertTrue(a.read_until("ready"))
+        self.assertTrue(b.read_until("ready"))
+        self.assertTrue(a.read_until("usage limit detected", timeout=15))
+        b.send("answer\r")
+        self.assertTrue(b.read_until("GOT:answer", timeout=15))
+        self.assertFalse(a.read_until("wait cancelled", timeout=2))
+        self.assertNotIn("session is answering again", "".join(a.log_lines()))
+
     def test_only_the_session_above_the_threshold_is_folded(self):
         # The bug T02 removes: without registry-based identity, a's watcher
         # could pick up b's growth and read b's numbers as its own (or vice

@@ -2048,7 +2048,14 @@ class TranscriptWatcher:
         if not self.grown or self.current in self.grown:
             return
         fresh = [p for p in self.grown if p not in self.preexisting]
+        old = self.current
         self.current = max(fresh or self.grown, key=self._mtime)
+        if old is not None:
+            # A registry (T02/T03) makes this rule a fallback rather than the
+            # switch point; that is exactly when a wrong guess is least
+            # expected, so every guess it still makes stays visible in the log.
+            self.log("transcript switched: %s → %s (fallback heuristic)"
+                     % (old, self.current))
 
     @staticmethod
     def _mtime(path):
@@ -2863,9 +2870,19 @@ class Controller:
     # and eventually types "continue" into the middle of it.
     ALIVE_GRACE = 8.0        # transcript rows this close to the banner are its own
 
-    def on_alive(self, now, source):
-        """The session is answering again: whatever we were waiting for is over."""
+    def on_alive(self, now, source, path=None):
+        """The session is answering again: whatever we were waiting for is over.
+
+        `path` is the transcript the row came from, when the caller knows one
+        (main() always does for `source == "transcript"`). A neighbour's
+        session answering is not evidence about ours, so a path that does not
+        match `context_path` clears nothing — the omitted-path callers below
+        (a screen read, or a test with no transcript of its own) are trusted
+        as before.
+        """
         if self.state not in (WAITING, VERIFY):
+            return False
+        if path is not None and path != self.context_path:
             return False
         # Scaled like every other wait, so a compressed test run does not have to
         # spend eight real seconds proving something about a 48-hour limit.
@@ -3160,6 +3177,31 @@ class Controller:
         return 100.0 * max(0, self.context_tokens - base) / (self.context_window - base)
 
     # -- inputs ------------------------------------------------------------- #
+    def bind_transcript(self, path, why, now):
+        """The one place `context_path` changes.
+
+        Every per-transcript count `on_context` had been carrying for the file
+        we are leaving means nothing for the one we are joining — a stale
+        `context_window_hint` or `last_stop_reason` from another session would
+        otherwise leak into this one's first reading. `context_model` is the
+        one exception: the API has not yet had a chance to restate it, and
+        until it does the old value is still the best guess at the window.
+        """
+        old = self.context_path
+        self.context_path = path
+        self.context_tokens = None
+        self.turn_open = None
+        self.codex_cap = None
+        self.context_window_hint = None
+        self.counted_by_log = None
+        self.last_stop_reason = None
+        self.context_grew_at = 0.0
+        self._window_bumped = False
+        if old is None:
+            self.log("context bound: %s (%s)" % (path, why))
+        else:
+            self.log("transcript switched: %s → %s (%s)" % (old, path, why))
+
     def on_context(self, rec, now):
         """An assistant row from the transcript this terminal's session writes.
 
@@ -3169,13 +3211,20 @@ class Controller:
         tick where the file did not grow.
         """
         path = rec.get("path")
-        if path and path != self.context_path:
-            # A different transcript: `/clear` moving the session to a new file,
-            # or the very first row we have seen. Its figures replace, never mix.
-            self.context_path = path
-            self.context_tokens = None
-            self.turn_open = None
-            self.codex_cap = None
+        if path:
+            if self.context_path is None:
+                # Bootstrap only: in the running wrapper `bind_transcript` has
+                # already been called by the time a row reaches here, so this
+                # fires only for a controller fed rows directly, with no
+                # switch point of its own to have called it first.
+                self.bind_transcript(path, "first transcript", now)
+            elif path != self.context_path:
+                # A different session's transcript. `bind_transcript` is the
+                # only thing allowed to move `context_path`; a row that just
+                # happens to arrive on a foreign one is not evidence of a
+                # `/clear`, and mixing its figures into ours is the bug this
+                # guards against.
+                return
         from_log = rec.get("source") == "log"
         if from_log:
             # codex's own count, and where it will compact. Once one has arrived
@@ -4879,31 +4928,42 @@ def main(argv):
                     ctl.on_user_bytes(data, now)
                     write_all(master, data)
 
-            for rec in watcher.poll_now(now):
+            recs = watcher.poll_now(now)
+            if watcher.current and watcher.current != ctl.context_path:
+                # The one place `main()` tells the controller a transcript is
+                # now ours: whatever the watcher used to decide it (identity,
+                # when the registry names one; its growth heuristic otherwise).
+                why = "session identity" if watcher.bound_session_id else "fallback heuristic"
+                ctl.bind_transcript(watcher.current, why, now)
+            for rec in recs:
                 if rec.get("kind") == "echo":
+                    # claude's own echo of our retry/resume is only evidence
+                    # about the session at this terminal; a neighbour's is not.
+                    if rec.get("path") != watcher.current:
+                        continue
                     if rec.get("text") == ctl.resume_text and ctl.on_resume_echo(now):
                         continue
                     if ctl.on_echo(now):
                         notify("session resumed")
                     continue
                 if rec.get("kind") == "alive":
-                    # The usage figures are read only off the transcript this
+                    # The usage figures, the turn state, and "the session is
+                    # answering" are read only off the transcript this
                     # terminal's session writes; another session's are another
-                    # session's context.
+                    # session's.
                     if rec.get("path") == watcher.current:
                         ctl.on_context(rec, now)
                         if rec.get("turn"):
                             ctl.on_turn(rec["turn"], now)
-                    if rec.get("clean"):
-                        ctl.on_turn_done(now)
-                    # A row that only names the model says nothing about whether
-                    # anything is being served, and a wait must not end on it.
-                    if rec.get("quiet"):
-                        continue
-                    # Rows are in file order, so an assistant row that follows a
-                    # limit row really did come after it.
-                    if ctl.on_alive(now, "transcript"):
-                        wait_cancelled()
+                        if rec.get("clean"):
+                            ctl.on_turn_done(now)
+                        # A row that only names the model says nothing about
+                        # whether anything is being served, and a wait must
+                        # not end on it.
+                        # Rows are in file order, so an assistant row that
+                        # follows a limit row really did come after it.
+                        if not rec.get("quiet") and ctl.on_alive(now, "transcript", rec.get("path")):
+                            wait_cancelled()
                     continue
                 if rec.get("turn") and rec.get("path") == watcher.current:
                     ctl.on_turn(rec["turn"], now)     # a turn that died of it
@@ -4914,7 +4974,12 @@ def main(argv):
                     continue
                 text = rec["text"] or "usage limit"
                 pending_scrape = None            # the structured channel wins
-                if ctl.on_limit(text, now, "transcript"):
+                # A limit is the account's, not the session's, so it is read
+                # from any file in the project — but a wait it schedules is
+                # only "ours" to clear on a neighbour's say-so, not on a
+                # screen correction meant for someone else's terminal.
+                source = "transcript" if rec.get("path") == watcher.current else "neighbour"
+                if ctl.on_limit(text, now, source):
                     notify("usage limit detected; waiting for reset")
             # Rows are not the only thing a transcript gains, and the gap between
             # a tool call and its result can be minutes: bytes are what say the
