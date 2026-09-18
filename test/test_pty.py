@@ -460,6 +460,82 @@ class TestBadge(PtyTestCase):
         self.assertNotIn("◆", self.screen(s).text())
 
 
+class TestAgentOverlay(PtyTestCase):
+    """T27: each row of Claude Code's own subagent tree annotated with the
+    model that agent is really running on — judged through the same terminal
+    emulator the badge is, since the risk is identical: where the bytes land,
+    whether the screen scrolled, whether the cursor was left where claude
+    expects it.
+    """
+
+    ROWS, COLS = 40, 120
+    ROW_A, ROW_B = 10, 12     # test/fake_claude.py's AGENT_TREE_ROW1/ROW3
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp(prefix="cr-cfg-")
+        self.work = tempfile.mkdtemp(prefix="cr-work-")
+        self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+
+    def screen(self, session, rows=None, cols=None):
+        s = Screen(rows or self.ROWS, cols or self.COLS)
+        s.feed(session.buf)
+        return s
+
+    def running(self, **env):
+        e = {"CR_AGENTS_OVERLAY": "1", "CLAUDE_CONFIG_DIR": self.cfg,
+             "FAKE_AGENT_TREE": "1", "CR_POLL_SEC": "0.05"}
+        e.update(env)
+        s = self.session(env=e, cwd=self.work, rows=self.ROWS, cols=self.COLS)
+        self.assertTrue(s.read_until("winsize"))
+        return s
+
+    def wait_for(self, s, needle, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            s.drain(0.2)
+            sc = self.screen(s)
+            if needle in sc.line(self.ROW_A) or needle in sc.line(self.ROW_B):
+                return sc
+        self.fail("%r never appeared on row %d or %d; got %r"
+                  % (needle, self.ROW_A, self.ROW_B, self.screen(s).text()))
+
+    def test_the_model_is_annotated_at_the_agent_s_row(self):
+        s = self.running()
+        self.wait_for(s, "sonnet-5/?")
+        sc = self.screen(s)
+        self.assertIn("sonnet-5/?", sc.line(self.ROW_A))
+        self.assertIn("haiku-4.5/?", sc.line(self.ROW_B))
+
+    def test_it_never_touches_the_last_column(self):
+        s = self.running()
+        sc = self.wait_for(s, "sonnet-5/?")
+        self.assertEqual(sc.cells[self.ROW_A - 1][self.COLS - 1], " ")
+        self.assertEqual(sc.cells[self.ROW_B - 1][self.COLS - 1], " ")
+
+    def test_it_never_scrolls_the_screen(self):
+        s = self.running()
+        sc = self.wait_for(s, "sonnet-5/?")
+        self.assertEqual(sc.scrolled, 0)
+
+    def test_it_is_off_by_default(self):
+        s = self.session(env={"CLAUDE_CONFIG_DIR": self.cfg, "FAKE_AGENT_TREE": "1"},
+                         cwd=self.work, rows=self.ROWS, cols=self.COLS)
+        self.assertTrue(s.read_until("winsize"))
+        s.drain(1.0)
+        self.assertNotIn("sonnet-5", s.buf)      # not one extra byte, model or otherwise
+
+    def test_the_label_returns_after_claude_repaints_the_row(self):
+        s = self.running()
+        self.wait_for(s, "sonnet-5/?")
+        s.send("repaint-tree\r")
+        self.assertTrue(s.read_until("GOT:repaint-tree"))
+        # claude's own repaint just wiped it with ESC[K — the overlay has to
+        # notice the next closed frame and put it straight back.
+        sc = self.wait_for(s, "sonnet-5/?")
+        self.assertIn("haiku-4.5/?", sc.line(self.ROW_B))
+
+
 class TestTheUpdateNotice(PtyTestCase):
     """What a user with an out-of-date copy actually sees, on a real terminal.
 

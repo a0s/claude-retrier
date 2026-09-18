@@ -233,5 +233,47 @@ class TestPaintAndErase(unittest.TestCase):
         self.assertEqual(read(), "")
 
 
+class TestAgentOverlayLeavesTheBadgeAlone(unittest.TestCase):
+    """The badge and a right-anchored T27 annotation share the same corner —
+    the last row, right edge. The overlay must lose that contest every time."""
+
+    def fd(self):
+        import os
+        import tempfile
+        path = tempfile.mktemp(prefix="cr-badge-agents-")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+
+        def read():
+            os.lseek(fd, 0, 0)
+            return os.read(fd, 65536).decode()
+        return fd, read
+
+    class Reg:
+        def model_for(self, label):
+            return ("claude-sonnet-5", None)
+
+    def test_the_badge_s_row_is_never_annotated_bottom_right(self):
+        Screen = cr.Screen
+        s = Screen(23, 120)
+        s.feed("\x1b[23;4H└\x1b[23;6GReport second file in cwd")  # lands on row 23
+        overlay = cr.AgentOverlay(dict(agents_overlay=True, agents_pos="right"))
+        fd, read = self.fd()
+        overlay.paint(fd, 23, 120, s, self.Reg(), badge_row=23)
+        self.assertEqual(read(), "")     # the badge's own row (bottom-right), untouched
+
+    def test_the_badge_s_row_is_never_annotated_top_right(self):
+        # A badge pinned to the top of the screen sits on row 1, not the last
+        # row — the overlay must follow the badge's actual position, not
+        # assume it is always at the bottom.
+        Screen = cr.Screen
+        s = Screen(23, 120)
+        s.feed("\x1b[1;4H└\x1b[1;6GReport second file in cwd")  # lands on row 1
+        overlay = cr.AgentOverlay(dict(agents_overlay=True, agents_pos="right"))
+        fd, read = self.fd()
+        overlay.paint(fd, 23, 120, s, self.Reg(), badge_row=1)
+        self.assertEqual(read(), "")     # the badge's own row (top-right), untouched
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

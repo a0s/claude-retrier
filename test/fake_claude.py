@@ -32,6 +32,16 @@ It also writes `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, the way Claude Code
 >=2.1.273 does, so identity-binding code (T02) has something real to read:
 
   FAKE_SCRIPT      comma-separated scenario directives (see `run_script`)
+
+For T27 (the subagent tree overlay) it can also draw two rows of Claude Code's
+own subagent tree and back them with real `subagents/agent-*.{meta.json,jsonl}`
+files, reproducing the geometry T27's evidence #5 captured (glyph in column 4,
+label from column 6, a frame closed by ESC[?2026l):
+
+  FAKE_AGENT_TREE  1 = draw the tree once at startup
+                    the frame is redrawn (with an ESC[K that wipes whatever the
+                    wrapper painted over it, the way claude's own repaint does)
+                    whenever the line `repaint-tree` is typed
 """
 import json
 import os
@@ -168,6 +178,49 @@ def run_script(spec):
             write_streaming_turn(int(value or "10000"))
 
 
+AGENT_TREE_ROW1 = 10   # rows chosen well clear of both the badge (bottom row)
+AGENT_TREE_ROW2 = 11   # and the terminal top, on any size test_pty.py uses.
+AGENT_TREE_ROW3 = 12
+AGENT_A, AGENT_B = "aaa111", "bbb222"
+AGENT_A_LABEL, AGENT_B_LABEL = "Report first file in cwd", "Report second file in cwd"
+AGENT_A_MODEL, AGENT_B_MODEL = "claude-sonnet-5", "claude-haiku-4-5-20251001"
+
+
+def subagents_dir():
+    d = os.path.join(project_dir(), SESSION[0], "subagents")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def write_subagent(agent_id, description, model):
+    d = subagents_dir()
+    meta = {"agentType": "general-purpose", "description": description,
+            "toolUseId": "toolu_fake_%s" % agent_id, "spawnDepth": 1,
+            # T27 evidence: a fork spawned with this field has been seen to run
+            # on a different model entirely — writing one here is deliberate,
+            # so a test can catch the overlay if it ever starts trusting it.
+            "requestedModel": "sonnet"}
+    with open(os.path.join(d, "agent-%s.meta.json" % agent_id), "w") as fh:
+        json.dump(meta, fh)
+    rec = {"type": "assistant", "isSidechain": False, "message": {"model": model, "content": []}}
+    with open(os.path.join(d, "agent-%s.jsonl" % agent_id), "w") as fh:
+        fh.write(json.dumps(rec) + "\n")
+
+
+def draw_agent_tree(out, suffix="0 tool uses"):
+    frame = (
+        "\x1b[?2026h"
+        "\x1b[%d;4H├\x1b[%d;6GReport first file in cwd · %s\x1b[K"
+        "\x1b[%d;4H│\x1b[%d;6G⎿  Initializing…\x1b[K"
+        "\x1b[%d;4H└\x1b[%d;6GReport second file in cwd · %s\x1b[K"
+        "\x1b[?2026l"
+    ) % (AGENT_TREE_ROW1, AGENT_TREE_ROW1, suffix,
+         AGENT_TREE_ROW2, AGENT_TREE_ROW2,
+         AGENT_TREE_ROW3, AGENT_TREE_ROW3, suffix)
+    out.write(frame)
+    out.flush()
+
+
 def fold_up(line):
     """Write (or fail to write) the handoff the wrapper just asked for."""
     mode = os.environ.get("FAKE_HANDOFF", "ok")
@@ -204,6 +257,23 @@ def main():
 
     write_pid_file("idle")
     run_script(os.environ.get("FAKE_SCRIPT"))
+
+    if os.environ.get("FAKE_AGENT_TREE"):
+        # A pause first: the wrapper seeds its transcript watcher at whatever
+        # size the file already has (so `--continue` never replays yesterday's
+        # banner) — writing before that seed happens would be invisible to it,
+        # same reasoning as FAKE_USAGE_DELAY below. Then a second pause after
+        # the transcript starts growing, before the tree is drawn: the overlay
+        # can only resolve a row's model once the wrapper's watcher has bound
+        # to THIS session's transcript (T27's subagents live next to it), and
+        # a real session's transcript is always growing well before it spawns
+        # subagents.
+        time.sleep(float(os.environ.get("FAKE_AGENT_TREE_DELAY", "0.3")))
+        write_transcript("agent tree started", limited=False)
+        time.sleep(float(os.environ.get("FAKE_AGENT_TREE_SETTLE_SEC", "0.5")))
+        write_subagent(AGENT_A, AGENT_A_LABEL, AGENT_A_MODEL)
+        write_subagent(AGENT_B, AGENT_B_LABEL, AGENT_B_MODEL)
+        draw_agent_tree(out)
 
     time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
 
@@ -258,6 +328,16 @@ def main():
                     out.write("winsize %dx%d\r\n" % (cols, rows))
                 except OSError:
                     out.write("winsize unknown\r\n")
+                out.flush()
+                continue
+            if line == "repaint-tree":
+                # A repaint the way claude's own TUI does one: new content,
+                # ESC[K wiping the row from wherever the label's cursor ends up
+                # — which wipes any overlay annotation that was sitting to the
+                # right of it, the exact flicker T27's per-frame repaint exists
+                # to fix.
+                draw_agent_tree(out, suffix="1 tool use")
+                out.write("GOT:repaint-tree\r\n")
                 out.flush()
                 continue
             if _MARKER.search(line) or "Write a complete handoff" in line:

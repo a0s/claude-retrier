@@ -42,6 +42,15 @@
 # While it runs there is a dim `◆ cr` in a corner of the screen — the wrapper's
 # only visible output. CR_BADGE=0 removes it.
 #
+# CR_AGENTS_OVERLAY=1 annotates each row of Claude Code's own subagent tree with
+# the model that agent is actually running on (read from its transcript, never
+# from the spawn request, which the model is free to ignore) — off by default,
+# since it means running a small terminal emulator over everything claude draws.
+# CR_AGENTS_POS (right|label, default right) picks where the annotation goes;
+# CR_AGENTS_POLL_SEC (default 1) how often the subagent files are re-read; and
+# CR_PAT_AGENT_ROW is the pattern that finds a tree row on screen, in case
+# Claude Code's own render of it ever changes shape.
+#
 # On startup it says so when a newer release exists, with the command that
 # updates the copy you are actually running — brew, git, or a link. The check
 # itself runs in the background and is read from a cache next time, so a session
@@ -224,6 +233,18 @@ CR_ROSTER_PATTERNS=(
   "describe a task for a new session"
 )
 
+# A row of Claude Code's own subagent tree, rendered into the screen grid (not
+# matched against the byte stream — the render is differential and word-split,
+# so grep finds nothing there). Column 1: the tree glyph (├/└/│ — a row whose
+# label starts with ⎿ is a child's status line, not an agent of its own, and
+# is filtered out in Python, not here). Column 2: the label, which is the
+# `description` Claude gave the Agent tool call and the only thing that ties a
+# screen row back to a real agent. Kept swappable so a render change upstream
+# is a variable, not a release.
+CR_AGENT_ROW_PATTERNS=(
+  "^ {3}([├└│])\\s(.+)$"
+)
+
 # =============================================================================
 # SECTION 2 — configuration (all overridable from the environment)
 # =============================================================================
@@ -246,6 +267,9 @@ CR_ROSTER_PATTERNS=(
 : "${CR_BADGE:=1}"                     # dim marker in a screen corner: "we are here"
 : "${CR_BADGE_POS:=bottom-right}"      # bottom-right | bottom-left | top-right | top-left
 : "${CR_BADGE_LABEL:=cr}"              # the word drawn next to the mark
+: "${CR_AGENTS_OVERLAY:=0}"            # 1 = annotate the subagent tree with models
+: "${CR_AGENTS_POS:=right}"            # right | label
+: "${CR_AGENTS_POLL_SEC:=1.0}"         # how often subagent files are re-read
 : "${CR_WAIT_SCALE:=1}"                # divide every wait by this (tests use 3600)
 : "${CR_CLAUDE_BIN:=}"                 # override the claude binary (a file, nothing else)
 : "${CR_CLAUDE_CMD:=}"                 # YOUR claude command: binary, PATH name, alias,
@@ -391,7 +415,7 @@ CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
 case "${1:-}" in
   --cr-version) echo "claude-retrier $CR_VERSION"; exit 0 ;;
   --cr-help|-h|--help-retrier)
-    sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
 esac
 
@@ -779,6 +803,9 @@ CFG = dict(
     badge=_env("CR_BADGE", "1") == "1",
     badge_pos=_env("CR_BADGE_POS", "bottom-right"),
     badge_label=_env("CR_BADGE_LABEL", "cr"),
+    agents_overlay=_env("CR_AGENTS_OVERLAY", "0") == "1",
+    agents_pos=_env("CR_AGENTS_POS", "right"),
+    agents_poll=_env("CR_AGENTS_POLL_SEC", 1.0, float),
     wait_scale=max(1e-6, _env("CR_WAIT_SCALE", 1.0, float)),
     poll=_env("CR_POLL_SEC", 2.0, float),
     scrape_confirm=_env("CR_SCRAPE_CONFIRM_SEC", 3.0, float),
@@ -875,6 +902,7 @@ PAT = {
     "ignore": _patterns("CR_PAT_IGNORE"),
     "roster": _patterns("CR_PAT_ROSTER"),
     "stall": _patterns("CR_PAT_STALL"),
+    "agent_row": _patterns("CR_PAT_AGENT_ROW"),
 }
 
 
@@ -3797,6 +3825,479 @@ def get_winsize(fd):
     return 24, 80
 
 
+# --------------------------------------------------------------------------- #
+# subagent tree overlay (T27) — annotates Claude Code's own agent tree with the
+# model each row is really running on.
+# --------------------------------------------------------------------------- #
+_SCREEN_CSI = re.compile(r"\x1b\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])")
+_SCREEN_OSC = re.compile(r"\x1b\][\s\S]*?(?:\x07|\x1b\\)")
+
+
+class Screen:
+    """A terminal emulator, just big enough to judge what a user would actually
+    see. A badge or an overlay is drawn with cursor positioning, so a test (or
+    the overlay itself) that greps the byte stream proves nothing: the question
+    is where those bytes land, whether the screen scrolled, and where the
+    cursor was left afterwards. This renders the stream into a grid and answers
+    that. test/screen.py re-exports this class via --cr-dump-python, so the
+    grid a test renders can never drift from what the supervisor actually feeds.
+
+    Supported: printable text with deferred wrap, CR/LF/BS/TAB, CUP,
+    CUU/CUD/CUF/CUB, CHA, ED/EL, SGR, DECSC/DECRC and CSI s/u, IL/DL (ESC[L /
+    ESC[M), ICH/DCH (ESC[@ / ESC[P), a scroll region (DECSTBM) with IND/RI, and
+    the DEC private modes (?25 cursor visibility, ?2026 synchronized update...)
+    a frame is wrapped in — consumed and ignored, since none of them move the
+    cursor or print text. Everything else is consumed and ignored too, which is
+    the right behaviour here: an unhandled sequence must never become text.
+    """
+    def __init__(self, rows=24, cols=80):
+        self.rows, self.cols = rows, cols
+        self.cells = [[" "] * cols for _ in range(rows)]
+        self.attrs = [[""] * cols for _ in range(rows)]
+        self.row = self.col = 0
+        self.attr = ""
+        self.wrap_pending = False
+        self.saved = (0, 0, "")
+        self.scrolled = 0            # how many times the screen scrolled up
+        self.top, self.bottom = 0, rows - 1   # scroll region, 0-based inclusive
+
+    # -- reading it back ---------------------------------------------------- #
+    def line(self, n):
+        """Row n, 1-based, right-stripped."""
+        return "".join(self.cells[n - 1]).rstrip()
+
+    def text(self):
+        return "\n".join(self.line(n + 1) for n in range(self.rows))
+
+    def attr_at(self, row, col):
+        return self.attrs[row - 1][col - 1]
+
+    def cursor(self):
+        """1-based (row, col), the way the escape sequences count."""
+        return (self.row + 1, self.col + 1)
+
+    # -- writing to it ------------------------------------------------------ #
+    def feed(self, data):
+        i, n = 0, len(data)
+        while i < n:
+            ch = data[i]
+            if ch == "\x1b":
+                i += self._escape(data, i)
+                continue
+            i += 1
+            if ch == "\r":
+                self.col, self.wrap_pending = 0, False
+            elif ch == "\n":
+                self._newline()
+            elif ch == "\b":
+                self.col = max(0, self.col - 1)
+                self.wrap_pending = False
+            elif ch == "\t":
+                self.col = min(self.cols - 1, (self.col // 8 + 1) * 8)
+            elif ch == "\x07":
+                pass
+            elif ch >= " ":
+                self._put(ch)
+        return self
+
+    def _put(self, ch):
+        if self.wrap_pending:
+            self.col = 0
+            self._newline()
+            self.wrap_pending = False
+        self.cells[self.row][self.col] = ch
+        self.attrs[self.row][self.col] = self.attr
+        if self.col + 1 >= self.cols:
+            self.wrap_pending = True      # deferred: the cell is filled, no scroll yet
+        else:
+            self.col += 1
+
+    def _newline(self):
+        if self.row == self.bottom:
+            self._scroll_up(self.top, self.bottom)
+        elif self.row + 1 >= self.rows:
+            self._scroll_up(0, self.rows - 1)
+        else:
+            self.row += 1
+
+    def _scroll_up(self, top, bottom, n=1):
+        if top > bottom:
+            return      # IL/DL issued below an active region's margin: no-op,
+                         # not a slice-insert that would grow the grid past rows
+        for _ in range(max(0, n)):
+            self.cells[top:bottom + 1] = self.cells[top + 1:bottom + 1] + [[" "] * self.cols]
+            self.attrs[top:bottom + 1] = self.attrs[top + 1:bottom + 1] + [[""] * self.cols]
+            if top == 0:
+                self.scrolled += 1
+
+    def _scroll_down(self, top, bottom, n=1):
+        if top > bottom:
+            return
+        for _ in range(max(0, n)):
+            self.cells[top:bottom + 1] = [[" "] * self.cols] + self.cells[top:bottom]
+            self.attrs[top:bottom + 1] = [[""] * self.cols] + self.attrs[top:bottom]
+
+    def _escape(self, data, i):
+        rest = data[i:]
+        m = _SCREEN_OSC.match(rest)
+        if m:
+            return m.end()
+        m = _SCREEN_CSI.match(rest)
+        if m:
+            self._csi(m.group(1), m.group(3))
+            return m.end()
+        if len(rest) >= 2:
+            nxt = rest[1]
+            if nxt == "7":
+                self.saved = (self.row, self.col, self.attr)
+            elif nxt == "8":
+                self.row, self.col, self.attr = self.saved
+                self.wrap_pending = False
+            elif nxt == "D":                 # IND: down, scrolling at the margin
+                self._newline()
+            elif nxt == "M":                 # RI: up, reverse-scrolling at the margin
+                self._reverse_index()
+            elif nxt == "E":                 # NEL
+                self.col = 0
+                self._newline()
+            return 2
+        return 1
+
+    def _reverse_index(self):
+        if self.row == self.top:
+            self._scroll_down(self.top, self.bottom)
+        else:
+            self.row = max(0, self.row - 1)
+
+    def _csi(self, params, final):
+        priv = params.startswith("?")
+        if priv:
+            # DEC private modes: ?25 (cursor visibility), ?2026 (synchronized
+            # update) and the rest move no cursor and print no text here.
+            return
+        nums = [int(p) if p.isdigit() else 0 for p in params.split(";")] if params else []
+
+        def arg(k, default=1):
+            return nums[k] if k < len(nums) and nums[k] else default
+
+        if final in "Hf":
+            self.row = min(self.rows - 1, max(0, arg(0) - 1))
+            self.col = min(self.cols - 1, max(0, arg(1) - 1))
+            self.wrap_pending = False
+        elif final == "A":
+            self.row = max(0, self.row - arg(0))
+        elif final == "B":
+            self.row = min(self.rows - 1, self.row + arg(0))
+        elif final == "C":
+            self.col = min(self.cols - 1, self.col + arg(0))
+        elif final == "D":
+            self.col = max(0, self.col - arg(0))
+        elif final == "G":
+            self.col = min(self.cols - 1, max(0, arg(0) - 1))
+        elif final == "J":
+            self._erase_display(arg(0, 0))
+        elif final == "K":
+            self._erase_line(arg(0, 0))
+        elif final == "L":                       # IL: insert blank lines at the cursor
+            self._scroll_down(self.row, self.bottom, arg(0))
+        elif final == "M":                       # DL: delete lines at the cursor
+            self._scroll_up(self.row, self.bottom, arg(0))
+        elif final == "@":                       # ICH
+            self._insert_chars(arg(0))
+        elif final == "P":                       # DCH
+            self._delete_chars(arg(0))
+        elif final == "r":                       # DECSTBM: scroll region
+            top = min(self.rows, arg(0)) - 1
+            bottom = min(self.rows, arg(1, self.rows)) - 1
+            self.top, self.bottom = (top, bottom) if top < bottom else (0, self.rows - 1)
+            # Origin mode (DECOM) is not implemented — this emulator only ever
+            # runs with it off — and with it off DECSTBM homes the cursor to
+            # the screen's absolute origin, not the new region's top margin.
+            self.row, self.col = 0, 0
+        elif final == "m":
+            self.attr = "" if not params or params == "0" else params
+        elif final == "s":
+            self.saved = (self.row, self.col, self.attr)
+        elif final == "u":
+            self.row, self.col, self.attr = self.saved
+
+    def _insert_chars(self, n):
+        row, arow = self.cells[self.row], self.attrs[self.row]
+        for _ in range(max(0, min(n, self.cols))):
+            row.insert(self.col, " ")
+            arow.insert(self.col, "")
+        del row[self.cols:]
+        del arow[self.cols:]
+
+    def _delete_chars(self, n):
+        row, arow = self.cells[self.row], self.attrs[self.row]
+        for _ in range(max(0, min(n, self.cols - self.col))):
+            del row[self.col]
+            del arow[self.col]
+        row.extend([" "] * (self.cols - len(row)))
+        arow.extend([""] * (self.cols - len(arow)))
+
+    def _blank_row(self, r, lo, hi):
+        for c in range(lo, hi):
+            self.cells[r][c] = " "
+            self.attrs[r][c] = ""
+
+    def _erase_line(self, mode):
+        if mode == 0:
+            self._blank_row(self.row, self.col, self.cols)
+        elif mode == 1:
+            self._blank_row(self.row, 0, self.col + 1)
+        else:
+            self._blank_row(self.row, 0, self.cols)
+
+    def _erase_display(self, mode):
+        if mode == 0:
+            self._blank_row(self.row, self.col, self.cols)
+            for r in range(self.row + 1, self.rows):
+                self._blank_row(r, 0, self.cols)
+        elif mode == 1:
+            for r in range(0, self.row):
+                self._blank_row(r, 0, self.cols)
+            self._blank_row(self.row, 0, self.col + 1)
+        else:
+            for r in range(self.rows):
+                self._blank_row(r, 0, self.cols)
+
+
+_CHILD_GLYPH = "⎿"  # a child's own status line, not an agent of its own
+
+
+def find_agent_rows(screen):
+    """[(row, label, label_col)] for every row of Claude Code's subagent tree
+    currently on screen — scanned in the GRID, never in the byte stream: the
+    render is differential and word-split (words separated by ESC[<col>G), so
+    a row's text does not exist as a contiguous run of bytes anywhere in the
+    stream. A row whose label starts with ⎿ is a child's status line, not an
+    agent's own row, and is left out; so is the trailing "· N tool uses" claude
+    appends to a label, which is not part of the description Agent tool calls
+    are keyed on.
+    """
+    found = []
+    for r in range(1, screen.rows + 1):
+        line = screen.line(r)
+        for pat in PAT["agent_row"]:
+            m = pat.match(line)
+            if not m:
+                continue
+            raw = m.group(2)
+            rest = raw.strip()
+            if not rest or rest.startswith(_CHILD_GLYPH):
+                break
+            label = rest.split(" · ")[0].strip()
+            if label:
+                # 1-based column the label actually starts at in THIS row, not
+                # an assumed constant — a render that indents differently (or
+                # a test grid that places it elsewhere) still gets the real
+                # position back.
+                label_col = m.start(2) + (len(raw) - len(raw.lstrip())) + 1
+                found.append((r, label, label_col))
+            break
+    return found
+
+
+_MODEL_DISPLAY = {
+    "claude-sonnet-5": "sonnet-5",
+    "claude-opus-5": "opus-5",
+    "claude-haiku-4-5-20251001": "haiku-4.5",
+    "claude-fable-5-1": "fable-5.1",
+}
+
+
+def model_label(slug, effort=None):
+    """The right-of-row annotation for one agent: 'sonnet-5/high', 'opus-5/?'
+    when the model is known but the effort is not (true of every subagent as
+    of 2.1.273 — perTurnEffort is always null on them), '…' before the first
+    assistant line has arrived (model unknown for ~3s on a fresh agent), or
+    '?' when two agents share a label and which is which cannot be told apart.
+
+    The spawn request's own "model" field is never accepted here: forks have
+    been observed to ignore it and run on a different model entirely (T27
+    evidence), so showing it would show a lie with a straight face.
+    """
+    if slug is None:
+        return "…"
+    if slug == "?":
+        return "?"
+    suffix = ""
+    base = slug
+    if base.endswith("[1m]"):
+        base, suffix = base[:-4], "[1m]"
+    name = _MODEL_DISPLAY.get(base, base) + suffix
+    return "%s/%s" % (name, effort) if effort else "%s/?" % name
+
+
+class SubagentRegistry:
+    """Maps a tree row's label to the model its agent is really running on.
+
+    Reads `<sessionId>/subagents/agent-*.{meta.json,jsonl}` next to the
+    transcript TranscriptWatcher is currently following — meta.json has the
+    `description` a row's label is matched against (and is written at spawn
+    time, before the model is known); the model comes only from the last
+    assistant line of the agent's OWN jsonl, never from meta.json or the
+    spawn request, both of which state an intent a fork is free to ignore.
+    Polled by mtime, the same way TranscriptWatcher is, and no more often than
+    `poll` seconds.
+    """
+    def __init__(self, poll=1.0):
+        self.poll = poll
+        self.next_poll = 0.0
+        self.session_path = None
+        self.dir = None
+        self.descriptions = {}     # agent_id -> description
+        self.meta_mtimes = {}      # agent_id -> mtime last read
+        self.jsonl_offsets = {}    # agent_id -> bytes already scanned
+        self.models = {}           # agent_id -> (slug, effort)
+        self.by_label = {}         # label -> agent_id, or "?" on a collision
+
+    def _rebind(self, session_path):
+        self.session_path = session_path
+        if session_path:
+            base = os.path.splitext(os.path.basename(session_path))[0]
+            self.dir = os.path.join(os.path.dirname(session_path), base, "subagents")
+        else:
+            self.dir = None
+        self.descriptions = {}
+        self.meta_mtimes = {}
+        self.jsonl_offsets = {}
+        self.models = {}
+        self.by_label = {}
+
+    def poll_now(self, session_path, now=None):
+        now = now if now is not None else time.time()
+        if session_path != self.session_path:
+            self._rebind(session_path)
+        if not self.dir or now < self.next_poll:
+            return
+        self.next_poll = now + self.poll
+        try:
+            metas = glob.glob(os.path.join(self.dir, "agent-*.meta.json"))
+        except OSError:
+            metas = []
+        by_label = {}
+        for path in metas:
+            agent_id = os.path.basename(path)[len("agent-"):-len(".meta.json")]
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            if self.meta_mtimes.get(agent_id) != mtime:
+                self.meta_mtimes[agent_id] = mtime
+                try:
+                    with open(path) as fh:
+                        meta = json.load(fh)
+                except (OSError, ValueError):
+                    meta = {}
+                self.descriptions[agent_id] = meta.get("description")
+            label = self.descriptions.get(agent_id)
+            if label:
+                by_label.setdefault(label, []).append(agent_id)
+            self._read_model(agent_id)
+        # A label two agents both claim can never be told apart on screen —
+        # show '?' for both rather than silently picking one (T27 AC).
+        self.by_label = {label: (ids[0] if len(ids) == 1 else "?")
+                          for label, ids in by_label.items()}
+
+    def _read_model(self, agent_id):
+        path = os.path.join(self.dir, "agent-%s.jsonl" % agent_id)
+        offset = self.jsonl_offsets.get(agent_id, 0)
+        # _appended() holds back a partial trailing line rather than parsing it
+        # half-written — the same idiom TranscriptWatcher's own records() uses,
+        # needed here too: a poll landing mid-write must not strand the rest of
+        # that line unreadable once it does land.
+        new_offset, rows = _appended(path, offset)
+        self.jsonl_offsets[agent_id] = new_offset
+        for raw in rows:
+            raw = raw.decode("utf-8", "replace").strip()
+            if not raw:
+                continue
+            try:
+                rec = json.loads(raw)
+            except ValueError:
+                continue
+            if rec.get("type") != "assistant" or rec.get("isSidechain"):
+                continue
+            msg = rec.get("message") or {}
+            model = msg.get("model")
+            if not model or model == "<synthetic>":
+                continue
+            effort = rec.get("effort") or msg.get("perTurnEffort") or None
+            self.models[agent_id] = (model, effort)
+
+    def model_for(self, label):
+        """(slug, effort) for a row's label; ("?", None) on a label collision;
+        None before any subagent file has named this label at all."""
+        agent_id = self.by_label.get(label)
+        if agent_id is None:
+            return None
+        if agent_id == "?":
+            return ("?", None)
+        return self.models.get(agent_id)
+
+
+class AgentOverlay:
+    def __init__(self, cfg):
+        self.enabled = bool(cfg["agents_overlay"])
+        self.pos = cfg["agents_pos"] if cfg["agents_pos"] in ("right", "label") else "right"
+        self.painted = {}      # row -> width last painted there
+
+    def paint(self, fd, rows, cols, screen, registry, badge_row=None):
+        if not self.enabled:
+            return False
+        # Which row the badge is anchored to — bottom-right/bottom-left share
+        # the last row, top-right/top-left the first — so the corner is only
+        # ever contested there, never assumed to be the bottom one.
+        avoid = rows if badge_row is None else badge_row
+        seen = set()
+        wrote = False
+        for row, label, label_col in find_agent_rows(screen):
+            if row == avoid:
+                continue        # never contest the badge's own row for the corner
+            model = registry.model_for(label)
+            text = model_label(*model) if model else model_label(None)
+            seen.add(row)
+            if self._paint_row(fd, rows, cols, row, label_col, len(screen.line(row)), text):
+                wrote = True
+        for row in [r for r in self.painted if r not in seen]:
+            del self.painted[row]
+        return wrote
+
+    def _paint_row(self, fd, rows, cols, row, label_col, own_width, text):
+        # The column has to be derived from the PADDED width, not the new
+        # text's own — otherwise a shrinking annotation (e.g. "sonnet-5/high"
+        # -> "sonnet-5/?", or two agents colliding down to a bare "?") is
+        # placed as if it were only as wide as the new text while still being
+        # padded out to the old, wider one, and the write overruns past the
+        # column it was placed at (in "right" mode: into or past the
+        # protected last column — exactly what Badge.sequence avoids by
+        # placing from len(draw), the already-padded string, not len(text)).
+        prev = self.painted.get(row, 0)
+        width = max(len(text), prev)
+        if cols < width + 2:
+            return False
+        if self.pos == "label":
+            col = label_col - width - 1
+            if col < 1:
+                return False
+        else:
+            # cols - width leaves the last cell untouched — writing into it is
+            # what makes a terminal wrap and scroll the whole screen by one
+            # line (the same rule Badge.place follows).
+            col = cols - width
+            if own_width >= col - 1:
+                return False    # claude's own text already reaches into our column
+        draw = text
+        if len(draw) < width:
+            draw = (" " * (width - len(draw))) + draw
+        seq = ("\x1b7\x1b[%d;%dH\x1b[2m%s\x1b[0m\x1b8" % (row, col, draw)).encode()
+        self.painted[row] = len(text)
+        return write_all(fd, seq)
+
+
 class Logger:
     """Writes to the one log file every wrapper on the machine shares.
 
@@ -3957,8 +4458,15 @@ def main(argv):
     ctl = Controller(run_cfg, log)
     lookup = WindowLookup(CFG, log)
     badge = Badge(CFG)
+    agents = AgentOverlay(CFG)
+    agent_registry = SubagentRegistry(poll=CFG["agents_poll"])
+    # Nothing is built when the overlay is off: no Screen, no per-frame feed,
+    # not one extra byte (CR_AGENTS_OVERLAY=0 AC).
+    tree_screen = Screen(rows, cols) if CFG["agents_overlay"] else None
     if not interactive:
         badge.enabled = False      # nothing to paint on when stdout is a pipe
+        agents.enabled = False
+        tree_screen = None
     usage_log = CodexUsageLog(CFG, log) if agent_name == "codex" and ctl.context_enabled else None
     watcher = TranscriptWatcher(poll=CFG["poll"], agent=build_agent(agent_name, argv),
                                 echo=[CFG["message"], ctl.resume_text])
@@ -4052,6 +4560,9 @@ def main(argv):
                 set_winsize(master, rows, cols)
                 badge.painted = None       # the corner it lived in has moved
                 badge.pending = True
+                if tree_screen is not None:
+                    tree_screen = Screen(rows, cols)
+                    agents.painted = {}
 
             now = time.time()
             timeout = 0.25
@@ -4084,6 +4595,18 @@ def main(argv):
                 badge.note_output(now)
                 text, esc_carry = split_escape_tail(
                     esc_carry + data.decode("utf-8", "replace"))
+                if tree_screen is not None:
+                    # Fed the same text write_all just sent to the real screen,
+                    # with an incomplete escape sequence held back exactly as
+                    # split_escape_tail already holds it back from detection —
+                    # so a frame cut in half by a read boundary is completed on
+                    # the next read rather than half-decoded as literal text.
+                    frame_closed = "\x1b[?2026l" in text
+                    tree_screen.feed(text)
+                    if frame_closed:
+                        agent_registry.poll_now(watcher.current, now)
+                        agents.paint(stdout_fd, rows, cols, tree_screen, agent_registry,
+                                    badge_row=(1 if badge.pos.startswith("top") else rows))
                 chunk = strip_ansi(text)
                 window = (window + chunk)[-8192:]
                 ctl.on_output(chunk, now)
@@ -4305,8 +4828,9 @@ CR_PAT_MENU=$(printf '%s\n' "${CR_MENU_PATTERNS[@]}")
 CR_PAT_IGNORE=$(printf '%s\n' "${CR_IGNORE_PATTERNS[@]}")
 CR_PAT_ROSTER=$(printf '%s\n' "${CR_ROSTER_PATTERNS[@]}")
 CR_PAT_STALL=$(printf '%s\n' "${CR_STALL_PATTERNS[@]}")
+CR_PAT_AGENT_ROW=$(printf '%s\n' "${CR_AGENT_ROW_PATTERNS[@]}")
 export CR_PAT_LIMIT CR_PAT_RESET CR_PAT_WORKING CR_PAT_MENU CR_PAT_IGNORE CR_PAT_ROSTER
-export CR_PAT_STALL
+export CR_PAT_STALL CR_PAT_AGENT_ROW
 
 case "${1:-}" in
   --cr-dump-python)
@@ -4315,7 +4839,7 @@ case "${1:-}" in
   --cr-dump-patterns)
     # The test suite reads the pattern arrays from here rather than re-declaring
     # them, so a pattern can never be tested in a form the wrapper doesn't use.
-    for _n in LIMIT RESET WORKING MENU IGNORE ROSTER STALL; do
+    for _n in LIMIT RESET WORKING MENU IGNORE ROSTER STALL AGENT_ROW; do
       eval "printf '### CR_PAT_%s\n%s\n' \"\$_n\" \"\$CR_PAT_$_n\""
     done
     exit 0 ;;
@@ -4400,6 +4924,7 @@ export CR_USER_IDLE_SEC CR_BUSY_IDLE_SEC CR_VERIFY_SEC CR_SCRAPE CR_LOG CR_NOTIF
 export CR_RESUME_SEC
 export CR_DRAFT_GRACE_SEC CR_TYPING_MAX_SEC
 export CR_BADGE CR_BADGE_POS CR_BADGE_LABEL
+export CR_AGENTS_OVERLAY CR_AGENTS_POS CR_AGENTS_POLL_SEC
 export CR_WAIT_SCALE CR_POLL_SEC CR_SCRAPE_CONFIRM_SEC
 export CR_AGENT
 export CR_STALL_WAIT_SEC CR_STALL_BACKOFF CR_STALL_MAX_WAIT_SEC CR_STALL_MAX_ATTEMPTS
