@@ -444,6 +444,20 @@ CR_CANCEL_MSG_DEFAULT='The context restart was cancelled — the handoff is not 
                                         # confirmation on its own, without a rebind
 : "${CR_CONTEXT_COOLDOWN_SEC:=600}"    # silence after any restart, successful or not
 : "${CR_CONTEXT_MAX_CYCLES:=0}"        # 0 = no cap; >0 is a fuse against a loop
+# A session fresh out of a restart already carries a baseline (system prompt,
+# CLAUDE.md, MCP tool defs, the resume read) before it writes a word -- against
+# a small window that alone can eat most of a percentage threshold's own
+# headroom, and the restart it just bought fires again in 30-40 minutes
+# instead of hours. CR_CONTEXT_MIN_HEADROOM is the floor the threshold is
+# raised to protect, capped to 30% of a window at or under 200k so a small
+# window is never asked for more slack than it could ever spare (T13).
+: "${CR_CONTEXT_MIN_HEADROOM:=80k}"
+# A threshold that keeps needing to raise itself, or a session that keeps
+# refilling in minutes, is not being protected by this feature any more -- it
+# is being ground down by it. More restarts than this inside a rolling hour
+# switches the trigger off for the rest of the session instead of guessing at
+# a better number (T13). 0 = no cap.
+: "${CR_CONTEXT_MAX_PER_HOUR:=3}"
 # Typing a "/" opens Claude Code's command list, where Enter can pick the
 # highlighted entry instead of submitting what was typed. On Claude Code 2.1.222
 # one Enter runs /clear and nothing asks for confirmation — so a slash command
@@ -888,6 +902,8 @@ CFG = dict(
     clear_settle=_env("CR_CLEAR_SETTLE_SEC", 5.0, float),
     context_cooldown=_env("CR_CONTEXT_COOLDOWN_SEC", 600.0, float),
     context_max_cycles=_env("CR_CONTEXT_MAX_CYCLES", 0, int),
+    context_min_headroom=parse_tokens(os.environ.get("CR_CONTEXT_MIN_HEADROOM") or "80k") or 0,
+    context_max_per_hour=_env("CR_CONTEXT_MAX_PER_HOUR", 3, int),
     slash_gap=_env("CR_SLASH_GAP_SEC", 0.9, float),
     slash_enter=_env("CR_SLASH_ENTER", 2, int),
     slash_enter_gap=_env("CR_SLASH_ENTER_GAP_SEC", 0.6, float),
@@ -2398,15 +2414,34 @@ def model_restart_at(agent, slug, window):
     LIVE value of CR_CODEX_RESERVE_TOKENS, not the frozen number baked into the
     profile — that knob is one the profile has no way to see.
     """
-    prof = MODEL_PROFILES.get(agent, {}).get(slug)
-    if not prof or prof.window != window:
+    prof = _matching_profile(agent, slug, window)
+    if not prof:
         return None
     candidate = prof.restart_at
     if prof.compact_at:
-        reserve = (parse_tokens(os.environ.get("CR_CODEX_RESERVE_TOKENS") or "64k") or 0) \
-            if agent == "codex" else 0
-        candidate = min(candidate, prof.compact_at - reserve)
+        candidate = min(candidate, prof.compact_at - _compaction_reserve(agent))
     return max(0, int(candidate))
+
+
+def _matching_profile(agent, slug, window):
+    """The profile row for this exact window, or None.
+
+    Shared by `model_restart_at` and the post-restart headroom guard (T13) --
+    both refuse a model whose window has moved past what the row was written
+    for rather than apply a profile that no longer describes it.
+    """
+    prof = MODEL_PROFILES.get(agent, {}).get(slug)
+    return prof if prof and prof.window == window else None
+
+
+def _compaction_reserve(agent):
+    """Live headroom this project holds back under a model's own compaction
+    point -- CR_CODEX_RESERVE_TOKENS for codex, the only agent with a knob of
+    its own; nothing for claude. Read fresh rather than trusting a number
+    frozen into the profile, which has no way to see this env var."""
+    if agent != "codex":
+        return 0
+    return parse_tokens(os.environ.get("CR_CODEX_RESERVE_TOKENS") or "64k") or 0
 
 
 def human_tokens(n):
@@ -2889,6 +2924,7 @@ CONTEXT_DEFAULTS = dict(
                "now. Continue with what you were doing before it was requested.",
     root_idle=20.0, handoff_timeout=900.0, step_gap=3.0, clear_settle=5.0,
     context_cooldown=600.0, context_max_cycles=0,
+    context_min_headroom=80000, context_max_per_hour=3,
     model_lookup=False, model_lookup_timeout=10.0,
     model_cache=os.path.expanduser("~/.claude-retrier/windows.json"),
     model_cache_ttl=604800.0, models_doc_url="", models_api_url="",
@@ -3071,6 +3107,8 @@ class Controller:
         self.rwake = 0.0              # earliest moment for the next step
         self.cycles = 0
         self.cooldown_until = 0.0
+        self._restart_times = []      # when each restart actually began, for the
+                                       # rolling-hour frequency guard (T13)
         self.context_before = 0       # what the context read just before /clear
         self.resume_echoed = False
         self.handoff_text = None      # the exact fold phrase last sent, nonce and all
@@ -4057,6 +4095,21 @@ class Controller:
             return "the session reports busy"
         return None
 
+    def _restart_thrashing(self, now):
+        """More restarts than `CR_CONTEXT_MAX_PER_HOUR` inside the last hour (T13).
+
+        A threshold that cannot hold for longer than 30-40 minutes is not
+        protecting the session any more, it is grinding it: the handoff fully
+        reprinted and the details it can't carry lost, again and again. `0`
+        means no cap, the same convention `context_max_cycles` uses.
+        """
+        cap = self.cfg["context_max_per_hour"]
+        if cap <= 0:
+            return False
+        cutoff = now - 3600.0
+        self._restart_times = [t for t in self._restart_times if t > cutoff]
+        return len(self._restart_times) >= cap
+
     def _maybe_restart(self, now):
         limit = self.trigger_limit() if self.context_enabled else None
         if limit is None:
@@ -4075,6 +4128,11 @@ class Controller:
             return interrupt
         if self._held(now):
             return None
+        if self._restart_thrashing(now):
+            return self._abort_restart(
+                "more than %d restarts in the last hour" % self.cfg["context_max_per_hour"],
+                now, permanent=True)
+        self._restart_times.append(now)
         self.cycles += 1
         self.handoff_tries = 0
         self.resume_tries = 0
@@ -4300,13 +4358,68 @@ class Controller:
             return False              # a zero reading is a synthetic/empty row, not a /clear
         return self.context_tokens <= self.context_before * self.RESTART_DROP
 
+    def _min_headroom(self):
+        """The floor `_guard_headroom` measures headroom against.
+
+        Capped to 30% of a window at or under 200k (T13): asking a small
+        window for the same 80k a 1M one can spare is asking for something it
+        never had to give, and would leave the guard firing every restart.
+        """
+        floor = self.cfg["context_min_headroom"]
+        if self.context_window and self.context_window <= 200000:
+            return min(floor, self.context_window * 0.3)
+        return floor
+
+    def _compaction_line(self):
+        """Where this model's own profile says the agent starts compacting on
+        its own, net of the same live reserve `model_restart_at` ceilings
+        restart_at under -- or None when no profile matches the window we are
+        actually on, the same case `model_restart_at` refuses to guess for."""
+        agent = "codex" if self.codex else "claude"
+        prof = _matching_profile(agent, model_slug(self.context_model), self.context_window)
+        if not prof or not prof.compact_at:
+            return None
+        return prof.compact_at - _compaction_reserve(agent)
+
+    def _guard_headroom(self):
+        """A session fresh out of a restart is not actually at zero (T13): the
+        system prompt, CLAUDE.md, MCP tool defs and the resume read already
+        cost real tokens, and against a small window that baseline alone can
+        eat most of a percentage threshold's own headroom -- so the restart it
+        just bought fires again in 30-40 minutes instead of hours.
+
+        Raises `context_limit` when the model's own compaction point leaves
+        real room to do that, and says so quietly (a log line); when it does
+        not, says so out loud instead -- disarming would only trade one
+        failure mode for another (never restarting again), so the trigger
+        stays as it is and a person is told to widen it by hand.
+        """
+        if not self.context_window or not self.context_limit or self.context_tokens is None:
+            return None
+        baseline = self.context_tokens
+        headroom = self.context_limit - baseline
+        if headroom >= self._min_headroom():
+            return None
+        ceiling = self._compaction_line()
+        raised = min(baseline + self.cfg["context_min_headroom"], ceiling) if ceiling else None
+        if raised and raised > self.context_limit:
+            self.log("after the restart the context already sits at %s of a %s threshold; "
+                     "raising the threshold to %s for this session"
+                     % (human_tokens(baseline), human_tokens(self.context_limit),
+                        human_tokens(raised)))
+            self.context_limit = raised
+            return None
+        return ("threshold leaves %s of working room; consider a larger CR_CONTEXT_PCT "
+                "or a bigger window" % human_tokens(headroom))
+
     def _check_resume(self, now):
         if self._context_fell():
             note = ("context restarted: %s down to %s"
                     % (human_tokens(self.context_before), human_tokens(self.context_tokens)))
             self.log(note)
+            warn = self._guard_headroom()
             self._end_restart(now)
-            return ("notify", note)
+            return ("notify", "%s; %s" % (note, warn) if warn else note)
         if now < self.rwake:
             return None
         if self._held(now):
@@ -6030,6 +6143,7 @@ export CR_CLAUDE_RESUME_MSG CR_CODEX_RESUME_MSG
 export CR_CLAUDE_CANCEL_MSG CR_CODEX_CANCEL_MSG
 export CR_ROOT_IDLE_SEC CR_HANDOFF_TIMEOUT_SEC CR_STEP_GAP_SEC CR_CLEAR_SETTLE_SEC
 export CR_CONTEXT_COOLDOWN_SEC CR_CONTEXT_MAX_CYCLES
+export CR_CONTEXT_MIN_HEADROOM CR_CONTEXT_MAX_PER_HOUR
 export CR_SLASH_GAP_SEC CR_SLASH_ENTER CR_SLASH_ENTER_GAP_SEC
 
 # The supervisor is handed over on a file descriptor rather than as an argument.

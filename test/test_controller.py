@@ -776,6 +776,95 @@ class TestTheHappyPath(RestartTestCase):
         self.assertIsNone(self.tick(ctl, 200))
 
 
+class TestPostRestartHeadroom(RestartTestCase):
+    """T13: a threshold that is a fraction of the window says nothing about the
+    absolute baseline a freshly-cleared session already carries (system prompt,
+    CLAUDE.md, MCP tool defs, the resume read) -- against a small window that
+    baseline alone can eat most of the threshold's own headroom, and the
+    restart it just bought fires again in 30-40 minutes instead of hours.
+    """
+
+    def restarted(self, ctl, pre_tokens, post_tokens, model):
+        usage(ctl, 0, pre_tokens)
+        action = self.tick(ctl, 30)
+        if action and action[0] == "inject":
+            ctl.on_handoff_echo(MINE, 30)
+        ctl.handoff.write(ctl, at=40)
+        usage(ctl, 40, pre_tokens)
+        self.tick(ctl, 65)                 # /clear goes out
+        moved(ctl, AFTER, 66)
+        self.tick(ctl, 66)                 # confirmed: CLEARED
+        self.tick(ctl, 69)                 # resume phrase sent
+        usage(ctl, 72, post_tokens, model=model, path=AFTER)
+        return self.tick(ctl, 73)
+
+    def test_a_baseline_that_eats_the_threshold_raises_it(self):
+        # 200k window, 51% threshold (102k), 57k left after the restart: only
+        # 45k of headroom, under the 80k floor, so the threshold is raised.
+        ctl = restart_controller(context_pct=51, context_window="200k")
+        action = self.restarted(ctl, pre_tokens=150000, post_tokens=57000,
+                                model="claude-haiku-4-5")
+        self.assertEqual(action[0], "notify")
+        self.assertIn("restarted", action[1])
+        self.assertTrue(any("raising the threshold" in l for l in ctl.log_lines))
+        # baseline (57k) + the full CR_CONTEXT_MIN_HEADROOM (80k)...
+        self.assertGreaterEqual(ctl.context_limit, 137000)
+        # ...but never past this model's own compaction point (190k for the
+        # 200k claude family), the ceiling nothing here is allowed to guess past.
+        self.assertLessEqual(ctl.context_limit, 190000)
+
+    def test_plenty_of_headroom_leaves_the_threshold_alone(self):
+        # 1M window, 51% threshold (510k), 55k left after the restart: 455k of
+        # headroom is nowhere near the 80k floor, so nothing changes.
+        ctl = restart_controller(context_pct=51, context_window="1M")
+        action = self.restarted(ctl, pre_tokens=700000, post_tokens=55000,
+                                model="claude-opus-5")
+        self.assertEqual(action[0], "notify")
+        self.assertNotIn("raising the threshold", action[1])
+        self.assertFalse(any("raising the threshold" in l for l in ctl.log_lines))
+        self.assertEqual(ctl.context_limit, 510000)
+
+
+class TestRestartFrequencyGuard(RestartTestCase):
+    """T13: a threshold that cannot hold for longer than 30-40 minutes is not
+    being protected by the restart, it is being ground down by it. More than
+    `CR_CONTEXT_MAX_PER_HOUR` restarts inside a rolling hour disables the
+    trigger for the rest of the session instead of guessing at a better one."""
+
+    def cycle(self, ctl, t0, before_path, after_path):
+        usage(ctl, t0, FULL, path=before_path)
+        action = self.tick(ctl, t0 + 30)
+        if action and action[0] == "inject":
+            ctl.on_handoff_echo(before_path, t0 + 30)
+        ctl.handoff.write(ctl, at=t0 + 40)
+        usage(ctl, t0 + 40, FULL, path=before_path)
+        self.tick(ctl, t0 + 65)
+        moved(ctl, after_path, t0 + 66)
+        self.tick(ctl, t0 + 66)
+        self.tick(ctl, t0 + 69)
+        usage(ctl, t0 + 72, 8000, path=after_path)
+        return self.tick(ctl, t0 + 73)
+
+    def test_a_fourth_restart_within_the_hour_switches_it_off(self):
+        ctl = restart_controller(context_cooldown=0)
+        p1, p2, p3 = "/proj/after1.jsonl", "/proj/after2.jsonl", "/proj/after3.jsonl"
+        self.cycle(ctl, 0, MINE, p1)
+        self.cycle(ctl, 100, p1, p2)
+        self.cycle(ctl, 200, p2, p3)
+        self.assertEqual(ctl.cycles, 3)
+        self.assertTrue(ctl.context_enabled)
+
+        usage(ctl, 300, FULL, path=p3)
+        action = self.tick(ctl, 330)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("restarts in the last hour", action[1])
+        self.assertTrue(ctl.context_off)
+        self.assertFalse(ctl.context_enabled)
+        self.assertIsNone(ctl.badge_context())
+        self.assertIsNone(ctl.rstate)
+        self.assertEqual(ctl.cycles, 3)            # the fourth never started
+
+
 class TestACollapsedRowKeepsEndTurn(RestartTestCase):
     """T11: the row that closes the fold turn can be followed, in the very same
     poll, by a streaming fragment of the NEXT turn whose stop_reason is still
