@@ -1346,13 +1346,27 @@ def transcript_limit_records(path, offset=0, echo=None):
                 out.append(dict(kind="echo", text=text, ts=rec.get("timestamp")))
             elif rec.get("type") == "assistant":
                 row = assistant_row(rec)
-                if out and out[-1]["kind"] == "alive":
+                prev = out[-1] if out else None
+                if (prev and prev["kind"] == "alive"
+                        and prev["sidechain"] == row["sidechain"]):
                     # The collapse keeps the NEWEST row's figures. Keeping the
                     # older row's would freeze the context reading at whatever it
                     # was when the answer began, which for a long answer is a
-                    # threshold that arrives an answer late.
-                    out[-1].update(row)
+                    # threshold that arrives an answer late. stop_reason is the
+                    # one field exempt from that: a streaming fragment reports
+                    # stop_reason=None, and letting it overwrite a real value
+                    # (e.g. "end_turn" from the row that just closed the turn)
+                    # would erase the very fact a caller needs.
+                    stop_reason = row["stop_reason"]
+                    if stop_reason is None:
+                        stop_reason = prev["stop_reason"]
+                    prev.update(row)
+                    prev["stop_reason"] = stop_reason
                 else:
+                    # A sidechain row never merges with a root row (or vice
+                    # versa): its usage figures belong to a subagent, not the
+                    # session, and mixing them into one record would hide
+                    # whichever side lost the merge from the caller entirely.
                     out.append(row)
             continue
         err = str(rec.get("error") or "")
