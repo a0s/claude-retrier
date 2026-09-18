@@ -903,6 +903,17 @@ class TestContextRestart(PtyTestCase):
         s.drain(3)
         self.assertNotIn("GOT:/clear", s.buf)
 
+    def test_a_lost_fold_phrase_is_retyped_and_the_restart_still_completes(self):
+        # T06: the first attempt is swallowed as if it never reached the
+        # session at all -- no file, no transcript row, no GOT reply. Nothing
+        # but the wrapper's own no-echo timeout (CR_VERIFY_SEC) can notice that
+        # and retype it; the second attempt is the one fake_claude answers.
+        s = self.session(env=self.env(FAKE_SCRIPT="dropfirstfold"), cwd=self.work)
+        self.assertTrue(self.wait_log("left no trace", s, timeout=20), self.logged())
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_log("context restarted", s), self.logged())
+
     def test_a_session_under_the_threshold_is_left_alone(self):
         s = self.session(env=self.env(FAKE_USAGE="200000"), cwd=self.work)
         self.assertTrue(s.read_until("ready"))

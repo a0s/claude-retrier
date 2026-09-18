@@ -681,10 +681,20 @@ class RestartTestCase(unittest.TestCase):
         self.assertNotIn("/clear", self.injected())
 
     # -- the machine, one step at a time ------------------------------------ #
-    def fold(self, ctl, tokens=FULL, at=0, tick_at=30):
-        """From "the context is full" to the folding phrase going out."""
+    def fold(self, ctl, tokens=FULL, at=0, tick_at=30, echo=True):
+        """From "the context is full" to the folding phrase going out.
+
+        `echo=True` simulates the ordinary case, where claude wrote the phrase
+        into the transcript (T06) — every test about what happens once a
+        handoff file is present assumes that already happened, the same way it
+        assumes the phrase was typed at all. The tests that are specifically
+        about a missing echo pass `echo=False`.
+        """
         usage(ctl, at, tokens)
-        return self.tick(ctl, tick_at)
+        action = self.tick(ctl, tick_at)
+        if echo and action and action[0] == "inject":
+            ctl.on_handoff_echo(MINE, tick_at)
+        return action
 
     def folded(self, ctl, written_at=40):
         """...and the model writes the file and finishes its turn."""
@@ -965,6 +975,55 @@ class TestNothingIsClearedOnAPromise(RestartTestCase):
         self.assertEqual(action[0], "notify")
         self.assertIn("no usable handoff", action[1])
         self.assertNeverCleared()
+
+
+class TestTheHandoffPhraseHasToHaveLanded(RestartTestCase):
+    """T06: the fold phrase's own echo is proof it reached the session at all —
+    the popup-ate-the-keystrokes case a valid-looking file can never rule out on
+    its own, because a file that merely looks right could belong to a
+    neighbouring session (T04/T06)."""
+
+    def test_a_phrase_with_no_echo_and_no_file_is_retyped_then_gives_up(self):
+        ctl = restart_controller()
+        self.fold(ctl, echo=False)
+        self.assertIsNone(self.tick(ctl, 89))          # under CR_VERIFY_SEC(60)
+
+        action = self.tick(ctl, 90)                    # 60s since the send: retype
+        self.assertEqual(action[0], "inject")
+        self.assertEqual(ctl.handoff_tries, 1)          # not spent on a no-echo resend
+        self.assertEqual(ctl.handoff_echo_retries, 1)
+        self.assertIn("left no trace", ctl.log_lines[-2])
+
+        action = self.tick(ctl, 150)                    # 60s since THAT send
+        self.assertEqual(action[0], "inject")
+        self.assertEqual(ctl.handoff_echo_retries, 2)
+
+        action = self.tick(ctl, 210)                    # the cap is spent
+        self.assertEqual(action[0], "notify")
+        self.assertIn("never reached the session", action[1])
+        self.assertNeverCleared()
+        self.assertIsNone(ctl.rstate)
+
+    def test_the_echo_is_proof_of_identity_even_on_a_different_transcript(self):
+        ctl = restart_controller()
+        self.fold(ctl, echo=False)
+        self.assertEqual(ctl.context_path, MINE)
+        other = "/proj/neighbour.jsonl"
+        self.assertTrue(ctl.on_handoff_echo(other, 31))
+        self.assertTrue(ctl.handoff_echoed)
+        self.assertEqual(ctl.context_path, other)
+        self.assertIn("was echoed there", ctl.log_lines[-1])
+
+    def test_a_valid_looking_file_does_not_clear_before_the_echo_does(self):
+        ctl = restart_controller()
+        self.fold(ctl, echo=False)
+        self.folded(ctl, written_at=40)
+        self.assertIsNone(self.tick(ctl, 65))            # every other layer agrees...
+        self.assertFalse(ctl.handoff_echoed)              # ...but this one hasn't
+        self.assertNeverCleared()
+
+        self.assertTrue(ctl.on_handoff_echo(MINE, 66))
+        self.assertEqual(self.tick(ctl, 67), ("inject", "/clear", False))
 
 
 class TestTheClearHasToHaveWorked(RestartTestCase):
