@@ -1514,16 +1514,39 @@ class TestWhatCountsAsContext(RestartTestCase):
         usage(ctl, 0, 10, model="claude-sonnet-4-5")
         self.assertEqual(ctl.context_limit, 100000)
 
-    def test_an_unfamiliar_model_is_not_guessed_at(self):
-        # Assuming the small window is what folded a 1M session at 12% full:
-        # 118k of a 1M window read as 59% of a 200k one. An unfamiliar slug is
-        # almost always a new — which is to say large — model, so nothing is
-        # assumed and the percentage trigger simply does not arm.
+    def test_an_unfamiliar_model_gets_a_modal_window_estimate(self):
+        # The actual bug: assuming the SMALL window put a 1M session on a 200k
+        # denominator and folded it at 12% full. Leaving the trigger disarmed
+        # instead just traded one failure for another: a new model appears
+        # exactly when the table goes stale, and a session with nothing armed
+        # dies of its own context instead. T19: guess large (a new slug is
+        # almost always a new model) and keep asking the network for
+        # something firmer while that guess stands.
         ctl = restart_controller(context_window="auto")
         usage(ctl, 0, 10, model="claude-something-9")
-        self.assertIsNone(ctl.context_window)
-        self.assertIsNone(ctl.context_limit)
-        self.assertEqual(ctl.window_unknown, "claude-something-9")
+        self.assertEqual(ctl.context_window, 1000000)     # the table's modal window
+        self.assertEqual(ctl.context_limit, 500000)
+        self.assertTrue(ctl.context_estimated)
+        self.assertEqual(ctl.window_unknown, "claude-something-9")   # still worth asking
+
+    def test_an_estimate_keeps_escalating_past_what_usage_proves_it(self):
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="not-a-claude-slug-at-all")
+        self.assertEqual(ctl.context_window, 200000)      # nothing claude-shaped to go on
+        self.assertTrue(ctl.context_estimated)
+        usage(ctl, 5, 250000, model="not-a-claude-slug-at-all")
+        self.assertEqual(ctl.context_window, 1000000)
+        self.assertTrue(any("past the 200k window assumed" in l for l in ctl.log_lines))
+        usage(ctl, 10, 1100000, model="not-a-claude-slug-at-all")
+        self.assertEqual(ctl.context_window, 1500000)     # past 1M too: +50%
+
+    def test_an_estimate_that_survives_most_of_itself_stops_being_a_guess(self):
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-something-9")
+        self.assertTrue(ctl.context_estimated)
+        usage(ctl, 5, 650000, model="claude-something-9")     # past 60% of 1M, no compaction
+        self.assertFalse(ctl.context_estimated)
+        self.assertTrue(any("no longer marked as a guess" in l for l in ctl.log_lines))
 
     def test_a_synthetic_row_between_two_real_ones_is_not_a_model_change(self):
         # "<synthetic>" ("No response requested", an interrupted request) sits
@@ -1562,29 +1585,36 @@ class TestWhatCountsAsContext(RestartTestCase):
         self.assertEqual(ctl.context_limit, 500000)
         self.assertIsNone(ctl.window_unknown)
 
-    def test_an_unknown_window_never_folds_however_full_it_looks(self):
+    def test_an_unfamiliar_model_still_folds_on_its_estimate(self):
+        # T19: the estimate arms the trigger from the first turn, not just
+        # once a lookup answers — the badge shows the guess is unconfirmed
+        # (~), it is not left silent as "window?".
         ctl = restart_controller(context_window="auto")
         usage(ctl, 0, 900000, model="claude-something-9")
-        self.assertIsNone(self.tick(ctl, 60))
-        self.assertEqual(ctl.badge_warn(), "window?")
+        self.assertIsNotNone(self.tick(ctl, 60))
+        self.assertIsNone(ctl.badge_warn())
 
-    def test_the_lookup_answer_arms_the_trigger(self):
+    def test_a_confirmed_answer_replaces_the_estimate(self):
         ctl = restart_controller(context_window="auto")
-        usage(ctl, 0, 600000, model="claude-something-9")
-        self.assertIsNone(self.tick(ctl, 60))
-        self.assertTrue(ctl.on_window_learned("claude-something-9", 1000000,
+        usage(ctl, 0, 10, model="claude-something-9")
+        self.assertTrue(ctl.context_estimated)
+        self.assertEqual(ctl.context_window, 1000000)      # the modal-window guess
+        self.assertEqual(ctl.window_unknown, "claude-something-9")
+        self.assertTrue(ctl.on_window_learned("claude-something-9", 2000000,
                                               "the models docs"))
-        self.assertEqual(ctl.context_limit, 500000)
+        self.assertEqual(ctl.context_window, 2000000)
+        self.assertEqual(ctl.context_limit, 1000000)
+        self.assertFalse(ctl.context_estimated)
         self.assertIsNone(ctl.window_unknown)
         self.assertIsNone(ctl.badge_warn())
-        self.assertIsNotNone(self.tick(ctl, 120))      # 600k is past 500k
 
     def test_an_answer_about_another_model_is_kept_but_not_applied(self):
         # A lookup takes seconds and a session can change model inside them.
         ctl = restart_controller(context_window="auto")
         usage(ctl, 0, 10, model="claude-something-9")
+        self.assertEqual(ctl.context_window, 1000000)      # the estimate, not None
         self.assertFalse(ctl.on_window_learned("claude-other-9", 300000, "docs"))
-        self.assertIsNone(ctl.context_window)
+        self.assertEqual(ctl.context_window, 1000000)      # unaffected either way
         usage(ctl, 5, 10, model="claude-other-9")
         self.assertEqual(ctl.context_window, 300000)
 
@@ -1648,6 +1678,41 @@ class TestWhatCountsAsContext(RestartTestCase):
         usage(ctl, 1, 9000, path="/proj/somebody-else.jsonl")
         self.assertEqual(ctl.context_tokens, FULL)
         self.assertEqual(ctl.context_path, MINE)
+
+
+class TestSelfCompactionCorrectsTheWindowDownward(RestartTestCase):
+    """T19: the agent compacting on its own is evidence, not a guess — the
+    session just told us its effective window is no bigger than what it held
+    right before folding itself."""
+
+    def test_a_compact_boundary_shrinks_an_assumed_1m_window(self):
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 1000000)
+        ctl.on_context(dict(kind="alive", path=MINE, quiet=True, sidechain=False,
+                            compacted=True, pre_tokens=190000), 5)
+        self.assertEqual(ctl.context_window, 206521)          # 190000 / 0.92
+        self.assertEqual(ctl.context_limit, 103260)            # half of it, recalculated
+        self.assertFalse(ctl.context_estimated)                # observed, not guessed
+        self.assertTrue(any("the effective window is" in l for l in ctl.log_lines))
+
+    def test_a_compaction_right_at_the_windows_own_edge_proves_nothing(self):
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-opus-5")
+        ctl.on_context(dict(kind="alive", path=MINE, quiet=True, sidechain=False,
+                            compacted=True, pre_tokens=950000), 5)
+        self.assertEqual(ctl.context_window, 1000000)          # untouched: 950k / 0.92 > 1M
+
+    def test_codexs_own_compaction_still_uses_the_last_known_count(self):
+        # codex's own `compacted` row carries no preTokens of its own; the
+        # count this session last reported stands in, same as before T19.
+        ctl = restart_controller(agent="codex", context_window="auto", context_pct=50)
+        ctl.on_context(dict(kind="alive", path=MINE, sidechain=False,
+                            window=258400, tokens=200000), 0)
+        ctl.on_context(dict(kind="alive", path=MINE, quiet=True, sidechain=False,
+                            compacted=True), 1)
+        self.assertEqual(ctl.context_window, int(200000 / 0.92))
+        self.assertEqual(ctl.self_compactions, 1)
 
 
 class TestAPerModelTokenOverride(RestartTestCase):

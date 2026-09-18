@@ -551,6 +551,46 @@ class TestAssistantRows(unittest.TestCase):
         self.assertIsNone(row["tokens"])
 
 
+def compact_boundary(pre_tokens=190000):
+    """claude's own row for compacting the context on its own (T19)."""
+    return {"type": "system", "subtype": "compact_boundary",
+            "timestamp": "2026-09-19T00:00:00.000Z",
+            "compactMetadata": {"trigger": "auto", "preTokens": pre_tokens}}
+
+
+class TestCompactBoundaryRows(unittest.TestCase):
+    """T19: the one row that says outright how large the context actually was
+    right before claude decided on its own that it was full."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-cb-")
+        self.path = os.path.join(self.dir, "s.jsonl")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def write(self, *records):
+        with open(self.path, "a") as fh:
+            for r in records:
+                fh.write(json.dumps(r) + "\n")
+
+    def rows(self):
+        return cr.transcript_limit_records(self.path, 0)[1]
+
+    def test_it_parses_into_an_alive_record_with_the_pre_compaction_count(self):
+        self.write(compact_boundary(190000))
+        row = self.rows()[0]
+        self.assertEqual(row["kind"], "alive")
+        self.assertTrue(row["quiet"])
+        self.assertTrue(row["compacted"])
+        self.assertEqual(row["pre_tokens"], 190000)
+
+    def test_it_never_merges_with_a_neighbouring_assistant_row(self):
+        self.write(assistant(tokens=100), compact_boundary(190000), assistant(tokens=50))
+        rows = self.rows()
+        self.assertEqual([r.get("compacted") for r in rows], [None, True, None])
+        self.assertEqual(rows[0]["tokens"], 100)
+        self.assertEqual(rows[2]["tokens"], 50)
+
+
 class TestWhichTranscriptIsOurs(unittest.TestCase):
     """A project directory holds more than one live transcript. For a limit that
     never mattered — a limit is the account's. For the context trigger it is the

@@ -52,6 +52,16 @@ class TestText(unittest.TestCase):
         text, _ = badge(badge_label="claude-retrier").frame(cr.IDLE, 0, 0, 3, 0)
         self.assertEqual(text, "◆ claude-retrier")
 
+    def test_the_context_percentage_shows(self):
+        text, _ = badge().frame(cr.IDLE, 0, 0, 3, 0, context=47.0)
+        self.assertEqual(text, "◆ cr 47%")
+
+    def test_an_estimated_percentage_carries_a_tilde(self):
+        # T19: the denominator behind this percentage is a guess, not a
+        # confirmed window -- worth saying on the one line anyone watches.
+        text, _ = badge().frame(cr.IDLE, 0, 0, 3, 0, context=47.0, context_estimated=True)
+        self.assertEqual(text, "◆ cr ~47%")
+
     def test_waiting_blinks_but_nothing_else_does(self):
         b = badge()
         marks = {b.frame(cr.WAITING, 60, 0, 3, t)[0][0] for t in (0, b.PULSE, 2 * b.PULSE)}
