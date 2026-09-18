@@ -1078,9 +1078,11 @@ class TestNothingIsClearedOnAPromise(RestartTestCase):
         ctl = restart_controller(handoff_timeout=60)
         self.fold(ctl)
         usage(ctl, 40, FULL, stop="tool_use")      # a turn that never ends
-        action = self.tick(ctl, 200)
-        self.assertEqual(action[0], "notify")
-        self.assertIn("no usable handoff", action[1])
+        # T09: the phrase was echoed (fold()'s default), so the timeout leads
+        # into a cancel rather than a plain notify -- see TestCancelAfterAbort.
+        self.assertIsNone(self.tick(ctl, 200))
+        self.assertIn("no usable handoff", ctl.log_lines[-1])
+        self.assertEqual(ctl.rstate, cr.CANCEL_PENDING)
         self.assertNeverCleared()
 
 
@@ -1214,6 +1216,85 @@ class TestTheClearHasToHaveWorked(RestartTestCase):
         self.assertEqual(action[0], "notify")
         self.assertIn("restarted", action[1])
         self.assertIsNone(ctl.rstate)
+
+
+class TestCancelAfterAbort(RestartTestCase):
+    """T09: an abort that comes AFTER the fold already reached the session (an
+    echo was seen) cannot just leave the session be, the way an ordinary abort
+    does -- the model was told to wrap up and start nothing new, and walking
+    away leaves an autonomous session sitting on that instruction until a
+    person happens to show up. Only HANDOFF_SENT/HANDOFF_OK, and only once the
+    phrase was echoed, take this branch instead of the plain notify."""
+
+    def test_a_delivered_fold_with_no_file_by_the_timeout_gets_a_cancel(self):
+        ctl = restart_controller()
+        self.fold(ctl)                              # echo=True: the phrase landed
+        self.assertTrue(ctl.handoff_echoed)
+
+        self.assertIsNone(self.tick(ctl, 30 + 900 + 1))   # handoff_timeout elapses, no file
+        self.assertEqual(ctl.rstate, cr.CANCEL_PENDING)
+        self.assertIn("restart aborted at handoff_sent", ctl.log_lines[-1])
+
+        action = self.tick(ctl, 30 + 900 + 2)
+        self.assertEqual(action[0], "inject")
+        self.assertIn("cancelled", action[1])
+        self.assertIn("asking the session to carry on", ctl.log_lines[-1])
+        self.assertEqual(ctl.rstate, cr.CANCEL_PENDING)    # one more tick still to close it
+
+        end_at = 30 + 900 + 3
+        self.assertIsNone(self.tick(ctl, end_at))
+        self.assertIsNone(ctl.rstate)
+        self.assertEqual(ctl.cooldown_until, end_at + ctl.cfg["context_cooldown"])
+
+    def test_an_undelivered_fold_gets_no_cancel(self):
+        ctl = restart_controller()
+        self.fold(ctl, echo=False)
+        self.assertFalse(ctl.handoff_echoed)
+        self.tick(ctl, 90)                          # left no trace; retyped (1/2)
+        self.tick(ctl, 150)                          # retyped again (2/2)
+        action = self.tick(ctl, 210)                 # the cap is spent
+        self.assertEqual(action[0], "notify")
+        self.assertIn("never reached the session", action[1])
+        self.assertIsNone(ctl.rstate)
+
+    def test_abort_while_accepted_but_not_yet_cleared_is_a_cancel(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        self.folded(ctl, written_at=40)
+        ctl.on_turn("open", 41)                      # holds `_send_clear` back
+        self.assertIsNone(self.tick(ctl, 65))
+        self.assertEqual(ctl.rstate, cr.HANDOFF_OK)
+
+        action = self.tick(ctl, 65 + 901)             # handoff_timeout elapses, still held
+        self.assertIsNone(action)
+        self.assertEqual(ctl.rstate, cr.CANCEL_PENDING)
+        self.assertIn("restart aborted at handoff_ok", ctl.log_lines[-1])
+
+    def test_abort_while_clearing_is_not_a_cancel(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        self.folded(ctl)
+        self.tick(ctl, 65)                            # handoff verified; /clear sent
+        self.assertEqual(ctl.rstate, cr.CLEAR_SENT)
+        self.assertTrue(ctl.handoff_echoed)            # the fold WAS delivered...
+
+        action = self.tick(ctl, 65 + 901)              # ...but /clear itself never confirms
+        self.assertEqual(action[0], "notify")
+        self.assertIsNone(ctl.rstate)
+
+    def test_abort_restart_only_treats_handoff_states_as_cancellable(self):
+        """CLEARED/UNFOLD_FAILED never reach `_abort_restart` through the
+        public state machine at all (T08 resolves them a different way), and
+        RESUME_SENT's only abort is `permanent`. None of that is reachable
+        from the outside to prove a negative, so the guard is exercised
+        directly here instead."""
+        for state in (cr.CLEARED, cr.UNFOLD_FAILED, cr.RESUME_SENT):
+            ctl = restart_controller()
+            ctl.rstate = state
+            ctl.handoff_echoed = True
+            action = ctl._abort_restart("forced for the test", 100)
+            self.assertEqual(action[0], "notify")
+            self.assertIsNone(ctl.rstate)
 
 
 class TestUnfoldCanFail(RestartTestCase):

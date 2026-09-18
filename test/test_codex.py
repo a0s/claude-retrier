@@ -622,13 +622,16 @@ class TestPerAgentMessages(unittest.TestCase):
 
     def test_handoff_msg_and_clear_cmd_follow_the_same_rule(self):
         mod = load(CR_CODEX_HANDOFF_MSG="fold it, codex-style: {file} / {marker}",
-                  CR_CLAUDE_CLEAR_CMD="/clear-please")
+                  CR_CLAUDE_CLEAR_CMD="/clear-please",
+                  CR_CODEX_CANCEL_MSG="never mind, codex")
         codex_cfg = mod.agent_cfg(mod.CFG, "codex")
         claude_cfg = mod.agent_cfg(mod.CFG, "claude")
         self.assertEqual(codex_cfg["handoff_msg"], "fold it, codex-style: {file} / {marker}")
         self.assertEqual(claude_cfg["handoff_msg"], mod.CFG["handoff_msg"])
         self.assertEqual(claude_cfg["clear_cmd"], "/clear-please")
         self.assertEqual(codex_cfg["clear_cmd"], mod.CFG["clear_cmd"])
+        self.assertEqual(codex_cfg["cancel_msg"], "never mind, codex")
+        self.assertEqual(claude_cfg["cancel_msg"], mod.CFG["cancel_msg"])
 
     def test_an_empty_override_is_the_same_as_unset(self):
         # The shell's ${VAR:=default} treats an explicitly empty value as unset
@@ -914,6 +917,25 @@ class TestStayingAheadOfCodex(unittest.TestCase):
         self.assertIsNone(ctl.rstate)
         self.assertEqual(ctl.self_compactions, 1)
         self.assertIn("compacted the thread on its own", " ".join(ctl.log_lines))
+
+    def test_codex_getting_there_first_after_a_delivered_fold_asks_it_to_carry_on(self):
+        # T09: unlike the two cases above, the phrase DID reach the session --
+        # codex just compacted its own context before a usable file followed
+        # it -- so the abort has to say the ask is off, not just walk away.
+        ctl = self.ctl()
+        logged_usage(ctl, 1, 230000)
+        ctl.tick(30)
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        ctl.on_handoff_echo(ROLL, 35)
+        feed(ctl, 40, compacted=True)            # still no usable file when it compacted
+        self.assertEqual(ctl.rstate, cr.CANCEL_PENDING)
+        self.assertEqual(ctl.self_compactions, 1)
+        self.assertIn("restart aborted at handoff_sent", " ".join(ctl.log_lines))
+
+        action = ctl.tick(65)                    # past root_idle, session quiet
+        self.assertEqual(action[0], "inject")
+        self.assertIn("cancelled", action[1])
+        self.assertIn("asking the session to carry on", " ".join(ctl.log_lines))
 
     def test_without_the_log_the_rollout_still_counts(self):
         ctl = self.ctl()

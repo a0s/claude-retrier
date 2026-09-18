@@ -37,7 +37,11 @@
 # than guessed at (CR_MODEL_LOOKUP=0 to keep it off the network). codex states its
 # window in the rollout, and has thresholds of its own: CR_CODEX_CONTEXT_PCT,
 # counted the way its status line counts "Context N% used" (claude's percentage
-# unless set), and CR_CODEX_CONTEXT_TOKENS, which is never borrowed.
+# unless set), and CR_CODEX_CONTEXT_TOKENS, which is never borrowed. If that
+# restart is aborted after the fold already reached the session, CR_CANCEL_MSG
+# is typed instead of just leaving the session be — default:
+# "The context restart was cancelled — the handoff is not needed now. Continue
+# with what you were doing before it was requested."
 #
 # While it runs there is a dim `◆ cr` in a corner of the screen — the wrapper's
 # only visible output. CR_BADGE=0 removes it.
@@ -413,6 +417,13 @@ CR_HANDOFF_MSG_DEFAULT='Wrap up now. Do not start new work. Write a complete han
 : "${CR_CLEAR_CMD:=/clear}"            # the built-in that starts a new session in place
 CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
 : "${CR_RESUME_MSG:=$CR_RESUME_MSG_DEFAULT}"
+# Said instead of the plain "restart aborted" notice when the abort comes
+# AFTER the fold already reached the session (T09): the model was told to
+# wrap up and start nothing new, and an autonomous session left on that
+# instruction sits on an empty input until a person shows up. {file} is
+# substituted, same as above, though this phrase has no need of it.
+CR_CANCEL_MSG_DEFAULT='The context restart was cancelled — the handoff is not needed now. Continue with what you were doing before it was requested.'
+: "${CR_CANCEL_MSG:=$CR_CANCEL_MSG_DEFAULT}"
 # claude and codex do not speak the same commands, so a phrase that names one —
 # a slash command, a skill, a custom prompt — cannot be shared between them.
 # CR_CLAUDE_<X>/CR_CODEX_<X> override CR_<X> for one agent only; unset (the
@@ -423,6 +434,8 @@ CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
 : "${CR_CODEX_CLEAR_CMD:=}"
 : "${CR_CLAUDE_RESUME_MSG:=}"
 : "${CR_CODEX_RESUME_MSG:=}"
+: "${CR_CLAUDE_CANCEL_MSG:=}"
+: "${CR_CODEX_CANCEL_MSG:=}"
 : "${CR_ROOT_IDLE_SEC:=20}"            # transcript quiet this long => the turn is over
 : "${CR_HANDOFF_TIMEOUT_SEC:=900}"     # per restart step, and frozen while a limit runs
 : "${CR_STEP_GAP_SEC:=3}"              # between /clear and the resume phrase
@@ -880,6 +893,7 @@ CFG = dict(
     handoff_msg=_env("CR_HANDOFF_MSG", ""),
     clear_cmd=_env("CR_CLEAR_CMD", "/clear"),
     resume_msg=_env("CR_RESUME_MSG", "Read `{file}` and continue from it."),
+    cancel_msg=_env("CR_CANCEL_MSG", ""),
     root_idle=_env("CR_ROOT_IDLE_SEC", 20.0, float),
     handoff_timeout=_env("CR_HANDOFF_TIMEOUT_SEC", 900.0, float),
     step_gap=_env("CR_STEP_GAP_SEC", 3.0, float),
@@ -2178,7 +2192,8 @@ CODEX_BASELINE_TOKENS = 12000
 # override CR_<X> for one agent only; unset, the agent keeps the shared phrase.
 AGENT_MESSAGE_KEYS = (("handoff_msg", "HANDOFF_MSG"),
                       ("clear_cmd", "CLEAR_CMD"),
-                      ("resume_msg", "RESUME_MSG"))
+                      ("resume_msg", "RESUME_MSG"),
+                      ("cancel_msg", "CANCEL_MSG"))
 
 
 def agent_cfg(cfg, agent):
@@ -2676,10 +2691,14 @@ IDLE, WAITING, VERIFY, DONE = "idle", "waiting", "verify", "done"
 # machines each have to be able to hold a position of their own.
 HANDOFF_SENT, HANDOFF_OK, CLEAR_SENT, CLEARED, RESUME_SENT, UNFOLD_FAILED = (
     "handoff_sent", "handoff_ok", "clear_sent", "cleared", "resume_sent", "unfold_failed")
+# A short-lived state of its own (T09): an abort that comes after the fold
+# already reached the session cannot just walk away like an ordinary abort --
+# it has one more thing to say before the restart is actually over.
+CANCEL_PENDING = "cancel_pending"
 
 RESTART_LABELS = {HANDOFF_SENT: "folding", HANDOFF_OK: "folded",
                   CLEAR_SENT: "clearing", CLEARED: "cleared", RESUME_SENT: "unfolding",
-                  UNFOLD_FAILED: "unfold failed"}
+                  UNFOLD_FAILED: "unfold failed", CANCEL_PENDING: "cancelling"}
 
 # Defaults for everything the context restart and the stall handling read, so a
 # Controller built from a config dict written before either existed (the tests
@@ -2691,6 +2710,8 @@ CONTEXT_DEFAULTS = dict(
     handoff_file=".claude-retrier/handoff.md", handoff_marker="HANDOFF",
     handoff_min_bytes=200, handoff_attempts=2, resume_attempts=5, handoff_msg="",
     clear_cmd="/clear", resume_msg="Read `{file}` and continue from it.",
+    cancel_msg="The context restart was cancelled — the handoff is not needed "
+               "now. Continue with what you were doing before it was requested.",
     root_idle=20.0, handoff_timeout=900.0, step_gap=3.0, clear_settle=5.0,
     context_cooldown=600.0, context_max_cycles=0,
     model_lookup=False, model_lookup_timeout=10.0,
@@ -2835,6 +2856,7 @@ class Controller:
             cfg["handoff_file"] = cfg["handoff_file"].replace("{id}", self.session_id)
         self.handoff_path = os.path.abspath(cfg["handoff_file"])
         self.resume_text = cfg["resume_msg"].replace("{file}", cfg["handoff_file"])
+        self.cancel_text = cfg["cancel_msg"].replace("{file}", cfg["handoff_file"])
         self.context_tokens = None    # what the session's last turn was sent with
         self.context_model = None
         self.context_window_hint = None   # a window the transcript states outright
@@ -2858,7 +2880,8 @@ class Controller:
         self.interrupt_at = 0.0       # when a running turn was last interrupted
         self.self_compactions = 0     # times codex got there first
         self.rstate = None            # None | HANDOFF_SENT | HANDOFF_OK | CLEAR_SENT |
-                                       # CLEARED | RESUME_SENT | UNFOLD_FAILED
+                                       # CLEARED | RESUME_SENT | UNFOLD_FAILED |
+                                       # CANCEL_PENDING
         self.nonce = None             # the marker only this attempt can satisfy
         self.handoff_sent_at = 0.0
         self.end_turn_seen_at = 0.0   # when end_turn last landed on the attached
@@ -2886,6 +2909,8 @@ class Controller:
         self._rearm = False           # a wait ended mid-restart: re-send the step
         self._gate_note = None
         self._window_bumped = False
+        self._cancel_sent = False     # CANCEL_PENDING: the phrase already went out,
+                                       # this tick only closes the restart out (T09)
 
     # -- inputs ------------------------------------------------------------- #
     # Not everything arriving on our stdin was typed. The terminal answers
@@ -3636,6 +3661,7 @@ class Controller:
             HANDOFF_SENT: "context is filling up; asking for a handoff",
             CLEAR_SENT: "handoff verified; clearing the context",
             RESUME_SENT: "context cleared; unfolding the handoff",
+            CANCEL_PENDING: "restart cancelled; asking the session to carry on",
         }.get(self.rstate,
               "asking the session to carry on" if self.incident == "stall"
               else "limit lifted; resuming session")
@@ -3774,6 +3800,8 @@ class Controller:
             return self._renotify(now,
                 "read `%s` yourself: the resume phrase never reached the session"
                 % self.cfg["handoff_file"])
+        if self.rstate == CANCEL_PENDING:
+            return self._send_cancel(now)
         return None
 
     def _held(self, now, session_gate=True):
@@ -4144,6 +4172,7 @@ class Controller:
         self._restart_tick = None
         self._rearm = False
         self._gate_note = None
+        self._cancel_sent = False
         self.cooldown_until = now + self.cfg["context_cooldown"]
 
     def _abort_restart(self, why, now, permanent=False):
@@ -4154,8 +4183,22 @@ class Controller:
         Code's own compaction — which is a great deal better than one whose
         history was thrown away on the strength of a handoff that was never
         written.
+
+        Except when the fold itself already landed (T09): once the phrase was
+        echoed back at HANDOFF_SENT/HANDOFF_OK, the model was told to wrap up
+        and start nothing new, and "leave the session exactly as it is" means
+        leaving it on that instruction — fine for a person at the keyboard,
+        useless for an autonomous one sitting on an empty input until someone
+        shows up. CANCEL_PENDING says the ask is off instead, once the same
+        gates that hold every other step back let it through.
         """
         at = self.rstate
+        if not permanent and at in (HANDOFF_SENT, HANDOFF_OK) and self.handoff_echoed:
+            self.log("restart aborted at %s: %s" % (at, why))
+            self.rstate = CANCEL_PENDING
+            self._cancel_sent = False
+            self.rwake = now
+            return None
         self._end_restart(now)
         if permanent:
             self.context_off = True
@@ -4165,6 +4208,25 @@ class Controller:
                     % why)
         self.log("restart aborted at %s: %s" % (at, why))
         return ("notify", "context restart aborted: %s" % why)
+
+    def _send_cancel(self, now):
+        """CANCEL_PENDING has no timeout of its own -- the restart already
+        failed, so there is nothing left to retry, only one phrase left to
+        send once nothing blocks the keystroke. The state lingers one tick
+        past that so `inject_note` (read right after this return, in `main`)
+        still finds it in place, rather than a restart that already ended.
+        """
+        if self._cancel_sent:
+            self._end_restart(now)
+            return None
+        if now < self.rwake:
+            return None
+        if self._held(now):
+            return None
+        self._cancel_sent = True
+        dismiss = self._take_dismiss()
+        self.log("restart cancelled; asking the session to carry on")
+        return ("inject", self.cancel_text, dismiss)
 
 
 # --------------------------------------------------------------------------- #
@@ -5725,10 +5787,11 @@ export CR_MODEL_CACHE_TTL_SEC CR_MODELS_DOC_URL CR_MODELS_API_URL
 export CR_HANDOFF_FILE CR_HANDOFF_MARKER CR_HANDOFF_MIN_BYTES CR_HANDOFF_ATTEMPTS
 export CR_RESUME_ATTEMPTS
 export CR_HANDOFF_REGISTRY_DIR
-export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG
+export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG CR_CANCEL_MSG
 export CR_CLAUDE_HANDOFF_MSG CR_CODEX_HANDOFF_MSG
 export CR_CLAUDE_CLEAR_CMD CR_CODEX_CLEAR_CMD
 export CR_CLAUDE_RESUME_MSG CR_CODEX_RESUME_MSG
+export CR_CLAUDE_CANCEL_MSG CR_CODEX_CANCEL_MSG
 export CR_ROOT_IDLE_SEC CR_HANDOFF_TIMEOUT_SEC CR_STEP_GAP_SEC CR_CLEAR_SETTLE_SEC
 export CR_CONTEXT_COOLDOWN_SEC CR_CONTEXT_MAX_CYCLES
 export CR_SLASH_GAP_SEC CR_SLASH_ENTER CR_SLASH_ENTER_GAP_SEC
