@@ -258,6 +258,32 @@ Whatever (4) answers is always capped under that row's `compact_at` minus
 `CR_CODEX_RESERVE_TOKENS` (0 for claude), read live rather than trusted frozen
 into the table.
 
+A threshold is a fraction of the window, but the session it protects never
+starts at zero: the system prompt, `CLAUDE.md`, MCP tool definitions and the
+handoff file it just read back all cost real tokens before a fresh session
+writes a word of its own. Against a small window, that baseline alone can eat
+most of the threshold's own headroom — a 200k window at the default 51%
+restarts at 102k, and a session that comes back from the fold already sitting
+at 57k has only 45k left to work with before it folds again, sometimes inside
+30-40 minutes. So after every restart the wrapper checks the room actually
+left: if `threshold − baseline` falls under `CR_CONTEXT_MIN_HEADROOM` (default
+`80k`), it raises the threshold for the rest of the session — `baseline +
+CR_CONTEXT_MIN_HEADROOM`, but never past the model's own `compact_at` minus
+its reserve, the same ceiling stage (4) above is held to — and says so in the
+log. Against a window at or under 200k, the check itself uses whichever is
+smaller of `CR_CONTEXT_MIN_HEADROOM` and 30% of the window, so a window too
+small to ever spare 80k is not nagged over headroom it never had; the raise
+that follows still reaches for the full `CR_CONTEXT_MIN_HEADROOM` where the
+model's `compact_at` leaves room for it. When there is nowhere to raise it to,
+the wrapper says so out loud instead of guessing — widening `CR_CONTEXT_PCT`
+or moving to a bigger window is then a decision for a person, not the wrapper.
+
+A threshold that still cannot hold is a different problem: more than
+`CR_CONTEXT_MAX_PER_HOUR` restarts (default `3`) inside a rolling hour means
+the trigger is grinding the session rather than protecting it, and it is
+switched off for the rest of the session — the same permanent-off state a
+failed unfold leaves behind, visible the same way (badge, notify).
+
 ## The context window
 
 Every model this build knows about is one row in a profile table — window,

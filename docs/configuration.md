@@ -92,6 +92,8 @@ More in [context-restart.md](context-restart.md). All of these do nothing until
 | `CR_RESUME_ATTEMPTS` | `5` | unfold retries, each wait doubling, before the debt becomes visible instead of retried |
 | `CR_CONTEXT_COOLDOWN_SEC` | `600` | silence after any restart |
 | `CR_CONTEXT_MAX_CYCLES` | `0` | `0` = no cap; a fuse against a loop |
+| `CR_CONTEXT_MIN_HEADROOM` | `80k` | floor the threshold is raised to protect once a restart lands, if the baseline it comes back to leaves less than this (capped to 30% of a window ≤ 200k); see [context-restart.md](context-restart.md#choosing-a-threshold) |
+| `CR_CONTEXT_MAX_PER_HOUR` | `3` | more restarts than this in a rolling hour switches the trigger off for the rest of the session; `0` = no cap |
 | `CR_SLASH_ENTER` | `2` | Enters sent for a `/command` |
 
 ## Codex
