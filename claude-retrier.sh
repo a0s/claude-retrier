@@ -395,6 +395,9 @@ CR_AGENTS_PANEL_ROW_PATTERNS=(
 : "${CR_MODELS_DOC_URL:=https://platform.claude.com/docs/en/models/overview.md}"
 : "${CR_MODELS_API_URL:=https://api.anthropic.com/v1/models}"
 : "${CR_HANDOFF_FILE:=.claude-retrier/handoff.md}"   # relative to cwd — .gitignore it
+                                        # supports {id}, a short id unique per session (T05)
+: "${CR_HANDOFF_REGISTRY_DIR:=$HOME/.claude-retrier/sessions}"
+                                        # where wrapper instances claim their handoff path
 : "${CR_HANDOFF_MARKER:=HANDOFF}"      # a nonce is appended; must end the file
 : "${CR_HANDOFF_MIN_BYTES:=200}"       # anything shorter is not a handoff
 : "${CR_HANDOFF_ATTEMPTS:=2}"          # tries to fold before giving up
@@ -864,6 +867,8 @@ CFG = dict(
     codex_interrupt=_env("CR_CODEX_INTERRUPT", "1") != "0",
     codex_logs_db=_env("CR_CODEX_LOGS_DB", ""),
     handoff_file=_env("CR_HANDOFF_FILE", ".claude-retrier/handoff.md"),
+    handoff_registry_dir=_env("CR_HANDOFF_REGISTRY_DIR",
+                              os.path.expanduser("~/.claude-retrier/sessions")),
     handoff_marker=_env("CR_HANDOFF_MARKER", "HANDOFF"),
     handoff_min_bytes=_env("CR_HANDOFF_MIN_BYTES", 200, int),
     handoff_attempts=_env("CR_HANDOFF_ATTEMPTS", 2, int),
@@ -2634,8 +2639,101 @@ CONTEXT_DEFAULTS = dict(
 )
 
 
+class HandoffRegistry:
+    """Where claude-retrier's own wrapper instances announce their handoff path.
+
+    Two sessions in the same project dir defaulting to the same
+    `CR_HANDOFF_FILE` would otherwise overwrite each other's fold (T05); this
+    is how the second one notices and moves aside, at
+    `CR_HANDOFF_REGISTRY_DIR/<pid>.json`.
+    """
+
+    def __init__(self, directory=None):
+        self.dir = directory or os.path.expanduser("~/.claude-retrier/sessions")
+
+    def _entries(self):
+        """`(pid, record)` for every live registration, pruning dead ones."""
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            return
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                pid = int(name[:-5])
+            except ValueError:
+                continue
+            path = os.path.join(self.dir, name)
+            if not self._alive(pid):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+                continue
+            try:
+                with open(path) as fh:
+                    rec = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            yield pid, rec
+
+    @staticmethod
+    def _alive(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True     # e.g. EPERM: it exists, just is not ours to signal
+        return True
+
+    def find_conflict(self, handoff_path, exclude_pid):
+        """The live pid already claiming `handoff_path`, if any."""
+        for pid, rec in self._entries():
+            if pid != exclude_pid and rec.get("handoff_path") == handoff_path:
+                return pid
+        return None
+
+    def register(self, pid, cwd, handoff_path, agent, started):
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            tmp = os.path.join(self.dir, ".%d.json.tmp" % pid)
+            with open(tmp, "w") as fh:
+                json.dump(dict(cwd=cwd, handoff_path=handoff_path,
+                               agent=agent, started=started), fh)
+            os.rename(tmp, os.path.join(self.dir, "%d.json" % pid))
+        except OSError:
+            pass
+
+    def unregister(self, pid):
+        try:
+            os.remove(os.path.join(self.dir, "%d.json" % pid))
+        except OSError:
+            pass
+
+    def claim(self, handoff_file, session_id, pid, cwd, agent, started, log):
+        """The path this session should use, registering it for the next one.
+
+        A path carrying `{id}` is unique by construction and skips the
+        registry entirely. One without it is checked against every live
+        session's claim; a collision gets `-<id>` appended, once, and logged.
+        """
+        if "{id}" in handoff_file:
+            resolved = handoff_file.replace("{id}", session_id)
+        else:
+            resolved = handoff_file
+            conflict = self.find_conflict(os.path.abspath(resolved), pid)
+            if conflict is not None:
+                stem, ext = os.path.splitext(resolved)
+                resolved = "%s-%s%s" % (stem, session_id, ext)
+                log("handoff file is taken by pid %d; using %s" % (conflict, resolved))
+        self.register(pid, cwd, os.path.abspath(resolved), agent, started)
+        return resolved
+
+
 class Controller:
-    def __init__(self, cfg, log=lambda *_: None, now=None, probe=None):
+    def __init__(self, cfg, log=lambda *_: None, now=None, probe=None, session_id=None):
         # A config that predates the context restart keeps working, disabled.
         self.cfg = dict(CONTEXT_DEFAULTS, **cfg)
         cfg = self.cfg
@@ -2668,6 +2766,13 @@ class Controller:
         # Reading the handoff file is the only I/O any of this needs, and it goes
         # through `probe` so the tests can hand over a file that never existed.
         self.probe = probe or read_handoff
+        # `{id}` makes a shared CR_HANDOFF_FILE unique per session on its own;
+        # a path without it may still get suffixed by HandoffRegistry.claim
+        # before this cfg ever reaches here (T05) — either way, self.cfg
+        # carries the resolved path from this point on.
+        self.session_id = session_id or os.urandom(4).hex()
+        if "{id}" in cfg["handoff_file"]:
+            cfg["handoff_file"] = cfg["handoff_file"].replace("{id}", self.session_id)
         self.handoff_path = os.path.abspath(cfg["handoff_file"])
         self.resume_text = cfg["resume_msg"].replace("{file}", cfg["handoff_file"])
         self.context_tokens = None    # what the session's last turn was sent with
@@ -4677,6 +4782,21 @@ def main(argv):
             time.sleep(max(0.0, CFG["update_notice"]))
 
     run_cfg = agent_cfg(CFG, agent_name)
+    session_id = os.urandom(4).hex()
+    handoff_registry = None
+    if run_cfg["context_tokens"] > 0 or run_cfg["context_pct"] > 0:
+        # A custom phrase that drops {file} cannot carry a per-session handoff
+        # path — worth one line in the log, once, rather than a silent fold
+        # into a path nobody told the model about (T05).
+        for key, env_name in (("resume_msg", "CR_RESUME_MSG"), ("handoff_msg", "CR_HANDOFF_MSG")):
+            phrase = run_cfg.get(key) or ""
+            if phrase and "{file}" not in phrase:
+                log("%s does not contain {file}; a per-session handoff path "
+                    "cannot be passed to it" % env_name)
+        handoff_registry = HandoffRegistry(run_cfg["handoff_registry_dir"])
+        run_cfg["handoff_file"] = handoff_registry.claim(
+            run_cfg["handoff_file"], session_id, os.getpid(), os.getcwd(),
+            agent_name, session_start, log)
     extra = codex_launch_args(run_cfg)
     if extra:
         log("holding codex's own compaction back for the context restart: %s"
@@ -4733,7 +4853,7 @@ def main(argv):
     # this thread's whole purpose is to be ready by the NEXT launch anyway.
     updater.refresh()
 
-    ctl = Controller(run_cfg, log)
+    ctl = Controller(run_cfg, log, session_id=session_id)
     lookup = WindowLookup(CFG, log)
     badge = Badge(CFG)
     agents = AgentOverlay(CFG)
@@ -5075,6 +5195,11 @@ def main(argv):
                     pass
                 break
     finally:
+        if handoff_registry is not None:
+            try:
+                handoff_registry.unregister(os.getpid())
+            except Exception:
+                pass
         try:
             badge.erase(stdout_fd, rows, cols)
         except Exception:
@@ -5237,6 +5362,7 @@ export CR_VERSION CR_SELF
 export CR_MODEL_LOOKUP CR_MODEL_LOOKUP_TIMEOUT_SEC CR_MODEL_CACHE
 export CR_MODEL_CACHE_TTL_SEC CR_MODELS_DOC_URL CR_MODELS_API_URL
 export CR_HANDOFF_FILE CR_HANDOFF_MARKER CR_HANDOFF_MIN_BYTES CR_HANDOFF_ATTEMPTS
+export CR_HANDOFF_REGISTRY_DIR
 export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG
 export CR_CLAUDE_HANDOFF_MSG CR_CODEX_HANDOFF_MSG
 export CR_CLAUDE_CLEAR_CMD CR_CODEX_CLEAR_CMD

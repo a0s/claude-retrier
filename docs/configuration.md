@@ -72,7 +72,8 @@ More in [context-restart.md](context-restart.md). All of these do nothing until
 | `CR_MODEL_LOOKUP` | `1` | look an unfamiliar model up; `0` never touches the network |
 | `CR_MODEL_CACHE` | `~/.claude-retrier/windows.json` | what the lookup learned |
 | `CR_MODEL_CACHE_TTL_SEC` | `604800` | a week |
-| `CR_HANDOFF_FILE` | `.claude-retrier/handoff.md` | where the fold is written |
+| `CR_HANDOFF_FILE` | `.claude-retrier/handoff.md` | where the fold is written; `{id}` makes it unique per session |
+| `CR_HANDOFF_REGISTRY_DIR` | `~/.claude-retrier/sessions` | where wrapper instances claim their handoff path, so two sharing an `{id}`-free `CR_HANDOFF_FILE` do not overwrite each other (T05) |
 | `CR_HANDOFF_MSG` | (see `--cr-help`) | the folding phrase; `{file}`, `{marker}` |
 | `CR_RESUME_MSG` | ``Read `{file}` and continue from it.`` | the unfolding phrase |
 | `CR_CLEAR_CMD` | `/clear` | |

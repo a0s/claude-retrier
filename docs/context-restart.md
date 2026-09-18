@@ -49,14 +49,30 @@ Two more make it fit a project you actually work in:
 ```sh
 export CR_CONTEXT_PCT=51
 export CR_HANDOFF_FILE=scratchpad/RESUME.md      # relative to cwd, .gitignore it
-export CR_RESUME_MSG='Read `scratchpad/RESUME.md` and carry on from it.'
+export CR_RESUME_MSG='Read `{file}` and carry on from it.'
 ```
 
 Put those three in your shell rc, or in a `direnv` file for one repo, and there
-is nothing else to run.
+is nothing else to run. Write `{file}` rather than the literal path in both
+phrases — it is substituted with whatever `CR_HANDOFF_FILE` actually resolves
+to, which is not always the path you set (see below).
 
 Add the handoff file to your `.gitignore`. It is a scratch note about one
 session and it is rewritten from scratch every time.
+
+Two sessions in the same project default to the same `CR_HANDOFF_FILE`, and
+without either of the two things below, the second one to fold overwrites the
+first one's file mid-write:
+
+- Put `{id}` in the path — `CR_HANDOFF_FILE=scratchpad/RESUME-{id}.md` — and
+  each session gets a short id of its own (`scratchpad/RESUME-3f9a1c2b.md`);
+  no coordination needed, because the path can never collide.
+- Leave it out and the wrapper coordinates for you: it registers the path it
+  is about to use, and a session that finds another live one already holding
+  it moves its own aside to `<stem>-<id><ext>` automatically, logging `handoff
+  file is taken by pid N; using scratchpad/RESUME-3f9a1c2b.md`.
+  `CR_HANDOFF_REGISTRY_DIR` (default `~/.claude-retrier/sessions`) is where
+  that coordination lives.
 
 ## What you will see
 
@@ -150,7 +166,7 @@ folding one, and each must be a single line, because a newline submits it.
 
 ```sh
 export CR_HANDOFF_MSG='Stop here, start nothing new, and write everything the next session needs into `{file}` because it will not remember this one. Last line of that file: {marker}, alone, written after the rest.'
-export CR_RESUME_MSG='/my-skill continue from `scratchpad/RESUME.md`'
+export CR_RESUME_MSG='/my-skill continue from `{file}`'
 ```
 
 If you write your own, keep three things in it. No new work, because the session
@@ -158,6 +174,14 @@ is about to end and anything started now is lost. "For a session that will not
 remember this one", without which you get notes that only make sense to someone
 who was there. And the marker as the last line of the file, written last: that
 is the only thing standing between a half-written note and a cleared session.
+
+Keep `{file}` in both, even in a phrase you are sure will only ever point at
+one path: it is what lets the wrapper hand a session its own, possibly
+suffixed, handoff path (see [Turning it on](#turning-it-on)) instead of a name
+it made up itself. A phrase that drops `{file}` is flagged once at startup —
+`CR_RESUME_MSG does not contain {file}; a per-session handoff path cannot be
+passed to it` — precisely because it is easy to miss until two sessions in the
+same project collide.
 
 A slash command works as a resume phrase. It goes out with the extra care
 described under [`CR_SLASH_ENTER`](#slash-commands-and-cr_slash_enter) below.
