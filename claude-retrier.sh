@@ -1964,6 +1964,33 @@ class TranscriptWatcher:
             except OSError:
                 self.offsets[p] = 0
 
+    def expect(self, text):
+        """Start watching for `text` as a verbatim echo of a submitted prompt.
+
+        `self.echo` is read fresh on every `poll_now` (see `__init__`), so a
+        mutation here takes effect on the very next poll with no other
+        plumbing — the handoff phrase's nonce changes every attempt, and
+        `_send_handoff` calls this each time it sends one.
+        """
+        if not text:
+            return
+        if isinstance(self.echo, str):
+            self.echo = [self.echo]
+        else:
+            self.echo = list(self.echo) if self.echo else []
+        if text not in self.echo:
+            self.echo.append(text)
+
+    def forget(self, text):
+        """Stop watching for a string added by `expect` (or given at construction)."""
+        if not text or not self.echo:
+            return
+        if isinstance(self.echo, str):
+            if self.echo == text:
+                self.echo = []
+            return
+        self.echo = [e for e in self.echo if e != text]
+
     def poll_now(self, now=None):
         now = now if now is not None else time.time()
         self.grown = []
@@ -2808,6 +2835,9 @@ class Controller:
         self.cooldown_until = 0.0
         self.context_before = 0       # what the context read just before /clear
         self.resume_echoed = False
+        self.handoff_text = None      # the exact fold phrase last sent, nonce and all
+        self.handoff_echoed = False   # that phrase, seen echoed back in a transcript
+        self.handoff_echo_retries = 0 # retypes for want of an echo, not for a bad file
         self._restart_tick = None     # last tick the restart clock actually ran
         self._rearm = False           # a wait ended mid-restart: re-send the step
         self._gate_note = None
@@ -3266,6 +3296,7 @@ class Controller:
     BADGE_NEAR = 0.8       # show the percentage only once the threshold is in sight
     GATE_RETRY = 5.0       # how long to sit on a held step before looking again
     INTERRUPT_RETRY = 20.0 # between Escs, if the first did not close the turn
+    HANDOFF_ECHO_RETRIES = 2   # retypes for a phrase that left no trace at all
 
     @property
     def context_enabled(self):
@@ -3498,6 +3529,23 @@ class Controller:
         self.resume_echoed = True
         return True
 
+    def on_handoff_echo(self, path, now):
+        """claude wrote the fold phrase into a transcript: it was submitted.
+
+        The nonce in it is unique machine-wide, so this is also the one
+        completely certain proof of which transcript is really ours — worth
+        acting on even when it turns up somewhere other than `context_path`,
+        which is exactly why `main()` checks it ahead of the ordinary
+        current-transcript filter every other echo kind is held to.
+        """
+        if self.rstate != HANDOFF_SENT:
+            return False
+        self.log("the handoff phrase was accepted")
+        self.handoff_echoed = True
+        if path and path != self.context_path:
+            self.bind_transcript(path, "our handoff phrase was echoed there", now)
+        return True
+
     # -- what the badge shows ----------------------------------------------- #
     def badge_context(self):
         """The context percentage worth putting on screen, or None.
@@ -3707,6 +3755,7 @@ class Controller:
         self.cycles += 1
         self.handoff_tries = 0
         self.resume_tries = 0
+        self.handoff_echo_retries = 0
         # The reading we acted on is the one the restart has to be judged
         # against. Taking it at /clear time instead would mean trusting whatever
         # the last row said by then — and a project directory can hold more than
@@ -3736,6 +3785,11 @@ class Controller:
         text = (self.cfg["handoff_msg"]
                 .replace("{file}", self.cfg["handoff_file"])
                 .replace("{marker}", self.nonce))
+        # A fresh nonce means a fresh phrase, so the proof that THIS one reached
+        # the session starts over too -- the echo (if any) still in the
+        # transcript belongs to whichever attempt came before.
+        self.handoff_text = text
+        self.handoff_echoed = False
         self.log("asking for a handoff into %s (attempt %d/%d, marker %s)"
                  % (self.cfg["handoff_file"], self.handoff_tries,
                     self.cfg["handoff_attempts"], self.nonce))
@@ -3761,18 +3815,28 @@ class Controller:
         self.log("unfolding from %s" % self.cfg["handoff_file"])
         return ("inject", self.resume_text, self._take_dismiss())
 
-    # -- the four layers ---------------------------------------------------- #
+    # -- the five layers ------------------------------------------------------ #
     def _check_handoff(self, now):
-        """`/clear` goes out only when all four of these agree.
+        """`/clear` goes out only when all five of these agree.
 
         The model saying it is done is not one of them. It is a report about its
         own intent, and the failure this guards against is precisely the one
-        where that intent was sincere and the file is still half a page.
+        where that intent was sincere and the file is still half a page. Nor is
+        a file that merely looks right: without the echo, it could just as
+        easily have been left by a neighbouring session (T06) — the nonce
+        proves which attempt wrote it, but only the echo proves it was typed
+        into THIS session at all.
         """
         busy = self._session_busy(now)
         st = self.probe(self.handoff_path)
         fault = self._handoff_fault(st)
         if fault is None and not busy:
+            if not self.handoff_echoed:
+                # Everything about the file checks out, but the one thing that
+                # says the phrase ever reached this session has not shown up
+                # yet. Wait for it rather than clear on the strength of a file
+                # that, on its own, could belong to somebody else entirely.
+                return None
             self.rstate = HANDOFF_OK
             self.restart_left = self.cfg["handoff_timeout"]
             self.rwake = now
@@ -3783,6 +3847,19 @@ class Controller:
             return self._abort_restart(
                 "no usable handoff within %.0fs: %s"
                 % (self.cfg["handoff_timeout"], fault or busy), now)
+        if (not self.handoff_echoed and st is None
+                and now - self.handoff_sent_at >= self.cfg["verify"]):
+            # Nothing at all came of it: no echo, no file. A popup that ate the
+            # keystrokes and a lost write look identical from here, and both are
+            # fixed the same way -- type it again, rather than sit out the whole
+            # handoff timeout on a phrase that never reached the input box.
+            if self.handoff_echo_retries >= self.HANDOFF_ECHO_RETRIES:
+                return self._abort_restart(
+                    "the handoff phrase never reached the session", now)
+            self.handoff_echo_retries += 1
+            self.log("the handoff phrase left no trace; sending it again (%d/%d)"
+                     % (self.handoff_echo_retries, self.HANDOFF_ECHO_RETRIES))
+            return self._send_handoff(now, fresh=False)
         if busy or fault is None:
             # Still writing, or written and the model kept going anyway. Either
             # way the answer is to wait, and the timeout above is the bound.
@@ -3885,6 +3962,8 @@ class Controller:
         self.nonce = None
         self.rwake = 0.0
         self.resume_echoed = False
+        self.handoff_text = None
+        self.handoff_echoed = False
         self.context_before = 0
         self._restart_tick = None
         self._rearm = False
@@ -4963,6 +5042,7 @@ def main(argv):
     esc_carry = ""         # half-received control sequence from the previous read
     pending = []           # [(due_ts, bytes)] scheduled writes into the pty
     pending_scrape = None  # (banner, confirm_at) — a scraped banner awaiting confirmation
+    handoff_watch_text = None  # the fold phrase currently registered with watcher.expect
     watch_stdin = True
     exit_code = 0
 
@@ -5130,6 +5210,14 @@ def main(argv):
                 ctl.bind_transcript(watcher.current, why, now)
             for rec in recs:
                 if rec.get("kind") == "echo":
+                    # The fold phrase's nonce is unique machine-wide, so its
+                    # echo is definitive proof of identity on its own (T06) —
+                    # checked ahead of the current-transcript filter below,
+                    # unlike every other echo kind, which a neighbour's session
+                    # can produce just as easily as ours.
+                    if (ctl.handoff_text and rec.get("text") == ctl.handoff_text
+                            and ctl.on_handoff_echo(rec.get("path"), now)):
+                        continue
                     # claude's own echo of our retry/resume is only evidence
                     # about the session at this terminal; a neighbour's is not.
                     if rec.get("path") != watcher.current:
@@ -5215,6 +5303,17 @@ def main(argv):
                         notify("usage limit detected; waiting for reset")
 
             action = ctl.tick(now)
+            if ctl.handoff_text != handoff_watch_text:
+                # The one place `main()` keeps the watcher's echo list in step
+                # with the controller's: a fresh nonce (or the restart ending)
+                # replaces `handoff_text` in exactly one spot (`_send_handoff`,
+                # `_end_restart`), so comparing against it here is proof enough
+                # that something changed, without main() having to know why.
+                if handoff_watch_text:
+                    watcher.forget(handoff_watch_text)
+                handoff_watch_text = ctl.handoff_text
+                if handoff_watch_text:
+                    watcher.expect(handoff_watch_text)
             if action and action[0] == "inject":
                 schedule_injection(action[1], action[2], now)
                 notify(ctl.inject_note())

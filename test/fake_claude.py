@@ -142,6 +142,25 @@ def write_transcript(text, limited=True, tokens=None, stop_reason=None, model=No
         os.fsync(fh.fileno())
 
 
+def write_user_message(text):
+    """The echo record: proof a typed line was really submitted.
+
+    Real Claude Code writes the user's own prompt into the transcript as a
+    `type: "user"` row before the assistant answers it; that row is what the
+    wrapper's echo detection (transcript_limit_records' `echoish`) reads, and
+    what proves a phrase it typed (a retry, the resume phrase, or -- T06 -- the
+    fold phrase) actually reached the session rather than being eaten by a
+    popup or lost keystrokes.
+    """
+    rec = {"type": "user", "timestamp": "2026-07-19T19:22:08.730Z",
+           "isSidechain": False,
+           "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
+    with open(transcript_path(), "a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
 def write_streaming_turn(tokens, final_stop_reason="end_turn"):
     """A turn as it looks mid-stream: a delta row with no stop_reason yet,
     then the row that closes it (T11 row-collapse)."""
@@ -363,6 +382,13 @@ def main():
             if not line:
                 continue                      # an empty box: Claude Code ignores it too
             write_pid_file("busy")
+            # The one line that may not get an echo at all: `dropfirstfold`
+            # (DROP_NEXT_FOLD) stands in for a popup eating the keystrokes or a
+            # write that never landed -- nothing reaches the session, so
+            # nothing is written for it, echo included (T06).
+            is_fold = bool(_MARKER.search(line) or "Write a complete handoff" in line)
+            if not (is_fold and DROP_NEXT_FOLD[0]):
+                write_user_message(line)
             if line.startswith("quit"):
                 break
             if line == "answer":
@@ -393,7 +419,7 @@ def main():
                 out.write("GOT:repaint-panel\r\n")
                 out.flush()
                 continue
-            if _MARKER.search(line) or "Write a complete handoff" in line:
+            if is_fold:
                 if DROP_NEXT_FOLD[0]:
                     # The lost-message case: the fold request is swallowed as if
                     # it never reached the session at all.

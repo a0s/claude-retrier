@@ -659,6 +659,7 @@ class TestACodexRestart(unittest.TestCase):
         ctl.handoff.write(ctl, at=40)
         feed(ctl, 40, tokens=201000)
         feed(ctl, 41, turn="closed", stop_reason="end_turn")
+        ctl.on_handoff_echo(ROLL, 41)               # T06: claude wrote the phrase back
         self.assertEqual(ctl.tick(70), ("inject", "/clear", False))
         # The new chat is a new rollout, and it answers small.
         self.assertEqual(ctl.tick(74)[1], "Read `H.md` and continue from it.")
