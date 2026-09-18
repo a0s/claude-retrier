@@ -9,6 +9,7 @@ and the "don't type over a half-written prompt" case, which the tmux design
 listed as unsolvable by scraping (DESIGN-NOTES §6) but is trivial here: we are
 the terminal, so we see the keystrokes.
 """
+import json
 import os
 import shutil
 import signal
@@ -758,6 +759,49 @@ class TestTheHappyPath(RestartTestCase):
         self.assertEqual(ctl.cycles, 1)
         usage(ctl, 100, FULL)
         self.assertIsNone(self.tick(ctl, 200))
+
+
+class TestACollapsedRowKeepsEndTurn(RestartTestCase):
+    """T11: the row that closes the fold turn can be followed, in the very same
+    poll, by a streaming fragment of the NEXT turn whose stop_reason is still
+    None. `transcript_limit_records` is what merges rows seen in one poll into
+    one before the controller ever sees them; if that merge let the None
+    overwrite "end_turn", `_handoff_fault` would see a turn that "ended" with
+    stop_reason=None and call the fold a failure that never happened.
+    """
+
+    def _assistant_row(self, text, tokens, stop):
+        msg = {"role": "assistant", "model": "claude-opus-5", "stop_reason": stop,
+               "content": [{"type": "text", "text": text}],
+               "usage": {"input_tokens": 2, "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": tokens - 2, "output_tokens": 10}}
+        return {"type": "assistant", "isSidechain": False, "message": msg}
+
+    def _one_poll(self, *rows):
+        """The single collapsed record `transcript_limit_records` hands back for
+        rows all seen within one poll — the same path production code takes."""
+        tmpdir = tempfile.mkdtemp(prefix="cr-t11-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        path = os.path.join(tmpdir, "s.jsonl")
+        with open(path, "a") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+        _, recs = cr.transcript_limit_records(path, 0)
+        self.assertEqual(len(recs), 1, recs)
+        return recs[0]
+
+    def test_a_streaming_fragment_after_end_turn_does_not_flip_the_verdict(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        ctl.handoff.write(ctl, at=40)
+        rec = self._one_poll(self._assistant_row("closing the fold", FULL, "end_turn"),
+                             self._assistant_row("next turn starting", FULL, None))
+        self.assertEqual(rec["stop_reason"], "end_turn")
+        ctl.on_context(dict(kind="alive", path=MINE, tokens=rec["tokens"],
+                            model=rec["model"], stop_reason=rec["stop_reason"],
+                            sidechain=rec["sidechain"]), 40)
+        self.assertEqual(self.tick(ctl, 65), ("inject", "/clear", False))
+        self.assertEqual(ctl.rstate, cr.CLEARED)
 
 
 class TestTheRegistryStatusIsAnExtraBusySignal(RestartTestCase):

@@ -507,6 +507,43 @@ class TestAssistantRows(unittest.TestCase):
         self.write(assistant(tokens=40000, sidechain=True))
         self.assertTrue(self.rows()[0]["sidechain"])
 
+    def test_a_collapse_does_not_overwrite_end_turn_with_none(self):
+        # The row that closes the fold turn ("end_turn") can be followed in the
+        # same poll by a streaming fragment of the NEXT turn, whose stop_reason
+        # is still None because it hasn't finished. Losing "end_turn" here is
+        # what makes _handoff_fault see stop_reason=tool_use and call the fold
+        # failed when it actually landed.
+        self.write(assistant(tokens=100, stop="end_turn"),
+                   assistant(tokens=200, stop=None))
+        rows = self.rows()
+        self.assertEqual([r["kind"] for r in rows], ["alive"])
+        self.assertEqual(rows[0]["tokens"], 200)
+        self.assertEqual(rows[0]["stop_reason"], "end_turn")
+
+    def test_a_collapse_does_not_overwrite_end_turn_with_none_reversed(self):
+        # Same guarantee in the other order: a real stop_reason still wins over
+        # an earlier None once it arrives.
+        self.write(assistant(tokens=100, stop=None),
+                   assistant(tokens=200, stop="end_turn"))
+        rows = self.rows()
+        self.assertEqual([r["kind"] for r in rows], ["alive"])
+        self.assertEqual(rows[0]["tokens"], 200)
+        self.assertEqual(rows[0]["stop_reason"], "end_turn")
+
+    def test_a_sidechain_row_never_merges_with_a_root_row(self):
+        # A root row immediately followed by a subagent's row must not collapse
+        # into one: that would either hide the root's real figures behind the
+        # subagent's small ones, or mark the root's tokens as a sidechain's and
+        # make Controller.on_context skip the observation entirely.
+        self.write(assistant(tokens=500000, sidechain=False),
+                   assistant(tokens=20000, sidechain=True))
+        rows = self.rows()
+        self.assertEqual([r["kind"] for r in rows], ["alive", "alive"])
+        self.assertEqual(rows[0]["tokens"], 500000)
+        self.assertFalse(rows[0]["sidechain"])
+        self.assertEqual(rows[1]["tokens"], 20000)
+        self.assertTrue(rows[1]["sidechain"])
+
     def test_a_row_with_no_usage_still_says_the_session_answered(self):
         self.write(assistant())
         row = self.rows()[0]
