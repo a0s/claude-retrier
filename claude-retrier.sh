@@ -34,8 +34,9 @@
 # CR_CONTEXT_PCT of the window it asks for a handoff file, checks that the file
 # really was written, clears the session and unfolds it from that file. Off
 # unless you set CR_CONTEXT_PCT — see the README. How large the window is comes
-# from the model slug; a model this file has never heard of is looked up rather
-# than guessed at (CR_MODEL_LOOKUP=0 to keep it off the network). codex states its
+# from the model slug; a model this file has never heard of is looked up over
+# the network (CR_MODEL_LOOKUP=0 to keep it off) and estimated in the meantime,
+# rather than left to disarm the trigger. codex states its
 # window in the rollout, and has thresholds of its own: CR_CODEX_CONTEXT_PCT,
 # counted the way its status line counts "Context N% used" (claude's percentage
 # unless set), and CR_CODEX_CONTEXT_TOKENS, which is never borrowed. If that
@@ -375,12 +376,15 @@ CR_AGENTS_PANEL_ROW_PATTERNS=(
 : "${CR_CODEX_RESERVE_TOKENS:=64k}"     # room kept under codex's cap for the fold
 : "${CR_CODEX_INTERRUPT:=1}"            # 0 = never interrupt a running turn
 : "${CR_CODEX_LOGS_DB:=}"               # default: the newest $CODEX_HOME/logs_*.sqlite
-# A model this file has never heard of has no window, and a guessed one is worse
-# than none: guessing small folds a session that is nowhere near full. So an
-# unfamiliar slug is looked up instead — the Models API when ANTHROPIC_API_KEY is
-# set, the published models table otherwise — in a worker thread, once a week per
-# slug. CR_MODEL_LOOKUP=0 turns the network off; the trigger then stays disarmed
-# for that model until CR_CONTEXT_WINDOW or CR_CONTEXT_TOKENS says what to use.
+# A model this file has never heard of is estimated rather than left to disarm
+# the trigger (T19): a slug nobody shipped this build knowing about is almost
+# always a NEW model, i.e. a large one, and a session with nothing armed at all
+# dies of its own context instead of folding a little early on a guess. The
+# network is still asked for something firmer while that estimate stands — the
+# Models API when ANTHROPIC_API_KEY is set, the published models table
+# otherwise — in a worker thread, once a week per slug. CR_MODEL_LOOKUP=0 turns
+# the network off; the estimate is what the trigger runs on from then on,
+# unless CR_CONTEXT_WINDOW or CR_CONTEXT_TOKENS says what to use instead.
 # The wrapper's own version, checked against the newest release once a day. The
 # fetch never blocks a session: what is printed at startup comes from the cache
 # the previous run left, and the refresh happens in the background afterwards.
@@ -1256,6 +1260,7 @@ def project_dir(cwd=None, config_dir=None):
 # Matched against the raw row, before any JSON parsing: the rows we care about
 # are a small fraction of a transcript and the rest are large.
 _ASSISTANT_ROW = re.compile(rb'"type"\s*:\s*"assistant"')
+_COMPACT_ROW = re.compile(rb'"subtype"\s*:\s*"compact_boundary"')
 
 
 def assistant_row(rec):
@@ -1330,17 +1335,24 @@ def _echo_keys(echo):
 def transcript_limit_records(path, offset=0, echo=None):
     """(new_offset, [records]) for rows appended past `offset` that we care about.
 
-    Three kinds: the rate-limit rows; — when `echo` is a message we typed, or a
-    list of them — the user row claude writes when it accepts a prompt; and
-    assistant rows. That user row is proof the message was submitted rather than
-    left sitting in the input box, which is the only question the verify step is
-    really asking (screen-scraping the footer to answer it broke the day Claude
-    Code reworded it). An assistant row is proof the account is serving requests,
-    which is the question a wait is really asking — and it carries the usage
-    figures the context trigger reads.
+    Four kinds: the rate-limit rows; — when `echo` is a message we typed, or a
+    list of them — the user row claude writes when it accepts a prompt;
+    assistant rows; and the row claude writes when IT compacts the context on
+    its own (`compact_boundary`, T19). That user row is proof the message was
+    submitted rather than left sitting in the input box, which is the only
+    question the verify step is really asking (screen-scraping the footer to
+    answer it broke the day Claude Code reworded it). An assistant row is proof
+    the account is serving requests, which is the question a wait is really
+    asking — and it carries the usage figures the context trigger reads. A
+    `compact_boundary` row states the one figure this build cannot otherwise
+    know until it is too late: how many tokens the context actually held right
+    before claude decided on its own that it was full.
 
     Consecutive assistant rows collapse into one: a single answer can be a dozen
-    of them, and the caller only needs the fact.
+    of them, and the caller only needs the fact. A `compact_boundary` row never
+    joins that collapse in either direction — merging it into a neighbour would
+    hide the model/stop_reason it does not carry, or hide the compaction fact
+    inside a row nobody would think to check for it.
     """
     out = []
     echoes, echo_keys = _echo_keys(echo)
@@ -1351,11 +1363,18 @@ def transcript_limit_records(path, offset=0, echo=None):
         # Prefilters only — all three can match on a tool result that merely
         # quotes the words, so the row's own "type" decides below.
         aliveish = bool(_ASSISTANT_ROW.search(raw))
-        if not limitish and not echoish and not aliveish:
+        compactish = bool(_COMPACT_ROW.search(raw))
+        if not limitish and not echoish and not aliveish and not compactish:
             continue
         try:
             rec = json.loads(raw.decode("utf-8", "replace"))
         except Exception:
+            continue
+        if compactish and rec.get("type") == "system" and rec.get("subtype") == "compact_boundary":
+            pre = (rec.get("compactMetadata") or {}).get("preTokens")
+            out.append(dict(kind="alive", ts=rec.get("timestamp"), quiet=True,
+                            compacted=True, sidechain=False,
+                            pre_tokens=int(pre) if isinstance(pre, (int, float)) else None))
             continue
         if not rec.get("isApiErrorMessage"):
             text = record_text(rec) if echoish and rec.get("type") == "user" else None
@@ -1364,7 +1383,7 @@ def transcript_limit_records(path, offset=0, echo=None):
             elif rec.get("type") == "assistant":
                 row = assistant_row(rec)
                 prev = out[-1] if out else None
-                if (prev and prev["kind"] == "alive"
+                if (prev and prev["kind"] == "alive" and not prev.get("compacted")
                         and prev["sidechain"] == row["sidechain"]):
                     # The collapse keeps the NEWEST row's figures. Keeping the
                     # older row's would freeze the context reading at whatever it
@@ -2371,6 +2390,112 @@ def model_window(model):
     return None
 
 
+_FAMILY_MAJOR = re.compile(r"^claude-([a-z]+)-(\d+)")
+
+
+def _claude_family_estimate(slug):
+    """(window, "same family"|"modal window") for a claude-shaped slug with no
+    exact or point-release match in CONTEXT_WINDOWS, or None when the slug is
+    not even shaped like a claude model (T19).
+
+    `model_window` already refuses to guess past a family/major it has never
+    seen — right for a KNOWN model, since a wrong number there folds a session
+    that is nowhere near full. But a slug this whole build has never heard of
+    at all is a different question: it is almost always a NEW model, i.e. a
+    large one, and disarming the trigger over it is its own failure (the log
+    that started this: `claude-fable-5-1` read as unfamiliar and assumed 200k
+    folded a 1M session at 12% full — except here the fix is a guess in the
+    OPPOSITE direction, large rather than small). A member of a family the
+    table already has (`claude-opus-6` when `claude-opus-5` is in it) gets that
+    family's newest window — a new major version is not presumed smaller than
+    the last one. A brand new family name has nothing family-specific to go
+    on, so it gets the modal window of the table's own newest generation
+    instead ("large is what ships now").
+    """
+    m = _FAMILY_MAJOR.match(slug)
+    if not m:
+        return None
+    family = m.group(1)
+    by_major = {}           # major version -> [window, window, ...], every family
+    family_majors = {}      # major version -> [window, ...], this family only
+    for known, window in CONTEXT_WINDOWS.items():
+        km = _FAMILY_MAJOR.match(known)
+        if not km:
+            continue
+        major = int(km.group(2))
+        by_major.setdefault(major, []).append(window)
+        if km.group(1) == family:
+            family_majors.setdefault(major, []).append(window)
+    if family_majors:
+        newest = family_majors[max(family_majors)]
+        return collections.Counter(newest).most_common(1)[0][0], "same family"
+    if not by_major:
+        return None
+    newest = by_major[max(by_major)]
+    return collections.Counter(newest).most_common(1)[0][0], "modal window"
+
+
+def _codex_model_cache():
+    """{slug: effective window} out of codex's own `$CODEX_HOME/models_cache.json`,
+    or {} when it is missing or unreadable (T19).
+
+    codex writes this file itself for every model it has ever been pointed at
+    on this machine — the one source that can genuinely know a model newer
+    than this build's own table, without asking the network at all.
+    `context_window` is the raw figure; `effective_context_window_percent` (a
+    whole-number percentage, e.g. 95) narrows it to the effective one, the same
+    computation already documented above `MODEL_PROFILES`.
+    """
+    try:
+        with open(os.path.join(codex_home(), "models_cache.json")) as fh:
+            data = json.load(fh)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for slug, row in data.items():
+        if not isinstance(row, dict):
+            continue
+        window = row.get("context_window")
+        if not isinstance(window, (int, float)) or window <= 0:
+            continue
+        pct = row.get("effective_context_window_percent")
+        if isinstance(pct, (int, float)) and pct > 0:
+            window *= pct / 100.0 if pct > 1 else pct
+        out[model_slug(str(slug))] = int(window)
+    return out
+
+
+def estimate_window(agent, model):
+    """(window, source) for a model neither the profile table, the cache, nor a
+    live lookup has ever sized (T19) — the fallback that replaces disarming the
+    trigger outright. A new model ships exactly when this build's table is
+    stale, and a session left with nothing armed dies of its own context
+    instead of being folded a little early on a guess; self-correction (the
+    upward bump in `Controller.on_context`, the downward one off the agent's
+    own compaction) is what takes the guess back out of it once the session
+    itself says whether it was right.
+
+    `SMALL_WINDOW` is the last resort, used only when nothing above has ANY
+    opinion at all — explicitly provisional, not a considered guess the way
+    the family/cache stages are.
+    """
+    slug = model_slug(model)
+    if agent == "codex":
+        cache = _codex_model_cache()
+        if slug in cache:
+            return cache[slug], "the codex model cache"
+        if cache:
+            return (collections.Counter(cache.values()).most_common(1)[0][0],
+                    "the codex cache's modal window")
+        return SMALL_WINDOW, "nothing published, no codex model cache either"
+    got = _claude_family_estimate(slug)
+    if got:
+        return got
+    return SMALL_WINDOW, "nothing published"
+
+
 def model_restart_at(agent, slug, window):
     """The one remaining stage of the threshold order `_recompute_limit` does
     not already cover on its own: the model's own profile. Full order, top to
@@ -3036,6 +3161,7 @@ class Controller:
         self.context_model = None
         self.context_window_hint = None   # a window the transcript states outright
         self.context_window = None
+        self.context_estimated = False  # the window above is a guess, not a confirmed one (T19)
         self.window_unknown = None    # a model nothing here can size, for the lookup
         self.learned = {}             # slug -> window, from whoever answered
         self.context_limit = None     # the threshold in tokens; None = no trigger
@@ -3546,6 +3672,7 @@ class Controller:
     MTIME_SLACK = 2.0      # some filesystems keep mtime to the second
     RESTART_DROP = 0.5     # the context has to at least halve for /clear to have worked
     BADGE_NEAR = 0.8       # show the percentage only once the threshold is in sight
+    ESTIMATE_CONFIRM_FRAC = 0.6  # a guess that survives this much of itself is not a guess (T19)
     GATE_RETRY = 5.0       # how long to sit on a held step before looking again
     INTERRUPT_RETRY = 20.0 # between Escs, if the first did not close the turn
     HANDOFF_ECHO_RETRIES = 2   # retypes for a phrase that left no trace at all
@@ -3647,7 +3774,7 @@ class Controller:
         else:
             self.context_grew_at = now
         if rec.get("compacted"):
-            self._lost_the_race(now)
+            self._lost_the_race(now, rec.get("pre_tokens"))
         if rec.get("sidechain"):
             return                       # a subagent's context, not the session's
         if rec.get("stop_reason") is not None:
@@ -3679,17 +3806,88 @@ class Controller:
             return
         self.context_tokens = tokens
         if (self.context_window and tokens > self.context_window
-                and not self._window_bumped and not self.context_window_hint
+                and not self.context_window_hint
                 and not parse_tokens(self.cfg["context_window"])):
             # Guessing low is the safe direction, but being PROVED low is not a
             # reason to keep the guess: a threshold above the window we assumed
             # is a restart that can never happen.
-            self._window_bumped = True
-            self.log("context is %s, past the %s window assumed for %s; assuming %s"
-                     % (human_tokens(tokens), human_tokens(self.context_window),
-                        self.context_model, human_tokens(BIG_WINDOW)))
-            self.context_window = BIG_WINDOW
-            self._recompute_limit()
+            self._bump_window(tokens)
+        elif (self.context_estimated and self.context_window
+              and tokens >= self.context_window * self.ESTIMATE_CONFIRM_FRAC):
+            self._confirm_estimate(tokens)
+
+    def _bump_window(self, tokens):
+        """Escalate the assumed window past what usage just proved it to be
+        (T19). One rung at a time, repeated until the number actually fits:
+        200k -> 1M covers the two windows this build's own table uses; past
+        that (a model bigger than the biggest one it knows, or an estimate
+        that keeps being wrong) codex's own advertised ceiling is tried before
+        falling back to a flat 50% bump. The result is marked as a fresh guess
+        either way — a bumped window is exactly as unconfirmed as the one it
+        replaced, whether the one it replaced came from a guess or from the
+        profile table getting this specific session wrong.
+        """
+        old = self.context_window
+        steps = 0
+        while self.context_window < tokens and steps < 20:
+            if self.context_window < BIG_WINDOW:
+                self.context_window = BIG_WINDOW
+            elif self.codex:
+                cache = _codex_model_cache().get(model_slug(self.context_model))
+                self.context_window = (cache if cache and cache > self.context_window
+                                       else int(self.context_window * 1.5))
+            else:
+                self.context_window = int(self.context_window * 1.5)
+            steps += 1
+        self._window_bumped = True
+        self.context_estimated = True
+        self.log("context is %s, past the %s window assumed for %s; assuming %s"
+                 % (human_tokens(tokens), human_tokens(old),
+                    self.context_model, human_tokens(self.context_window)))
+        self._recompute_limit()
+
+    def _confirm_estimate(self, tokens):
+        """A guessed window that has carried this session past
+        `ESTIMATE_CONFIRM_FRAC` of itself without compacting has earned the
+        benefit of the doubt (T19): stop marking it with `~` in the badge.
+        """
+        self.context_estimated = False
+        self.log("%s: the %s window assumed for it has held past %s without "
+                 "compacting; no longer marked as a guess"
+                 % (self.context_model, human_tokens(self.context_window),
+                    human_tokens(tokens)))
+
+    def _correct_window_down(self, pre_tokens, now):
+        """The agent just told us, by compacting on its own, that its
+        effective window is no bigger than `pre_tokens` (T19): `window =
+        pre_tokens / 0.92` backs off the ~8% headroom both agents' own
+        compaction leaves before the true ceiling — the same margin the
+        `_SMALL_CLAUDE` profiles already assume (`window * 0.95`), close
+        enough not to invent a second constant for it. This can only move the
+        assumption DOWN: a compaction well inside a window that already fits
+        it is not evidence the window is smaller, just that the agent folded
+        early. Unlike a guess, this is observed directly from the session's
+        own behavior, so it does not carry the `~` an estimate does.
+        """
+        if not isinstance(pre_tokens, (int, float)) or pre_tokens <= 0:
+            return
+        corrected = int(pre_tokens / 0.92)
+        if self.context_window and corrected >= self.context_window:
+            return
+        old = self.context_window
+        self.context_window = corrected
+        self.context_estimated = False
+        self._window_bumped = False
+        self._recompute_limit()
+        if not self.context_enabled:
+            return
+        self.log("%s compacted at %s: the effective window is ~%s, not the %s "
+                 "assumed; restarting at %s from now on"
+                 % ("codex" if self.codex else "claude", human_tokens(pre_tokens),
+                    human_tokens(corrected),
+                    human_tokens(old) if old else "nothing",
+                    human_tokens(self.context_limit) if self.context_limit
+                    else "nothing"))
 
     def on_turn(self, state, now):
         """codex opened or closed a turn in the rollout this session writes."""
@@ -3738,14 +3936,27 @@ class Controller:
                      "using %s instead" % (human_tokens(self.context_limit),
                                            human_tokens(line)))
 
-    def _lost_the_race(self, now):
+    def _lost_the_race(self, now, pre_tokens=None):
+        """The agent compacted the context on its own, ahead of the restart:
+        codex's own `compacted` event (no count of its own — `pre_tokens`
+        defaults to the last count this session reported), or claude's
+        `compact_boundary` (which states `pre_tokens` outright, T19).
+        """
         if not self.context_enabled:
             return                       # nothing was racing it
         self.self_compactions += 1
-        self.log("codex compacted the thread on its own before the restart could "
-                 "(%d this session) — the count stood at %s of a %s cap"
-                 % (self.self_compactions, human_tokens(self.context_tokens),
-                    human_tokens(self.codex_cap)))
+        pre_tokens = pre_tokens if pre_tokens is not None else self.context_tokens
+        agent = "codex" if self.codex else "claude"
+        if self.codex:
+            self.log("codex compacted the thread on its own before the restart could "
+                     "(%d this session) — the count stood at %s of a %s cap"
+                     % (self.self_compactions, human_tokens(pre_tokens),
+                        human_tokens(self.codex_cap)))
+        else:
+            self.log("claude compacted the thread on its own before the restart could "
+                     "(%d this session) — the count stood at %s"
+                     % (self.self_compactions, human_tokens(pre_tokens)))
+        self._correct_window_down(pre_tokens, now)
         # Whatever this thread's count was, it is gone, and a restart in flight is
         # judging a context that no longer exists.
         self.context_tokens = None
@@ -3753,20 +3964,20 @@ class Controller:
             return
         if self.rstate in (HANDOFF_SENT, HANDOFF_OK) and self._handoff_fault(
                 self.probe(self.handoff_path)) is None:
-            # codex reached its own cap before the wrapper's /clear did, but the
-            # handoff it was racing had already landed — the file passes every
-            # layer `_check_handoff` would have accepted. codex did the clearing
-            # for us; sending `/clear` again would only retype into a context
-            # that is already gone, so what is missing is the unfold, not
-            # another restart from scratch.
-            self.log("the handoff had already landed when codex compacted; "
-                     "skipping straight to unfold instead of aborting")
+            # The agent reached its own compaction before the wrapper's /clear
+            # did, but the handoff it was racing had already landed — the file
+            # passes every layer `_check_handoff` would have accepted. It did
+            # the clearing for us; sending `/clear` again would only retype
+            # into a context that is already gone, so what is missing is the
+            # unfold, not another restart from scratch.
+            self.log("the handoff had already landed when %s compacted; "
+                     "skipping straight to unfold instead of aborting" % agent)
             self.rstate = CLEARED
             self.restart_left = self.cfg["handoff_timeout"]
             self.rwake = now
             self._unfold_notify_at = now
             return
-        self._abort_restart("codex compacted the thread itself during %s" % self.rstate,
+        self._abort_restart("%s compacted the thread itself during %s" % (agent, self.rstate),
                             now)
 
     def _maybe_interrupt(self, now):
@@ -3864,43 +4075,67 @@ class Controller:
 
     # -- the window --------------------------------------------------------- #
     def _resolve_window(self):
-        """How large the context window is, in the order the answers are trusted."""
+        """How large the context window is, in the order the answers are trusted
+        (T19):
+
+          1. CR_CONTEXT_WINDOW — said outright, so nothing below is asked.
+          2. reported by the agent itself — codex states one in every row of
+             accounting; T20 will have claude's own statusline do the same.
+          3. claude's own environment (CLAUDE_CODE_MAX_CONTEXT_TOKENS /
+             CLAUDE_CODE_DISABLE_1M_CONTEXT) — narrows what its native window
+             would otherwise be; meaningless for codex, which states its own.
+          4. the profile table (T18) — ground truth for a model it lists,
+             including a same-family point release (`model_window`'s own
+             fallback) and codex's exact-slug entries in MODEL_PROFILES.
+          5. a slug learned off the network (`self.learned`, via WindowLookup)
+             — stands in for a model the shipped table does not carry.
+          6. an estimate (`estimate_window`, T19) — a slug NOTHING above
+             answered for is guessed rather than left to disarm the trigger:
+             an unfamiliar slug is almost always evidence of a new, large
+             model, and a session with no restart armed at all is a worse
+             failure than a guess. `window_unknown` (below) keeps asking the
+             network for something firmer while the guess stands, and
+             `on_context` corrects it both ways as the session proves it
+             right or wrong.
+        """
         forced = parse_tokens(self.cfg["context_window"])
-        native = model_window(self.context_model) or self.learned.get(
-            model_slug(self.context_model))
+        slug = model_slug(self.context_model)
+        if self.codex:
+            prof = MODEL_PROFILES.get("codex", {}).get(slug)
+            native = prof.window if prof else None
+        else:
+            native = model_window(self.context_model)
+        native = native or self.learned.get(slug)
+        self.context_estimated = False
         if forced:
             self.context_window, why = forced, "CR_CONTEXT_WINDOW"
-        elif self.codex:
-            # Claude Code's switches are not codex's, the table knows no codex
-            # model, and none is needed: every turn states its window.
-            self.context_window = self.context_window_hint
-            why = "the transcript" if self.context_window else "nothing stated yet"
-        elif self.cfg["context_env_max"] > 0:
-            self.context_window, why = (int(self.cfg["context_env_max"]),
-                                        "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
         elif self.context_window_hint:
             self.context_window, why = self.context_window_hint, "the transcript"
-        elif native is None:
-            # No denominator, and inventing one is the bug this used to have:
-            # assuming the small window put a 1M session at 59% when it was at
-            # 12%, and folded it. An unfamiliar slug is almost always a NEW
-            # model, which is to say a large one — so nothing is assumed, the
-            # percentage trigger stays disarmed, and the wrapper goes and asks.
-            self.context_window, why = None, "an unfamiliar model slug"
-        elif self.cfg["context_no_1m"]:
-            # We started claude ourselves, so its environment is ours to read:
-            # the long window is switched off for this session whatever the
-            # model is capable of.
-            self.context_window, why = (min(native, SMALL_WINDOW),
-                                        "CLAUDE_CODE_DISABLE_1M_CONTEXT")
+        elif not self.codex and self.cfg["context_env_max"] > 0:
+            self.context_window, why = (int(self.cfg["context_env_max"]),
+                                        "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
+        elif native is not None:
+            if not self.codex and self.cfg["context_no_1m"]:
+                # We started claude ourselves, so its environment is ours to
+                # read: the long window is switched off for this session
+                # whatever the model is capable of.
+                self.context_window, why = (min(native, SMALL_WINDOW),
+                                            "CLAUDE_CODE_DISABLE_1M_CONTEXT")
+            else:
+                self.context_window, why = native, "the model"
         else:
-            self.context_window, why = native, "the model"
+            self.context_window, why = estimate_window(
+                "codex" if self.codex else "claude", self.context_model)
+            self.context_estimated = True
         self._window_bumped = False
         self._recompute_limit()
-        # Nobody publishes a codex model's window where the lookup looks, and
-        # the rollout says it on the next turn anyway.
-        self.window_unknown = (self.context_model if self._needs_window()
-                               and not self.codex else None)
+        # Nothing above codex's own rollout ever names its window, so a lookup
+        # here would only ever ask about a slug it cannot answer.
+        self.window_unknown = (self.context_model if self.context_estimated
+                               and not self.codex
+                               and self.cfg["context_tokens"] <= 0
+                               and self.cfg["context_pct"] > 0
+                               and not self.context_off else None)
         if not self.context_enabled:
             return
         if self._needs_window():
@@ -3909,13 +4144,19 @@ class Controller:
                      % (self.context_model or "this session", why,
                         self.cfg["context_pct"]))
         else:
-            self.log("%s: a %s context window (%s), restarting at %s"
+            marker = " (estimated)" if self.context_estimated else ""
+            self.log("%s: a %s context window (%s)%s, restarting at %s"
                      % (self.context_model or "this session",
-                        human_tokens(self.context_window), why,
+                        human_tokens(self.context_window), why, marker,
                         human_tokens(self.context_limit)))
 
     def _needs_window(self):
-        """Is a window the missing piece? An absolute threshold never needs one."""
+        """Is a window the missing piece? An absolute threshold never needs one.
+
+        True today only for codex before its first turn has stated one: every
+        other path through `_resolve_window` always lands on SOME number now,
+        even if only a T19 estimate — which is the point of that fallback.
+        """
         return (self.context_window is None and self.cfg["context_tokens"] <= 0
                 and self.cfg["context_pct"] > 0 and not self.context_off)
 
@@ -4536,7 +4777,7 @@ class Badge:
 
     # -- what it says ------------------------------------------------------- #
     def frame(self, state, remaining, attempts, max_attempts, now, deferred=False,
-              restart=None, context=None, warn=None):
+              restart=None, context=None, warn=None, context_estimated=False):
         """(text, sgr) for a controller state. Pure, so the tests can drive it."""
         mark = self.MARK
         if state == WAITING:
@@ -4574,7 +4815,12 @@ class Badge:
         if context is not None:
             # Rounded, not truncated: codex's status line rounds, and a corner
             # saying 4% under a line saying 5% reads as two different sessions.
-            return ("%s %s %d%%" % (mark, self.label, int(context + 0.5)), "2;32")
+            pct = "%d%%" % int(context + 0.5)
+            if context_estimated:
+                # T19: the denominator is a guess, not a confirmed window --
+                # worth saying on the one line anyone is actually watching.
+                pct = "~" + pct
+            return ("%s %s %s" % (mark, self.label, pct), "2;32")
         return ("%s %s" % (mark, self.label), "2")
 
     # -- when it says it ---------------------------------------------------- #
@@ -4634,9 +4880,10 @@ class Badge:
         return annotation_bytes(row, col, text, sgr)
 
     def paint(self, fd, rows, cols, state, remaining, attempts, max_attempts, now,
-              blocked=False, deferred=False, restart=None, context=None, warn=None):
+              blocked=False, deferred=False, restart=None, context=None, warn=None,
+              context_estimated=False):
         text, sgr = self.frame(state, remaining, attempts, max_attempts, now, deferred,
-                               restart, context, warn)
+                               restart, context, warn, context_estimated)
         if not self.due(text, now, blocked):
             return False
         # A narrower frame than the last one would leave the tail of that one on
@@ -5802,7 +6049,7 @@ def main(argv):
                             # the terminal; anything written now lands inside it.
                             blocked=bool(esc_carry), deferred=ctl.deferred,
                             restart=ctl.rstate, context=ctl.badge_context(),
-                            warn=ctl.badge_warn())
+                            warn=ctl.badge_warn(), context_estimated=ctl.context_estimated)
 
             try:
                 done, status = os.waitpid(pid, os.WNOHANG)

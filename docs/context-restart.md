@@ -281,30 +281,76 @@ codex   gpt-5.6-sol        258k    194k        258k        CR_CONTEXT_RESTART
 | opus 4-1/4-5, sonnet 4-5, haiku 4-5 | 200k | 102k (51%) | ~190k |
 | codex 5.6 (sol/terra/luna/astra) and 5.5 | 258.4k (effective) | 194.4k (cap − 64k reserve) | 258.4k (hard cap) |
 
-`CR_CONTEXT_WINDOW=auto` reads the model slug out of the transcript and looks
-it up. It narrows to 200k if `CLAUDE_CODE_DISABLE_1M_CONTEXT` or
-`CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set in the environment claude is started
-with, and it widens if the session is ever seen past the window it assumed.
-Name a number if your setup narrows the window some way the wrapper cannot see.
-(On codex the window is read from the rollout, and `CR_CONTEXT_WINDOW` is not
-needed — which is also why raising `model_context_window` in codex's
-`config.toml` past what the profile table lists moves the window the wrapper
-sees, and the table's row for that model stops applying; see stage 4 above.)
+`CR_CONTEXT_WINDOW=auto` reads the model slug out of the transcript and
+resolves it in the order `resolve_window` trusts most to least:
 
-A model the built-in table does not list is not guessed at. A point release
-resolves to its family (`claude-fable-5-1` is whatever `claude-fable-5` is), and
-anything left over is looked up: the Models API when `ANTHROPIC_API_KEY` is set
-— a Claude subscription is not an API key, so most sessions skip this — and the
-published models table otherwise. That happens in a worker thread, so nothing
-waits on it, and the answer is cached in `CR_MODEL_CACHE` for a week. Until it
-arrives the percentage trigger is disarmed and the corner says `cr window?`;
-`CR_MODEL_LOOKUP=0` keeps the wrapper entirely offline, and then an unknown
-model needs `CR_CONTEXT_WINDOW` or `CR_CONTEXT_TOKENS` from you.
+1. `CR_CONTEXT_WINDOW` itself, if it names a number rather than `auto`.
+2. What the agent states outright — codex writes its window into every row of
+   accounting; a claude statusline will do the same once T20 lands.
+3. Claude Code's own environment: it narrows to 200k if
+   `CLAUDE_CODE_DISABLE_1M_CONTEXT` or `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set
+   in the environment claude is started with.
+4. The profile table above — including a same-family point release
+   (`claude-fable-5-1` is whatever `claude-fable-5` is).
+5. A window this build has learned off the network for a slug the table does
+   not carry (below).
+6. **An estimate** (new — see below): a slug nothing above sized gets a guess
+   rather than a disarmed trigger.
+
+It also widens on its own if the session is ever seen past the window it
+assumed — see "Self-correction" below. Name a number if your setup narrows
+the window some way the wrapper cannot see. (On codex the window is normally
+read from the rollout every turn, which is why `CR_CONTEXT_WINDOW` is not
+needed there — and why raising `model_context_window` in codex's
+`config.toml` past what the profile table lists moves the window the wrapper
+sees, and the table's row for that model stops applying; see stage 4 of
+"Choosing a threshold" above.)
+
+A model the built-in table does not list is looked up rather than guessed at
+first: the Models API when `ANTHROPIC_API_KEY` is set — a Claude subscription
+is not an API key, so most sessions skip this — and the published models table
+otherwise. That happens in a worker thread, so nothing waits on it, and the
+answer is cached in `CR_MODEL_CACHE` for a week. `CR_MODEL_LOOKUP=0` keeps the
+wrapper entirely offline.
+
+### An estimate is an estimate
+
+Until the network answers (or if `CR_MODEL_LOOKUP=0` means it never will), the
+trigger no longer sits disarmed on `cr window?`. A slug nobody shipped this
+build knowing about is almost always a NEW model — which is to say a large
+one — so it gets a guess instead: a claude slug from a family the table
+already has (`claude-opus-6` when `claude-opus-5` is in it) gets that family's
+newest window; an entirely new family gets the modal window of the table's own
+newest generation; a codex slug is read from codex's own
+`$CODEX_HOME/models_cache.json` if it is there, or that cache's modal window;
+and if nothing above has any opinion at all, a flat 200k stands in as a
+last, explicitly provisional resort. The corner marks a percentage built on a
+guess with `~` (`cr ~51%`) so it is never mistaken for a confirmed reading, and
+the log names the guess and where it came from
+(`claude-opus-6: a 1.0M context window (same family) (estimated), restarting
+at 510k`).
+
+**Self-correction**, both ways:
+
+- *Upward*: proven too small (a turn's usage lands past the assumed window) —
+  200k escalates to 1M, and past that to codex's own advertised ceiling or a
+  flat 50% bump, repeated until the number actually fits. Always was true even
+  before an estimate could be wrong in this direction (a profile-table window
+  can be proven wrong for one specific session too); T19 just lets it escalate
+  more than once.
+- *Downward*: the agent compacts the context on its own — claude's own
+  `compact_boundary`, or codex's own `compacted` — which states or implies
+  how many tokens it actually held right before deciding it was full. The
+  window becomes `tokens / 0.92` (backing off the headroom both agents leave
+  before their true ceiling) if that is smaller than what was assumed, and the
+  restart threshold is recalculated from it. This also fixes "the table says
+  1M, but this session's real ceiling is 200k" after the fact, and it is not
+  marked `~`: it is something the session just told us, not a guess.
+- A guess that survives past 60% of itself without compacting has earned the
+  benefit of the doubt and loses its `~`.
 
 This is the one thing in the wrapper that talks to the network, and only ever
-about a model name: it sends a slug and reads back a number. Guessing instead is
-what this replaced — assuming 200k for a slug that turned out to be a 1M model
-folded a session that was 12% full.
+about a model name: it sends a slug and reads back a number.
 
 ## Slash commands and `CR_SLASH_ENTER`
 
@@ -331,11 +377,14 @@ Look in `~/.claude-retrier/log`. In order of likelihood:
 - `a 200k context window` for a model you expected to have 1M: the line says
   where the figure came from — most likely `CLAUDE_CODE_DISABLE_1M_CONTEXT`.
   Name the window yourself with `CR_CONTEXT_WINDOW=1M`.
-- `the window is unknown ... stays disarmed`, and `cr window?` in the corner:
-  this build has never heard of the model and could not look it up either. It
-  will not guess — a guessed window is how a session gets folded at 12% full —
-  so either `CR_CONTEXT_WINDOW=1M`, or set `CR_CONTEXT_TOKENS`, which needs no
-  window at all.
+- `cr window?` in the corner (codex only): the rollout has not stated its
+  window yet, which normally clears itself on the next turn. If it never does,
+  `CR_CONTEXT_WINDOW` or `CR_CONTEXT_TOKENS` gives it one directly.
+- `(estimated)` in a `context window` line, or `~` in front of the percentage
+  in the corner: this build has never heard of the model (or could not look it
+  up) and is running on a guess — see "An estimate is an estimate" above for
+  where the guess comes from and how it corrects itself. Name the window
+  yourself with `CR_CONTEXT_WINDOW` if you already know it is wrong.
 - `restart aborted at handoff_sent: ...` (or `handoff_ok`) means the fold
   produced nothing usable, and the message names which of the four checks
   failed. If the phrase never reached the session at all, that's it — the

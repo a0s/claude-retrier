@@ -13,6 +13,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from helper import load
 from test_codex import codex_controller, feed
@@ -253,6 +254,54 @@ class TestTheModelProfileTable(unittest.TestCase):
         # derived from them, and model_window's own behavior must not move.
         for slug, prof in cr.MODEL_PROFILES["claude"].items():
             self.assertEqual(cr.model_window(slug), prof.window, slug)
+
+
+class TestTheWindowEstimate(unittest.TestCase):
+    """T19: a slug neither the profile table, the cache, nor a live lookup has
+    ever sized still gets a number, not a disarmed trigger — an unfamiliar
+    slug is almost always a NEW (large) model, and a session with nothing
+    armed at all dies of its own context instead."""
+
+    def test_an_unfamiliar_version_of_a_known_family_gets_its_newest_window(self):
+        self.assertEqual(cr.estimate_window("claude", "claude-opus-6"),
+                         (1000000, "same family"))
+
+    def test_a_brand_new_family_gets_the_tables_modal_window(self):
+        self.assertEqual(cr.estimate_window("claude", "claude-newfamily-1"),
+                         (1000000, "modal window"))
+
+    def test_nothing_claude_shaped_falls_back_to_the_small_window(self):
+        self.assertEqual(cr.estimate_window("claude", "not-even-claude-shaped"),
+                         (200000, "nothing published"))
+
+    def test_a_codex_slug_is_read_from_its_own_cache(self):
+        home = tempfile.mkdtemp(prefix="cr-codex-cache-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        with open(os.path.join(home, "models_cache.json"), "w") as fh:
+            json.dump({"gpt-7-nova": {"context_window": 300000,
+                                      "effective_context_window_percent": 90}}, fh)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+            self.assertEqual(cr.estimate_window("codex", "gpt-7-nova"),
+                             (270000, "the codex model cache"))
+
+    def test_a_codex_slug_absent_from_the_cache_gets_its_modal_window(self):
+        home = tempfile.mkdtemp(prefix="cr-codex-cache-")
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        with open(os.path.join(home, "models_cache.json"), "w") as fh:
+            json.dump({"gpt-a": {"context_window": 300000,
+                                  "effective_context_window_percent": 100},
+                       "gpt-b": {"context_window": 300000,
+                                 "effective_context_window_percent": 100},
+                       "gpt-c": {"context_window": 100000,
+                                 "effective_context_window_percent": 100}}, fh)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": home}):
+            self.assertEqual(cr.estimate_window("codex", "gpt-unknown"),
+                             (300000, "the codex cache's modal window"))
+
+    def test_with_nothing_published_at_all_it_is_the_provisional_small_window(self):
+        with mock.patch.dict(os.environ, {"CODEX_HOME": "/nonexistent-cr-test-home"}):
+            self.assertEqual(cr.estimate_window("codex", "gpt-anything"),
+                             (200000, "nothing published, no codex model cache either"))
 
 
 class TestTheThresholdResolutionOrder(unittest.TestCase):
