@@ -401,6 +401,8 @@ CR_AGENTS_PANEL_ROW_PATTERNS=(
 : "${CR_HANDOFF_MARKER:=HANDOFF}"      # a nonce is appended; must end the file
 : "${CR_HANDOFF_MIN_BYTES:=200}"       # anything shorter is not a handoff
 : "${CR_HANDOFF_ATTEMPTS:=2}"          # tries to fold before giving up
+: "${CR_RESUME_ATTEMPTS:=5}"           # retypes of the unfold phrase, each wait doubling,
+                                        # before the debt is UNFOLD_FAILED instead of retried
 # Three things in this phrase are load-bearing: no new work, "a fresh session
 # that has no memory of this one", and the marker as the LAST LINE OF THE FILE.
 # A marker in the chat would only prove the model believes it finished; a marker
@@ -424,6 +426,8 @@ CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
 : "${CR_ROOT_IDLE_SEC:=20}"            # transcript quiet this long => the turn is over
 : "${CR_HANDOFF_TIMEOUT_SEC:=900}"     # per restart step, and frozen while a limit runs
 : "${CR_STEP_GAP_SEC:=3}"              # between /clear and the resume phrase
+: "${CR_CLEAR_SETTLE_SEC:=5}"          # screen quiet this long after /clear counts as
+                                        # confirmation on its own, without a rebind
 : "${CR_CONTEXT_COOLDOWN_SEC:=600}"    # silence after any restart, successful or not
 : "${CR_CONTEXT_MAX_CYCLES:=0}"        # 0 = no cap; >0 is a fuse against a loop
 # Typing a "/" opens Claude Code's command list, where Enter can pick the
@@ -872,12 +876,14 @@ CFG = dict(
     handoff_marker=_env("CR_HANDOFF_MARKER", "HANDOFF"),
     handoff_min_bytes=_env("CR_HANDOFF_MIN_BYTES", 200, int),
     handoff_attempts=_env("CR_HANDOFF_ATTEMPTS", 2, int),
+    resume_attempts=_env("CR_RESUME_ATTEMPTS", 5, int),
     handoff_msg=_env("CR_HANDOFF_MSG", ""),
     clear_cmd=_env("CR_CLEAR_CMD", "/clear"),
     resume_msg=_env("CR_RESUME_MSG", "Read `{file}` and continue from it."),
     root_idle=_env("CR_ROOT_IDLE_SEC", 20.0, float),
     handoff_timeout=_env("CR_HANDOFF_TIMEOUT_SEC", 900.0, float),
     step_gap=_env("CR_STEP_GAP_SEC", 3.0, float),
+    clear_settle=_env("CR_CLEAR_SETTLE_SEC", 5.0, float),
     context_cooldown=_env("CR_CONTEXT_COOLDOWN_SEC", 600.0, float),
     context_max_cycles=_env("CR_CONTEXT_MAX_CYCLES", 0, int),
     slash_gap=_env("CR_SLASH_GAP_SEC", 0.9, float),
@@ -2668,11 +2674,12 @@ IDLE, WAITING, VERIFY, DONE = "idle", "waiting", "verify", "done"
 # The context restart runs alongside those rather than inside them. A limit that
 # lands in the middle of one does not cancel it — it suspends it — so the two
 # machines each have to be able to hold a position of their own.
-HANDOFF_SENT, HANDOFF_OK, CLEARED, RESUME_SENT = (
-    "handoff_sent", "handoff_ok", "cleared", "resume_sent")
+HANDOFF_SENT, HANDOFF_OK, CLEAR_SENT, CLEARED, RESUME_SENT, UNFOLD_FAILED = (
+    "handoff_sent", "handoff_ok", "clear_sent", "cleared", "resume_sent", "unfold_failed")
 
 RESTART_LABELS = {HANDOFF_SENT: "folding", HANDOFF_OK: "folded",
-                  CLEARED: "cleared", RESUME_SENT: "unfolding"}
+                  CLEAR_SENT: "clearing", CLEARED: "cleared", RESUME_SENT: "unfolding",
+                  UNFOLD_FAILED: "unfold failed"}
 
 # Defaults for everything the context restart and the stall handling read, so a
 # Controller built from a config dict written before either existed (the tests
@@ -2682,9 +2689,9 @@ CONTEXT_DEFAULTS = dict(
     context_pct=0.0, context_tokens=0, context_window="auto",
     context_env_max=0, context_no_1m=False,
     handoff_file=".claude-retrier/handoff.md", handoff_marker="HANDOFF",
-    handoff_min_bytes=200, handoff_attempts=2, handoff_msg="", clear_cmd="/clear",
-    resume_msg="Read `{file}` and continue from it.",
-    root_idle=20.0, handoff_timeout=900.0, step_gap=3.0,
+    handoff_min_bytes=200, handoff_attempts=2, resume_attempts=5, handoff_msg="",
+    clear_cmd="/clear", resume_msg="Read `{file}` and continue from it.",
+    root_idle=20.0, handoff_timeout=900.0, step_gap=3.0, clear_settle=5.0,
     context_cooldown=600.0, context_max_cycles=0,
     model_lookup=False, model_lookup_timeout=10.0,
     model_cache=os.path.expanduser("~/.claude-retrier/windows.json"),
@@ -2850,7 +2857,8 @@ class Controller:
         self.counted_by_log = None    # the rollout whose count now comes from that log
         self.interrupt_at = 0.0       # when a running turn was last interrupted
         self.self_compactions = 0     # times codex got there first
-        self.rstate = None            # None | HANDOFF_SENT | HANDOFF_OK | CLEARED | RESUME_SENT
+        self.rstate = None            # None | HANDOFF_SENT | HANDOFF_OK | CLEAR_SENT |
+                                       # CLEARED | RESUME_SENT | UNFOLD_FAILED
         self.nonce = None             # the marker only this attempt can satisfy
         self.handoff_sent_at = 0.0
         self.end_turn_seen_at = 0.0   # when end_turn last landed on the attached
@@ -2869,6 +2877,11 @@ class Controller:
         self.handoff_text = None      # the exact fold phrase last sent, nonce and all
         self.handoff_echoed = False   # that phrase, seen echoed back in a transcript
         self.handoff_echo_retries = 0 # retypes for want of an echo, not for a bad file
+        self.last_output_at = 0.0     # last byte of any kind read from the pty
+        self.clear_sent_at = 0.0      # when the current /clear (or its one reprint) went out
+        self.clear_retried = False    # the one reprint CLEAR_SENT allows itself
+        self._clear_from_path = None  # context_path at /clear time; a change confirms it
+        self._unfold_notify_at = 0.0  # last time a stuck CLEARED/UNFOLD_FAILED said so
         self._restart_tick = None     # last tick the restart clock actually ran
         self._rearm = False           # a wait ended mid-restart: re-send the step
         self._gate_note = None
@@ -2999,10 +3012,17 @@ class Controller:
             i += 1
         if human:
             self.last_user_input = now
+            if self.rstate == UNFOLD_FAILED:
+                # The failure itself is not undone -- context_off stays set -- but
+                # a human is now at the keyboard, and a badge/notify that keeps
+                # repeating at someone who already saw it is just noise.
+                self.log("a key was pressed; the unfold-failed notice is dismissed")
+                self._end_restart(now)
         if self.pending_input_chars != before:
             self.last_draft_change = now
 
     def on_output(self, text, now):
+        self.last_output_at = now     # any byte at all, not just a working footer (T08)
         # Claude's streaming footer can land split across two reads, so match on a
         # small overlap with the previous chunk rather than the chunk alone. It must
         # stay small: matching the whole rolling window would keep `last_working`
@@ -3328,6 +3348,7 @@ class Controller:
     GATE_RETRY = 5.0       # how long to sit on a held step before looking again
     INTERRUPT_RETRY = 20.0 # between Escs, if the first did not close the turn
     HANDOFF_ECHO_RETRIES = 2   # retypes for a phrase that left no trace at all
+    NOTIFY_INTERVAL = 300.0    # how often a stuck CLEARED/UNFOLD_FAILED says so again
 
     @property
     def context_enabled(self):
@@ -3522,6 +3543,7 @@ class Controller:
             self.rstate = CLEARED
             self.restart_left = self.cfg["handoff_timeout"]
             self.rwake = now
+            self._unfold_notify_at = now
             return
         self._abort_restart("codex compacted the thread itself during %s" % self.rstate,
                             now)
@@ -3612,7 +3634,7 @@ class Controller:
         """The one line the human sees when something is typed for them."""
         return {
             HANDOFF_SENT: "context is filling up; asking for a handoff",
-            CLEARED: "handoff verified; clearing the context",
+            CLEAR_SENT: "handoff verified; clearing the context",
             RESUME_SENT: "context cleared; unfolding the handoff",
         }.get(self.rstate,
               "asking the session to carry on" if self.incident == "stall"
@@ -3734,26 +3756,38 @@ class Controller:
             return self._after_limit(now)[1]
         if self.rstate == HANDOFF_SENT:
             return self._check_handoff(now)
-        if self.restart_left <= 0:
-            return self._abort_restart("%s took longer than %.0fs"
-                                       % (self.rstate, self.cfg["handoff_timeout"]), now)
         if self.rstate == HANDOFF_OK:
+            if self.restart_left <= 0:
+                return self._abort_restart("%s took longer than %.0fs"
+                                           % (self.rstate, self.cfg["handoff_timeout"]), now)
             return self._send_clear(now)
+        if self.rstate == CLEAR_SENT:
+            if self.restart_left <= 0:
+                return self._abort_restart("%s took longer than %.0fs"
+                                           % (self.rstate, self.cfg["handoff_timeout"]), now)
+            return self._check_clear(now)
         if self.rstate == CLEARED:
-            if now < self.rwake or self._held(now):
-                return None
-            return self._send_resume(now)
+            return self._wait_for_unfold_gate(now)
         if self.rstate == RESUME_SENT:
             return self._check_resume(now)
+        if self.rstate == UNFOLD_FAILED:
+            return self._renotify(now,
+                "read `%s` yourself: the resume phrase never reached the session"
+                % self.cfg["handoff_file"])
         return None
 
-    def _held(self, now):
+    def _held(self, now, session_gate=True):
         """Is a person or a running turn holding the next step back?
+
+        `session_gate` is False for `CLEARED`: once `/clear` is confirmed, whatever
+        "busy" meant on the transcript that came before it says nothing about the
+        session now in front of it (T04) -- only a person still counts there.
 
         Logged only when the answer changes: this is asked several times a second
         and a line each time would bury everything else in the log.
         """
-        why = self._blocked_by_human(now) or self._session_busy(now)
+        why = self._blocked_by_human(now) or (session_gate and self._session_busy(now))
+        why = why or None                # False -> None: a plain "nothing" for the log
         if why != self._gate_note:
             self._gate_note = why
             if why:
@@ -3761,6 +3795,25 @@ class Controller:
         if why:
             self.rwake = now + self.GATE_RETRY
         return why
+
+    def _renotify(self, now, text):
+        """Say a standing debt again if it has been `NOTIFY_INTERVAL` since the
+        last time -- a debt that can sit for hours must not go quiet after the
+        first mention just because nothing else changed."""
+        if now - self._unfold_notify_at < self.NOTIFY_INTERVAL:
+            return None
+        self._unfold_notify_at = now
+        return ("notify", text)
+
+    def _wait_for_unfold_gate(self, now):
+        """CLEARED has no timeout: the context is already gone, so the only thing
+        left to do is unfold it, and the only reason not to yet is a person."""
+        if now < self.rwake:
+            return None
+        why = self._held(now, session_gate=False)
+        if why:
+            return self._renotify(now, "context cleared; unfold is waiting for: %s" % why)
+        return self._send_resume(now)
 
     def _session_busy(self, now):
         if self.turn_open:
@@ -3839,18 +3892,54 @@ class Controller:
         if now < self.rwake or self._held(now):
             return None
         # The one irreversible step, and the only route to it is a handoff that
-        # satisfied all four layers below.
+        # satisfied all four layers below. It is not, on its own, proof that
+        # Claude Code actually acted on it -- CLEAR_SENT is what waits for that.
         self.context_before = max(self.context_before or 0, self.context_tokens or 0)
-        self.rstate = CLEARED
+        self.rstate = CLEAR_SENT
         self.restart_left = self.cfg["handoff_timeout"]
-        self.rwake = now + self.cfg["step_gap"]
+        self.clear_sent_at = now
+        self.clear_retried = False
+        self._clear_from_path = self.context_path
         self.log("handoff verified; clearing the context with %s" % self.cfg["clear_cmd"])
         return ("inject", self.cfg["clear_cmd"], self._take_dismiss())
+
+    def _check_clear(self, now):
+        """Did `/clear` actually land? Unfolding into a session that never saw it
+        would type the resume phrase straight into the still-full one (T08).
+
+        Two signals count as proof, either one: the transcript identity moved on
+        (claude rebinding to a new sessionId/file, codex to a new rollout -- the
+        same `bind_transcript` call either way), or the screen has simply gone
+        quiet for `clear_settle` -- the only signal there is on an agent that does
+        not rebind. Absent either, one reprint is cheap insurance against a
+        keystroke that never reached the input box at all.
+        """
+        if self.context_path != self._clear_from_path:
+            return self._enter_cleared("a new session replaced it", now)
+        if now - max(self.last_output_at, self.clear_sent_at) >= self.cfg["clear_settle"]:
+            return self._enter_cleared("the screen went quiet", now)
+        if (not self.clear_retried and now - self.clear_sent_at >= self.cfg["verify"]
+                and not self._held(now)):
+            self.clear_retried = True
+            self.clear_sent_at = now
+            self.log("the clear command left no trace; sending it again")
+            return ("inject", self.cfg["clear_cmd"], self._take_dismiss())
+        return None
+
+    def _enter_cleared(self, why, now):
+        self.rstate = CLEARED
+        self.rwake = now + self.cfg["step_gap"]
+        self._unfold_notify_at = now
+        self.log("the clear took hold (%s); unfolding once the gate opens" % why)
+        return None
 
     def _send_resume(self, now):
         self.rstate = RESUME_SENT
         self.restart_left = self.cfg["handoff_timeout"]
-        self.rwake = now + self.cfg["verify"]
+        # Growing gaps between reprints (60s, 120, 240, ...): a phrase that never
+        # reached the input box once is not made more likely to by asking again
+        # every minute for however long CR_RESUME_ATTEMPTS allows.
+        self.rwake = now + self.cfg["verify"] * (2 ** self.resume_tries)
         self.resume_echoed = False
         self.log("unfolding from %s" % self.cfg["handoff_file"])
         return ("inject", self.resume_text, self._take_dismiss())
@@ -3989,21 +4078,36 @@ class Controller:
             return None
         if self._held(now):
             return None
-        if not self.resume_echoed and self.resume_tries < self.cfg["handoff_attempts"]:
-            self.resume_tries += 1
-            self.log("the resume phrase left no trace; sending it again (%d/%d)"
-                     % (self.resume_tries, self.cfg["handoff_attempts"]))
-            return self._send_resume(now)
-        # Two different failures end up here and they read very differently in a
-        # log. Either the phrase never reached the input box, or it did and the
-        # context is still the size it was — which means the clear did nothing.
-        # Both stop for good: retrying would type into a session that is as full
-        # as it was, or into one that cannot be typed into at all.
+        if not self.resume_echoed:
+            if self.resume_tries < self.cfg["resume_attempts"]:
+                self.resume_tries += 1
+                self.log("the resume phrase left no trace; sending it again (%d/%d)"
+                         % (self.resume_tries, self.cfg["resume_attempts"]))
+                return self._send_resume(now)
+            # It reached none of the CR_RESUME_ATTEMPTS tries -- not one bad
+            # keystroke, but every one of them. That is not the world's problem
+            # to retry its way out of, but it is not the one-way failure a bad
+            # `/clear` is either: the context really is gone, so the debt stays
+            # owed and visible (badge, notify) until a person does something
+            # about it, rather than the trigger just going quiet for good.
+            return self._enter_unfold_failed(now)
+        # The phrase landed and the context is still the size it was — which
+        # means the clear did nothing. Retrying would type into a session that
+        # is as full as it was, so this one does stop for good.
         why = ("the context did not fall after %s (still %s)"
-               % (self.cfg["clear_cmd"], human_tokens(self.context_tokens))
-               if self.resume_echoed else
-               "the resume phrase never reached the session")
+               % (self.cfg["clear_cmd"], human_tokens(self.context_tokens)))
         return self._abort_restart(why, now, permanent=True)
+
+    def _enter_unfold_failed(self, now):
+        self.rstate = UNFOLD_FAILED
+        self.context_off = True
+        self._unfold_notify_at = now
+        self.log("unfold failed: the resume phrase never reached the session in "
+                 "%d attempts — switched off for this session until a key is pressed"
+                 % self.cfg["resume_attempts"])
+        return ("notify",
+                "read `%s` yourself: the resume phrase never reached the session"
+                % self.cfg["handoff_file"])
 
     # -- a limit in the middle of it ---------------------------------------- #
     def _after_limit(self, now):
@@ -4184,6 +4288,10 @@ class Badge:
             return ("%s %s %d/%d" % (mark, self.label, attempts, max_attempts), "2;36")
         if state == DONE:
             return ("%s %s stopped" % (mark, self.label), "2;31")
+        if restart == UNFOLD_FAILED:
+            # Red and not blinking, like `warn`: nothing is being typed into the
+            # session any more, and the debt sits there until a person acts.
+            return ("%s %s %s" % (mark, self.label, RESTART_LABELS[restart]), "2;31")
         if restart:
             # Minutes of typing into a live session, ending in a cleared one.
             # While that is happening it is the most important thing the corner
@@ -5615,12 +5723,13 @@ export CR_VERSION CR_SELF
 export CR_MODEL_LOOKUP CR_MODEL_LOOKUP_TIMEOUT_SEC CR_MODEL_CACHE
 export CR_MODEL_CACHE_TTL_SEC CR_MODELS_DOC_URL CR_MODELS_API_URL
 export CR_HANDOFF_FILE CR_HANDOFF_MARKER CR_HANDOFF_MIN_BYTES CR_HANDOFF_ATTEMPTS
+export CR_RESUME_ATTEMPTS
 export CR_HANDOFF_REGISTRY_DIR
 export CR_HANDOFF_MSG CR_CLEAR_CMD CR_RESUME_MSG
 export CR_CLAUDE_HANDOFF_MSG CR_CODEX_HANDOFF_MSG
 export CR_CLAUDE_CLEAR_CMD CR_CODEX_CLEAR_CMD
 export CR_CLAUDE_RESUME_MSG CR_CODEX_RESUME_MSG
-export CR_ROOT_IDLE_SEC CR_HANDOFF_TIMEOUT_SEC CR_STEP_GAP_SEC
+export CR_ROOT_IDLE_SEC CR_HANDOFF_TIMEOUT_SEC CR_STEP_GAP_SEC CR_CLEAR_SETTLE_SEC
 export CR_CONTEXT_COOLDOWN_SEC CR_CONTEXT_MAX_CYCLES
 export CR_SLASH_GAP_SEC CR_SLASH_ENTER CR_SLASH_ENTER_GAP_SEC
 
