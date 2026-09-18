@@ -262,8 +262,18 @@ Look in `~/.claude-retrier/log`. In order of likelihood:
 ## Caveats
 
 - The context restart reads its figures from one transcript at a time, the one
-  this terminal's session writes. Another live session under the same working
-  directory can, briefly, be the file that grew last.
+  this terminal's session writes. On Claude Code >= 2.1.273 that transcript is
+  identified explicitly, through `~/.claude/sessions/<pid>.json`
+  (`ClaudeSessionRegistry`) — never by guessing which file grew last, so
+  another live session under the same working directory has no effect on it,
+  even while it is briefly the busier of the two.
+- Without that file (an older Claude Code, or the registry never resolving one
+  unambiguously), the watcher falls back to its previous heuristic: stay with
+  the transcript already being followed while it grows, and otherwise prefer
+  whichever one did not exist when the session started. That fallback carries
+  the same limitation as before — another live session under the same working
+  directory can, briefly, be the file that grew last — and a
+  `no session registry for pid …` line in the log says when it is in effect.
 
 ## Settings
 

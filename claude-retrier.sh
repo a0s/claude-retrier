@@ -741,6 +741,7 @@ import re
 import select
 import signal
 import struct
+import subprocess
 import sys
 import termios
 import threading
@@ -1546,6 +1547,125 @@ class ClaudeAgent:
     def records(self, path, offset, echo):
         return transcript_limit_records(path, offset, echo)
 
+    def path_for(self, session_id):
+        return os.path.join(self.dir, session_id + ".jsonl")
+
+
+class ClaudeSessionRegistry:
+    """Where claude's own identity lives: `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`.
+
+    The pid this wrapper forked is not always the pid claude runs as: a shell
+    alias (`sh -c "alias claude=...; claude"`) execs a shell that then execs
+    claude as a *grandchild*, never touching the pid we hold. `<child_pid>.json`
+    is tried first; when it is missing, every `sessions/*.json` whose `cwd`
+    matches ours is checked for being a descendant of the child (walking `ppid`
+    the way `ps -o ppid=` would) or, failing that, having started at or after
+    our own start time. More than one candidate surviving that scan means no
+    bind: a wrong guess here is the whole bug T02 exists to remove.
+    """
+
+    def __init__(self, child_pid, cwd=None, config_dir=None, started_at=None,
+                log=None, proc_table=None):
+        self.child_pid = child_pid
+        self.cwd = cwd or os.getcwd()
+        base = config_dir or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+        self.dir = os.path.join(base, "sessions")
+        self.started_at = started_at      # ms epoch, for the cwd+startedAt fallback
+        self.log = log or (lambda *_: None)
+        self.proc_table = proc_table or self._ps_table
+        self._logged_fallback = False
+        self._logged_ambiguous = False
+
+    def _read(self, pid):
+        try:
+            with open(os.path.join(self.dir, "%d.json" % pid)) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _ps_table():
+        """pid -> ppid for every process on the box, read once per lookup()."""
+        try:
+            out = subprocess.run(["ps", "-axo", "pid=,ppid="],
+                                 capture_output=True, text=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        table = {}
+        for line in out.stdout.splitlines():
+            parts = line.split()
+            if len(parts) == 2:
+                try:
+                    table[int(parts[0])] = int(parts[1])
+                except ValueError:
+                    pass
+        return table
+
+    def _is_descendant(self, pid, table):
+        seen = set()
+        cur = table.get(pid)
+        while cur and cur not in seen:
+            if cur == self.child_pid:
+                return True
+            seen.add(cur)
+            cur = table.get(cur)
+        return False
+
+    def _is_recent(self, started_at):
+        """`startedAt >= ours`, tolerant of whatever a stranger's file holds.
+
+        A malformed or foreign-format entry (a wrong Claude Code version, a
+        half-written file) must lose the candidate, never crash the wrapper
+        reading it.
+        """
+        if not isinstance(started_at, (int, float)):
+            return False
+        return started_at >= self.started_at
+
+    def lookup(self):
+        """`(record, why)` for our session, or `(None, None)` if nothing binds."""
+        direct = self._read(self.child_pid)
+        if direct:
+            self._logged_ambiguous = self._logged_fallback = False
+            return direct, "pid file"
+        try:
+            names = os.listdir(self.dir)
+        except OSError:
+            names = []
+        table = None
+        matches = []
+        for name in names:
+            if not name.endswith(".json"):
+                continue
+            try:
+                pid = int(name[:-5])
+            except ValueError:
+                continue
+            rec = self._read(pid)
+            if not rec or rec.get("cwd") != self.cwd:
+                continue
+            if table is None:
+                table = self.proc_table()
+            if self._is_descendant(pid, table):
+                matches.append((rec, "descendant of pid %d" % self.child_pid))
+            elif self.started_at is not None and self._is_recent(rec.get("startedAt")):
+                matches.append((rec, "cwd+startedAt"))
+        if len(matches) == 1:
+            self._logged_ambiguous = self._logged_fallback = False
+            return matches[0]
+        if len(matches) > 1:
+            if not self._logged_ambiguous:
+                self.log("session registry: %d candidates for pid %d in %s; not binding"
+                         % (len(matches), self.child_pid, self.cwd))
+                self._logged_ambiguous = True
+            return None, None
+        self._logged_ambiguous = False
+        if not self._logged_fallback:
+            self.log("no session registry for pid %d; falling back to newest transcript"
+                     % self.child_pid)
+            self._logged_fallback = True
+        return None, None
+
 
 class CodexAgent:
     """Where codex writes, and which of those files are this terminal's.
@@ -1802,12 +1922,16 @@ def build_agent(name, argv=None):
 class TranscriptWatcher:
     """Follows every transcript in this project that grows after we start.
 
-    No session-id guessing: the file our claude writes is simply the one that
-    starts growing. Files already present are seeded at their current size, so
-    a `--continue` run never replays yesterday's banner.
+    With a `registry` (claude, Claude Code >= 2.1.273), identity is explicit:
+    `current` is whatever `sessions/<pid>.json` names, never a guess, and
+    `_pick_current`'s growth heuristic never runs. Without one (codex, or an
+    older claude with no pid file), the heuristic is all there is. Files
+    already present are seeded at their current size either way, so a
+    `--continue` run never replays yesterday's banner.
     """
 
-    def __init__(self, directory=None, poll=2.0, now=None, echo=None, agent=None):
+    def __init__(self, directory=None, poll=2.0, now=None, echo=None, agent=None,
+                registry=None, log=None):
         # `directory` stays first and positional: it is how the claude side has
         # always been built, and naming a directory is still the whole of what
         # that side needs.
@@ -1815,11 +1939,16 @@ class TranscriptWatcher:
         self.dir = getattr(self.agent, "dir", directory)
         self.poll = poll
         self.echo = echo
+        self.registry = registry
+        self.log = log or (lambda *_: None)
         self.offsets = {}
         self.next_poll = 0.0
         self.seen_any = False
         self.grown = []          # files that gained bytes in the last poll
         self.current = None      # of those, the one this terminal's session writes
+        self.bound_session_id = None   # set once the registry names one (T02)
+        self.agent_status = None       # "busy"/"idle" from the registry, or None
+        self.agent_status_at = 0.0     # when the registry says that last changed
         self._seed(now or time.time())
         self.preexisting = set(self.offsets)
 
@@ -1836,6 +1965,8 @@ class TranscriptWatcher:
         if now < self.next_poll:
             return []
         self.next_poll = now + self.poll
+        if self.registry is not None:
+            self._poll_registry(now)
         found = []
         # The file we are following stays on the list even if it drops off the
         # scan: codex's directories are named for the day, and a session that
@@ -1863,8 +1994,39 @@ class TranscriptWatcher:
             for rec in recs:
                 rec["path"] = p
             found.extend(recs)
-        self._pick_current()
+        if not self.bound_session_id:
+            self._pick_current()
         return found
+
+    def _poll_registry(self, now):
+        """Identity, straight from `sessions/<pid>.json`: no growth to watch.
+
+        `status`/`statusUpdatedAt` ride along as an extra "is anyone home"
+        signal for the controller (T02 item 4) — never the only one, since a
+        Claude Code that predates the field would otherwise look permanently
+        idle.
+        """
+        rec, why = self.registry.lookup()
+        if rec is None:
+            self.agent_status = None
+            return
+        self.agent_status = rec.get("status")
+        updated = rec.get("statusUpdatedAt")
+        self.agent_status_at = updated / 1000.0 if isinstance(updated, (int, float)) else now
+        session_id = rec.get("sessionId")
+        if not session_id or session_id == self.bound_session_id:
+            return
+        self.bind(session_id, self.agent.path_for(session_id), why)
+
+    def bind(self, session_id, path, why):
+        old = self.bound_session_id
+        self.bound_session_id = session_id
+        self.current = path
+        self.offsets.setdefault(path, 0)
+        if old is None:
+            self.log("session bound: %s (%s)" % (session_id, why))
+        else:
+            self.log("session rebound: %s → %s (%s)" % (old, session_id, why))
 
     def _pick_current(self):
         """Which of the growing transcripts belongs to the session at this terminal.
@@ -2515,6 +2677,8 @@ class Controller:
         # codex states where a turn starts and ends; None is "nobody said", which
         # is all Claude Code's transcript ever says.
         self.turn_open = None
+        self.agent_status = None      # "busy"/"idle" from sessions/<pid>.json (T02)
+        self.agent_status_at = 0.0    # when the registry last said that changed
         self.codex = cfg.get("agent") == "codex"
         self.context_baseline = CODEX_BASELINE_TOKENS if self.codex else 0
         self.codex_cap = None         # where codex compacts, as its own log states it
@@ -3067,6 +3231,16 @@ class Controller:
         """codex opened or closed a turn in the rollout this session writes."""
         self.turn_open = state == "open"
 
+    def on_agent_status(self, status, updated_at):
+        """`sessions/<pid>.json` (T02): one more "is anyone home" signal.
+
+        Never the only one `_session_busy` trusts — a claude that predates the
+        field, or codex, never calls this at all, and the transcript-based
+        checks above still carry the whole load for them.
+        """
+        self.agent_status = status
+        self.agent_status_at = updated_at
+
     # -- codex's own compaction --------------------------------------------- #
     def interrupt_line(self):
         """The count past which a running codex turn is stopped, or None.
@@ -3356,6 +3530,8 @@ class Controller:
             return "a turn is still running"
         if self.context_grew_at and now - self.context_grew_at < self.cfg["root_idle"]:
             return "the session is still writing to its transcript"
+        if self.agent_status == "busy" and self.agent_status_at and now - self.agent_status_at < 60:
+            return "the session reports busy"
         return None
 
     def _maybe_restart(self, now):
@@ -4521,8 +4697,11 @@ def main(argv):
         agents.enabled = False
         tree_screen = None
     usage_log = CodexUsageLog(CFG, log) if agent_name == "codex" and ctl.context_enabled else None
+    registry = (ClaudeSessionRegistry(pid, cwd=os.getcwd(), started_at=int(session_start * 1000), log=log)
+               if agent_name == "claude" else None)
     watcher = TranscriptWatcher(poll=CFG["poll"], agent=build_agent(agent_name, argv),
-                                echo=[CFG["message"], ctl.resume_text])
+                                echo=[CFG["message"], ctl.resume_text],
+                                registry=registry, log=log)
     if ctl.context_enabled:
         log("context restart armed: handoff -> %s, %s"
             % (ctl.handoff_path,
@@ -4741,6 +4920,8 @@ def main(argv):
             # a tool call and its result can be minutes: bytes are what say the
             # session is still mid-turn.
             ctl.note_growth(watcher.grown, now)
+            if watcher.agent_status is not None:
+                ctl.on_agent_status(watcher.agent_status, watcher.agent_status_at)
             if usage_log is not None and watcher.current:
                 for total, cap in usage_log.poll(watcher.agent.thread_id(watcher.current), now):
                     ctl.on_context(dict(kind="alive", source="log", path=watcher.current,

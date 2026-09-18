@@ -43,6 +43,24 @@ USER_ECHO = user_row("continue")
 REAL = record("You've hit your weekly limit · resets Jul 22 at 6am (Europe/Warsaw)")
 
 
+class FakeRegistry:
+    """A stand-in for ClaudeSessionRegistry: hands back whichever queued
+    `(record, why)` answer is next, repeating the last one once exhausted —
+    the same shape a real `sessions/<pid>.json` gives across polls once
+    nothing about it has changed."""
+
+    def __init__(self, *answers):
+        self.answers = list(answers)
+        self.calls = 0
+
+    def lookup(self):
+        if not self.answers:
+            return None, None
+        i = min(self.calls, len(self.answers) - 1)
+        self.calls += 1
+        return self.answers[i]
+
+
 class TestProjectDir(unittest.TestCase):
     def test_cwd_is_slugged_the_way_claude_code_does_it(self):
         got = cr.project_dir("/Users/a0s/a0s_github/node_editor", "/cfg")
@@ -235,6 +253,118 @@ class TestWatcher(unittest.TestCase):
         with open(self.path("s.jsonl"), "w") as fh:      # rewritten from scratch
             fh.write(json.dumps(REAL) + "\n")
         self.assertEqual(len(w.poll_now()), 1)
+
+    # -- registry-backed identity (T02) -------------------------------------- #
+    def test_registry_binding_ignores_a_foreign_file_that_grows(self):
+        registry = FakeRegistry(
+            ({"sessionId": "ours", "status": "idle", "statusUpdatedAt": 0}, "pid file"))
+        w = cr.TranscriptWatcher(self.dir, poll=0, registry=registry)
+        w.poll_now()
+        self.assertEqual(w.current, self.path("ours.jsonl"))
+        for _ in range(3):
+            self.append("theirs.jsonl", ORDINARY)
+            w.poll_now()
+            self.assertEqual(w.current, self.path("ours.jsonl"))
+
+    def test_registry_rebinds_when_sessionId_changes_and_stops_reading_the_old_file(self):
+        registry = FakeRegistry(
+            ({"sessionId": "old", "status": "idle", "statusUpdatedAt": 0}, "pid file"),
+            ({"sessionId": "new", "status": "busy", "statusUpdatedAt": 0}, "pid file"))
+        logged = []
+        w = cr.TranscriptWatcher(self.dir, poll=0, registry=registry, log=logged.append)
+        w.poll_now()
+        self.assertEqual(w.current, self.path("old.jsonl"))
+        w.poll_now()
+        self.assertEqual(w.current, self.path("new.jsonl"))
+        self.assertTrue(any("session rebound: old → new" in ln for ln in logged))
+        # growth on the file we left behind no longer moves `current`
+        self.append("old.jsonl", REAL)
+        w.poll_now()
+        self.assertEqual(w.current, self.path("new.jsonl"))
+
+    def test_registry_status_feeds_agent_status(self):
+        registry = FakeRegistry(
+            ({"sessionId": "s", "status": "busy", "statusUpdatedAt": 12345}, "pid file"))
+        w = cr.TranscriptWatcher(self.dir, poll=0, registry=registry)
+        w.poll_now()
+        self.assertEqual(w.agent_status, "busy")
+        self.assertEqual(w.agent_status_at, 12.345)
+
+    def test_no_registry_keeps_the_growth_heuristic(self):
+        # codex, and claude with no registry passed in: unchanged behaviour.
+        w = cr.TranscriptWatcher(self.dir, poll=0)
+        self.append("a.jsonl", ORDINARY)
+        w.poll_now()
+        self.assertEqual(w.current, self.path("a.jsonl"))
+        self.append("b.jsonl", ORDINARY)
+        w.poll_now()
+        self.assertEqual(w.current, self.path("b.jsonl"))
+
+
+class TestSessionRegistry(unittest.TestCase):
+    """`ClaudeSessionRegistry.lookup()` in isolation: which of
+    `sessions/*.json` is ours, given only a child pid and a cwd."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-reg-")
+        self.sessions = os.path.join(self.dir, "sessions")
+        os.makedirs(self.sessions)
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+
+    def write(self, pid, **fields):
+        rec = {"pid": pid, "sessionId": "s-%d" % pid, "cwd": "/work",
+               "startedAt": 1000, "version": "2.1.273", "kind": "interactive",
+               "status": "idle", "statusUpdatedAt": 1000}
+        rec.update(fields)
+        with open(os.path.join(self.sessions, "%d.json" % pid), "w") as fh:
+            json.dump(rec, fh)
+        return rec
+
+    def registry(self, child_pid, **kw):
+        kw.setdefault("proc_table", lambda: {})
+        return cr.ClaudeSessionRegistry(child_pid, cwd="/work", config_dir=self.dir, **kw)
+
+    def test_direct_pid_file_is_used_first(self):
+        self.write(111)
+        rec, why = self.registry(111).lookup()
+        self.assertEqual(rec["sessionId"], "s-111")
+        self.assertEqual(why, "pid file")
+
+    def test_a_grandchild_is_found_through_the_parent_chain(self):
+        # An alias launch: we forked pid 100 (a shell), which forked 200 --
+        # the real claude, which is who writes 200.json.
+        self.write(200)
+        table = {200: 100, 100: 1}
+        rec, why = self.registry(100, proc_table=lambda: table).lookup()
+        self.assertEqual(rec["sessionId"], "s-200")
+        self.assertIn("descendant", why)
+
+    def test_cwd_and_startedAt_fallback_when_not_a_descendant(self):
+        self.write(300, startedAt=5000)
+        rec, why = self.registry(999, started_at=4000).lookup()
+        self.assertEqual(rec["sessionId"], "s-300")
+        self.assertEqual(why, "cwd+startedAt")
+
+    def test_a_different_cwd_is_never_a_candidate(self):
+        self.write(400, cwd="/elsewhere", startedAt=0)
+        rec, why = self.registry(999, started_at=0).lookup()
+        self.assertIsNone(rec)
+
+    def test_ambiguous_candidates_do_not_bind(self):
+        self.write(500, startedAt=5000)
+        self.write(501, startedAt=5000)
+        rec, why = self.registry(999, started_at=4000).lookup()
+        self.assertIsNone(rec)
+
+    def test_no_session_registry_falls_back_and_logs_exactly_once(self):
+        logged = []
+        reg = self.registry(999, started_at=0, log=logged.append)
+        for _ in range(3):
+            rec, why = reg.lookup()
+            self.assertIsNone(rec)
+        matches = [ln for ln in logged if "no session registry for pid 999" in ln]
+        self.assertEqual(len(matches), 1)
+        self.assertIn("falling back to newest transcript", matches[0])
 
 
 class TestContextFigures(unittest.TestCase):

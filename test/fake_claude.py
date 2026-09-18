@@ -92,11 +92,16 @@ def pid_file_path():
 
 
 def write_pid_file(status):
-    """The identity record TranscriptWatcher (T02) binds on: pid -> sessionId."""
+    """The identity record TranscriptWatcher (T02) binds on: pid -> sessionId.
+
+    Field shapes copied from a real `sessions/<pid>.json` written by Claude
+    Code 2.1.273 (see T02's "Verified" section): `startedAt`/`statusUpdatedAt`
+    are epoch milliseconds, not ISO strings.
+    """
     rec = {"pid": os.getpid(), "sessionId": SESSION[0], "cwd": os.getcwd(),
            "startedAt": STARTED_AT[0], "version": "1.0.0-fake",
            "kind": "interactive", "status": status,
-           "statusUpdatedAt": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
+           "statusUpdatedAt": int(time.time() * 1000)}
     tmp = pid_file_path() + ".tmp"
     with open(tmp, "w") as fh:
         json.dump(rec, fh)
@@ -278,7 +283,7 @@ def fold_up(line):
 
 def main():
     out = sys.stdout
-    STARTED_AT[0] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    STARTED_AT[0] = int(time.time() * 1000)
     SESSION[0] = "fake-session-%d" % os.getpid()  # distinct per process, like a real sessionId
     out.write("fake-claude ready argv=%s\r\n" % " ".join(sys.argv[1:]))
     try:

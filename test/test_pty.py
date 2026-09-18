@@ -65,6 +65,10 @@ class Session:
             "CR_NOTIFY": "0",
             "CR_BADGE": "0",             # off unless a test is about the badge
             "PYTHONUNBUFFERED": "1",
+            # Left unset, both the fake and the real ClaudeSessionRegistry (T02)
+            # fall back to the developer's actual ~/.claude — reading (and
+            # littering) whatever real sessions/transcripts happen to be there.
+            "CLAUDE_CONFIG_DIR": tempfile.mkdtemp(prefix="cr-pty-cfg-"),
         })
         full.update(env or {})
         self.proc = subprocess.Popen(
@@ -818,6 +822,33 @@ class TestContextRestart(PtyTestCase):
         with open(os.path.join(self.work, "handoff.md")) as fh:
             handoff = fh.read()
         self.assertTrue(handoff.rstrip().split("\n")[-1].startswith("HANDOFF-"))
+
+    def test_a_clear_rebinds_the_watcher_and_unfold_lands_in_the_new_file(self):
+        # T02 AC: `/clear` moves the session's identity, and the watcher has to
+        # follow it through the registry — not the old growth heuristic — for
+        # the unfold phrase to ever reach the file claude is actually writing.
+        s = self.session(env=self.env(), cwd=self.work)
+        # getcwd() inside the child reports the resolved path (macOS: /var/folders
+        # is a symlink to /private/var/folders) -- slug off that, not the raw
+        # tempdir string, or this looks for a directory that is never created.
+        proj_dir = os.path.join(self.cfg, "projects",
+                                re.sub(r"[^A-Za-z0-9]", "-", os.path.realpath(self.work)))
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        before = {f for f in os.listdir(proj_dir) if f.endswith(".jsonl")}
+        self.assertEqual(len(before), 1, before)
+
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_log("session rebound", s), self.logged())
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_log("context restarted", s), self.logged())
+
+        after = {f for f in os.listdir(proj_dir) if f.endswith(".jsonl")}
+        new_files = after - before
+        self.assertEqual(len(new_files), 1, after)
+        with open(os.path.join(proj_dir, next(iter(new_files)))) as fh:
+            self.assertIn("picked the handoff up", fh.read())
+        with open(os.path.join(proj_dir, next(iter(before)))) as fh:
+            self.assertNotIn("picked the handoff up", fh.read())
 
     def test_the_clear_is_typed_once_however_many_enters_it_takes(self):
         # Two Enters go out for a slash command, because the first may only

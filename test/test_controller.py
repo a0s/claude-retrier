@@ -745,6 +745,28 @@ class TestTheHappyPath(RestartTestCase):
         self.assertIsNone(self.tick(ctl, 200))
 
 
+class TestTheRegistryStatusIsAnExtraBusySignal(RestartTestCase):
+    """T02 item 4: `sessions/<pid>.json`'s status/statusUpdatedAt holds the
+    gate too, on top of the transcript-based checks -- never instead of them."""
+
+    def test_a_busy_status_holds_the_clear_even_once_the_transcript_looks_idle(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        self.folded(ctl, written_at=40)
+        ctl.on_agent_status("busy", 60)
+        self.assertEqual(ctl._session_busy(65), "the session reports busy")
+        self.assertIsNone(self.tick(ctl, 65))       # transcript alone would clear here
+        ctl.on_agent_status("idle", 60)
+        self.assertEqual(self.tick(ctl, 66), ("inject", "/clear", False))
+
+    def test_a_stale_busy_status_is_not_trusted(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        self.folded(ctl, written_at=40)
+        ctl.on_agent_status("busy", 4)              # 61s old by t=65: too stale
+        self.assertEqual(self.tick(ctl, 65), ("inject", "/clear", False))
+
+
 class TestNothingIsClearedOnAPromise(RestartTestCase):
     """The dangerous failure in the whole design: the fold was asked for, the
     model did not manage it, and the context is cleared anyway — which loses the

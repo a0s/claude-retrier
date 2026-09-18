@@ -117,6 +117,35 @@ class TestTwoWrappers(TwoWrappersTestCase):
         self.assertEqual(entries[a_pid]["cwd"], entries[b_pid]["cwd"])
         self.assertNotEqual(entries[a_pid]["sessionId"], entries[b_pid]["sessionId"])
 
+    def test_only_the_session_above_the_threshold_is_folded(self):
+        # The bug T02 removes: without registry-based identity, a's watcher
+        # could pick up b's growth and read b's numbers as its own (or vice
+        # versa), folding the wrong session or both.
+        base = {
+            "agent": "claude",
+            "CR_SCRAPE": "never",
+            "CR_CONTEXT_PCT": "51",
+            "CR_HANDOFF_FILE": "handoff.md",
+            "CR_ROOT_IDLE_SEC": "1",
+            "CR_HANDOFF_TIMEOUT_SEC": "45",
+            "CR_STEP_GAP_SEC": "0.5",
+            "CR_VERIFY_SEC": "8",
+            "CR_USER_IDLE_SEC": "0",
+            "CR_POLL_SEC": "0.2",
+            "CR_SLASH_GAP_SEC": "0.2",
+            "CR_SLASH_ENTER_GAP_SEC": "0.2",
+            "FAKE_MODEL": "claude-opus-5",
+            "FAKE_USAGE_DELAY": "0.3",
+        }
+        a, b = self.two(dict(base, FAKE_USAGE="700000"), dict(base, FAKE_USAGE="50000"))
+        self.assertTrue(a.read_until("ready"))
+        self.assertTrue(b.read_until("ready"))
+        self.assertTrue(a.read_until("GOT:handoff", timeout=20), a.buf[-500:])
+        # b gets every chance it would need to (wrongly) fold too.
+        self.assertFalse(b.read_until("GOT:handoff", timeout=3))
+        self.assertIn("folding up", "".join(a.log_lines()))
+        self.assertNotIn("folding up", "".join(b.log_lines()))
+
 
 if __name__ == "__main__":
     unittest.main()
