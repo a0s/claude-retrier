@@ -77,9 +77,11 @@ More in [context-restart.md](context-restart.md). All of these do nothing until
 | `CR_HANDOFF_MSG` | (see `--cr-help`) | the folding phrase; `{file}`, `{marker}` |
 | `CR_RESUME_MSG` | ``Read `{file}` and continue from it.`` | the unfolding phrase |
 | `CR_CLEAR_CMD` | `/clear` | |
+| `CR_CANCEL_MSG` | (see `--cr-help`) | said instead of a plain "restart aborted" notice when the abort comes after the fold already reached the session (T09); `{file}` |
 | `CR_CLAUDE_HANDOFF_MSG`, `CR_CODEX_HANDOFF_MSG` | unset = `CR_HANDOFF_MSG` | override for one agent only — a phrase that names a command (a skill, a custom prompt) cannot be shared, because claude and codex do not recognize the same ones |
 | `CR_CLAUDE_RESUME_MSG`, `CR_CODEX_RESUME_MSG` | unset = `CR_RESUME_MSG` | same, for the unfolding phrase |
 | `CR_CLAUDE_CLEAR_CMD`, `CR_CODEX_CLEAR_CMD` | unset = `CR_CLEAR_CMD` | same, for the clear command |
+| `CR_CLAUDE_CANCEL_MSG`, `CR_CODEX_CANCEL_MSG` | unset = `CR_CANCEL_MSG` | same, for the cancel phrase |
 | `CR_HANDOFF_MARKER` | `HANDOFF` | prefix; a nonce is appended to it |
 | `CR_HANDOFF_MIN_BYTES` | `200` | a shorter file is not a handoff |
 | `CR_HANDOFF_ATTEMPTS` | `2` | folds attempted before giving up |

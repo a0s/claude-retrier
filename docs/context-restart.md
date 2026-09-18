@@ -293,9 +293,14 @@ Look in `~/.claude-retrier/log`. In order of likelihood:
   will not guess — a guessed window is how a session gets folded at 12% full —
   so either `CR_CONTEXT_WINDOW=1M`, or set `CR_CONTEXT_TOKENS`, which needs no
   window at all.
-- `restart aborted at handoff_sent: ...` means the fold produced nothing usable,
-  and the message names which of the four checks failed. The session was left
-  alone.
+- `restart aborted at handoff_sent: ...` (or `handoff_ok`) means the fold
+  produced nothing usable, and the message names which of the four checks
+  failed. If the phrase never reached the session at all, that's it — the
+  session is left alone. If it did (an echo was seen: the model was already
+  told to wrap up and start nothing new), the next line is
+  `restart cancelled; asking the session to carry on` — `CR_CANCEL_MSG` typed
+  in to say the ask is off, so an unattended session does not sit on that
+  instruction forever.
 - The percentage in the badge never moves: the wrapper reads the figures off
   assistant rows, so it has nothing to show until the session answers something.
   A transcript that already existed when the wrapper started is seeded rather
