@@ -1704,23 +1704,33 @@ class ClaudeSessionRegistry:
 class CodexAgent:
     """Where codex writes, and which of those files are this terminal's.
 
-    Two things differ from Claude Code and both matter. The rollouts of every
-    project live in one tree, under a directory named for the day — so the scan
-    is dated rather than fixed, and spans three of them, because "which day" is
-    a question the local clock and codex can answer differently and a session
-    can outlive midnight either way. And a subagent gets a rollout of its own:
-    reading one as the session's would report a limit this terminal never hit
-    and a context that is not ours to restart.
+    Three things differ from Claude Code and all three matter. The rollouts of
+    every project live in one tree, under a directory named for the day — so
+    the scan is dated rather than fixed, and spans three of them, because
+    "which day" is a question the local clock and codex can answer differently
+    and a session can outlive midnight either way. A subagent gets a rollout
+    of its own: reading one as the session's would report a limit this
+    terminal never hit and a context that is not ours to restart. And
+    `codex resume <old>` writes into whichever day that rollout was CREATED
+    on, which the three-day scan can be long past by the time it happens
+    (T03) — so `paths` also looks at the rest of the tree, for anything that
+    has changed since we started.
     """
 
     name = "codex"
+    OLD_SCAN_INTERVAL = 30.0   # a resumed session touches one file in a tree that
+                               # can be months deep; walking all of it every poll
+                               # would cost more than the feature is worth
 
-    def __init__(self, home=None, cwd=None):
+    def __init__(self, home=None, cwd=None, now=None):
         self.home = home or codex_home()
         self.dir = os.path.join(self.home, "sessions")
         self.cwd = os.path.realpath(cwd or os.getcwd())
+        self.started_at = now if now is not None else time.time()
         self._verdicts = {}          # path -> is this session's, once we can tell
         self._threads = {}           # path -> the thread id its head names
+        self._old_paths = []         # last full-tree scan's answer (throttled)
+        self._old_scan_at = 0.0
 
     def paths(self, now=None):
         now = now if now is not None else time.time()
@@ -1730,7 +1740,32 @@ class CodexAgent:
             out.extend(glob.glob(os.path.join(
                 self.dir, "%04d" % t.tm_year, "%02d" % t.tm_mon, "%02d" % t.tm_mday,
                 "*.jsonl")))
+        out.extend(self._resumed_paths(now))
         return sorted(set(out))
+
+    def _resumed_paths(self, now):
+        """Files anywhere under `sessions/` that changed after we started.
+
+        `codex resume` reopens a rollout in place; nothing about that touches
+        the mtime of the day directory it lives in, only the file's own, so
+        there is no shortcut past looking at each one -- only at how often.
+        """
+        if now - self._old_scan_at < self.OLD_SCAN_INTERVAL:
+            return self._old_paths
+        self._old_scan_at = now
+        found = []
+        for dirpath, _dirnames, filenames in os.walk(self.dir):
+            for name in filenames:
+                if not name.endswith(".jsonl"):
+                    continue
+                path = os.path.join(dirpath, name)
+                try:
+                    if os.path.getmtime(path) > self.started_at:
+                        found.append(path)
+                except OSError:
+                    continue
+        self._old_paths = found
+        return found
 
     def keep(self, path):
         verdict = self._verdicts.get(path)
@@ -1983,6 +2018,9 @@ class TranscriptWatcher:
         self.bound_session_id = None   # set once the registry names one (T02)
         self.agent_status = None       # "busy"/"idle" from the registry, or None
         self.agent_status_at = 0.0     # when the registry says that last changed
+        self.confirmed = False   # `confirm` has fired: no registry, but no longer a guess (T03)
+        self.candidates = []     # kept, fresh, not-yet-ruled-out files (T03)
+        self._demoted = set()    # candidates `confirm` has since ruled out
         self._seed(now or time.time())
         self.preexisting = set(self.offsets)
 
@@ -2035,9 +2073,8 @@ class TranscriptWatcher:
         scan = set(self.agent.paths(now))
         if self.current:
             scan.add(self.current)
-        for p in sorted(scan):
-            if not self.agent.keep(p):
-                continue
+        kept = [p for p in sorted(scan) if self.agent.keep(p)]
+        for p in kept:
             start = self.offsets.get(p)
             if start is None:
                 start = 0                       # created after we started: read it all
@@ -2055,6 +2092,12 @@ class TranscriptWatcher:
             for rec in recs:
                 rec["path"] = p
             found.extend(recs)
+        # Every kept, not-yet-ruled-out file created since we started -- not
+        # just the ones that happened to grow this tick, or a wrapper reading
+        # a neighbour's climbing count in the gaps between its own turns would
+        # never see the ambiguity at all (T03).
+        self.candidates = [p for p in kept
+                           if p not in self.preexisting and p not in self._demoted]
         if not self.bound_session_id:
             self._pick_current()
         return found
@@ -2089,6 +2132,21 @@ class TranscriptWatcher:
         else:
             self.log("session rebound: %s → %s (%s)" % (old, session_id, why))
 
+    def confirm(self, path):
+        """The one proof stronger than the growth heuristic: our own fold
+        phrase's nonce, echoed into `path` (T06). No registry ever names codex
+        a session, so without this a directory holding two live rollouts has
+        no way to tell them apart beyond a guess that a neighbour's next burst
+        can undo (T03). Once it fires, every other candidate seen so far is
+        ruled out for good, and `_pick_current` can never hand `current` back
+        to one of them just because it grew and ours, for a moment, did not.
+        """
+        self.confirmed = True
+        self._demoted |= {p for p in self.offsets if p != path}
+        self.candidates = [p for p in self.candidates if p not in self._demoted]
+        self.current = path
+        self.offsets.setdefault(path, 0)
+
     def _pick_current(self):
         """Which of the growing transcripts belongs to the session at this terminal.
 
@@ -2105,12 +2163,19 @@ class TranscriptWatcher:
         like from here: the session moves to a new file), prefer one that did not
         exist when we started, because our claude created its transcript within a
         second of us and anything else in this directory is older.
+
+        A `confirm`ed path is excluded from every other transcript's `_demoted`
+        set, so once the fold phrase's echo has settled who is who, this never
+        hands `current` back to a candidate that proof already ruled out.
         """
         if not self.grown or self.current in self.grown:
             return
-        fresh = [p for p in self.grown if p not in self.preexisting]
+        grown = [p for p in self.grown if p not in self._demoted]
+        if not grown:
+            return
+        fresh = [p for p in grown if p not in self.preexisting]
         old = self.current
-        self.current = max(fresh or self.grown, key=self._mtime)
+        self.current = max(fresh or grown, key=self._mtime)
         if old is not None:
             # A registry (T02/T03) makes this rule a fallback rather than the
             # switch point; that is exactly when a wrong guess is least
@@ -2843,6 +2908,7 @@ class Controller:
         self.learned = {}             # slug -> window, from whoever answered
         self.context_limit = None     # the threshold in tokens; None = no trigger
         self.context_path = None      # the transcript those figures came from
+        self.context_ambiguous = False   # >1 unconfirmed candidate rollout (T03)
         self.context_grew_at = 0.0    # ...and when it last gained a byte
         self.context_off = False      # a failure bad enough not to repeat
         self.last_stop_reason = None  # how the turn we are waiting on ended
@@ -3390,6 +3456,25 @@ class Controller:
         else:
             self.log("transcript switched: %s → %s (%s)" % (old, path, why))
 
+    def on_candidates(self, ambiguous, now):
+        """More than one just-started rollout shares this directory and no
+        handoff echo has proved yet which one is ours (T03).
+
+        Usage still updates from whatever `bind_transcript` currently points
+        at either way — that number is only wrong for as long as the guess
+        is, and the guess is the whole reason this exists. What it gates is
+        the one thing a wrong guess cannot be allowed to do: fold a session
+        that was never actually near its limit because a neighbour's was.
+        """
+        if ambiguous == self.context_ambiguous:
+            return
+        self.context_ambiguous = ambiguous
+        if ambiguous:
+            self.log("more than one candidate rollout in this directory; "
+                     "holding the restart until the handoff phrase proves which is ours")
+        else:
+            self.log("down to one candidate rollout; the restart is no longer held")
+
     def on_context(self, rec, now):
         """An assistant row from the transcript this terminal's session writes.
 
@@ -3831,6 +3916,8 @@ class Controller:
         if limit is None:
             return None
         if self.context_tokens is None or self.context_tokens < limit:
+            return None
+        if self.context_ambiguous:
             return None
         if now < self.cooldown_until:
             return None
@@ -5388,6 +5475,10 @@ def main(argv):
                 # when the registry names one; its growth heuristic otherwise).
                 why = "session identity" if watcher.bound_session_id else "fallback heuristic"
                 ctl.bind_transcript(watcher.current, why, now)
+            # >1 candidate and nothing has echoed yet (T03): read on, but a
+            # number that might be a neighbour's is not one to fold on.
+            ctl.on_candidates(len(watcher.candidates) > 1 and not watcher.confirmed
+                              and not watcher.bound_session_id, now)
             for rec in recs:
                 if rec.get("kind") == "echo":
                     # The fold phrase's nonce is unique machine-wide, so its
@@ -5395,8 +5486,13 @@ def main(argv):
                     # checked ahead of the current-transcript filter below,
                     # unlike every other echo kind, which a neighbour's session
                     # can produce just as easily as ours.
+                    echo_path = rec.get("path")
                     if (ctl.handoff_text and rec.get("text") == ctl.handoff_text
-                            and ctl.on_handoff_echo(rec.get("path"), now)):
+                            and ctl.on_handoff_echo(echo_path, now)):
+                        # Syncing the watcher too keeps its own growth heuristic
+                        # from handing `current` back to a candidate this same
+                        # proof just ruled out (T03).
+                        watcher.confirm(echo_path)
                         continue
                     # claude's own echo of our retry/resume is only evidence
                     # about the session at this terminal; a neighbour's is not.

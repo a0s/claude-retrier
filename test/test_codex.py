@@ -222,8 +222,8 @@ class TestWhichRolloutsAreOurs(unittest.TestCase):
         self.today = os.path.join(self.home, "sessions", "%04d" % t.tm_year,
                                   "%02d" % t.tm_mon, "%02d" % t.tm_mday)
 
-    def agent(self, cwd=None):
-        return cr.CodexAgent(home=self.home, cwd=cwd or os.getcwd())
+    def agent(self, cwd=None, now=None):
+        return cr.CodexAgent(home=self.home, cwd=cwd or os.getcwd(), now=now)
 
     def test_todays_rollouts_are_found(self):
         path = rollout(self.today, rows=[])
@@ -262,6 +262,68 @@ class TestWhichRolloutsAreOurs(unittest.TestCase):
             fh.write(json.dumps({"type": "session_meta",
                                  "payload": {"thread_source": "subagent"}}) + "\n")
         self.assertFalse(a.keep(path))
+
+    def test_a_rollout_codex_resume_reopens_days_later_is_still_found(self):
+        # `codex resume` writes into the rollout from the day it was CREATED,
+        # which the three-day scan above has long since scrolled past (T03).
+        old = os.path.join(self.home, "sessions", "2026", "08", "01")
+        a = self.agent(now=time.time() - 5)
+        path = rollout(old, rows=[])           # written "now": after `a` started
+        self.assertIn(path, a.paths())
+
+    def test_an_old_rollout_nobody_resumed_is_left_alone(self):
+        old = os.path.join(self.home, "sessions", "2020", "01", "01")
+        path = rollout(old, rows=[])
+        os.utime(path, (1000, 1000))           # long before this agent existed
+        self.assertNotIn(path, self.agent().paths())
+
+
+class TestBindingTwoLiveRollouts(unittest.TestCase):
+    """T03: nothing about a rollout names the pid that writes it, so two user
+    sessions in the same cwd look identical until the fold phrase's nonce
+    lands in one of them. Until then, the wrapper reads both but does not bet
+    a restart on a guess."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="cr-codex-home-")
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        t = time.localtime()
+        self.today = os.path.join(self.home, "sessions", "%04d" % t.tm_year,
+                                  "%02d" % t.tm_mon, "%02d" % t.tm_mday)
+
+    def watcher(self, cwd=None):
+        agent = cr.CodexAgent(home=self.home, cwd=cwd or os.getcwd())
+        return cr.TranscriptWatcher(agent=agent, poll=0)
+
+    def test_both_are_candidates_until_one_is_confirmed(self):
+        # Both files are created AFTER the watcher starts -- neither is
+        # "preexisting", which is exactly what makes them indistinguishable.
+        w = self.watcher()
+        rollout(self.today, name="rollout-a.jsonl", rows=[])
+        rollout(self.today, name="rollout-b.jsonl", rows=[])
+        w.poll_now(now=time.time() + 1)
+        self.assertEqual(len(w.candidates), 2)
+
+    def test_the_echo_settles_it_and_the_others_growth_cannot_undo_that(self):
+        w = self.watcher()
+        a = rollout(self.today, name="rollout-a.jsonl", rows=[])
+        b = rollout(self.today, name="rollout-b.jsonl", rows=[])
+        w.poll_now(now=time.time() + 1)
+        w.confirm(a)                      # our handoff phrase was echoed in `a`
+        self.assertEqual(w.current, a)
+        self.assertEqual(len(w.candidates), 1)
+        with open(b, "a") as fh:
+            fh.write(json.dumps({"type": "response_item", "payload": {}}) + "\n")
+        w.poll_now(now=time.time() + 2)
+        self.assertEqual(w.current, a)
+
+    def test_a_subagent_is_never_a_candidate_even_with_a_live_neighbour(self):
+        w = self.watcher()
+        a = rollout(self.today, name="rollout-a.jsonl", rows=[])
+        rollout(self.today, name="rollout-sub.jsonl", subagent=True, rows=[])
+        w.poll_now(now=time.time() + 1)
+        self.assertEqual(w.current, a)
+        self.assertEqual(w.candidates, [a])
 
 
 class TestPickingTheAgent(unittest.TestCase):
@@ -461,6 +523,52 @@ def moved(ctl, path, at, why="new rollout"):
     — what `main()` does once it notices a new rollout file, before handing
     its first row over to `feed()`."""
     ctl.bind_transcript(path, why, at)
+
+
+class TestCandidateModeHoldsTheFoldBack(unittest.TestCase):
+    """T03: what `main()` reports through `on_candidates` when the directory
+    holds more than one unconfirmed rollout. A number that might be a
+    neighbour's climbing count is read same as any other, but it is not one
+    to fold a session on."""
+
+    def ctl(self, **over):
+        # root_idle/user_idle=0: nothing here is about whether a person or the
+        # session is busy, and the defaults would hold every tick back on
+        # that alone.
+        return codex_controller(context_pct=50, root_idle=0, user_idle=0, **over)
+
+    def test_an_ambiguous_reading_is_never_folded(self):
+        ctl = self.ctl()
+        feed(ctl, 1, window=WINDOW, tokens=WINDOW)
+        ctl.on_candidates(True, 1)
+        self.assertIsNone(ctl.tick(2))
+        self.assertIsNone(ctl.rstate)
+
+    def test_narrowing_to_one_candidate_lets_it_through(self):
+        ctl = self.ctl()
+        feed(ctl, 1, window=WINDOW, tokens=WINDOW)
+        ctl.on_candidates(True, 1)
+        self.assertIsNone(ctl.tick(2))
+        ctl.on_candidates(False, 3)
+        self.assertEqual(ctl.tick(4)[0], "inject")
+
+    def test_the_hold_and_release_are_each_logged_once(self):
+        ctl = self.ctl()
+        ctl.on_candidates(True, 1)
+        ctl.on_candidates(True, 2)                 # no second line for the same state
+        ctl.on_candidates(False, 3)
+        held = [l for l in ctl.log_lines if "holding the restart" in l]
+        released = [l for l in ctl.log_lines if "no longer held" in l]
+        self.assertEqual(len(held), 1)
+        self.assertEqual(len(released), 1)
+
+    def test_an_unambiguous_reading_was_never_held_back_at_all(self):
+        # The common case -- one session, one rollout -- never calls
+        # `on_candidates(True, ...)`, so nothing about this feature is in its
+        # way.
+        ctl = self.ctl()
+        feed(ctl, 1, window=WINDOW, tokens=WINDOW)
+        self.assertEqual(ctl.tick(2)[0], "inject")
 
 
 class TestTheCodexThreshold(unittest.TestCase):
@@ -1287,6 +1395,25 @@ class TestCodexEndToEnd(PtyTestCase):
         s.read_until("ready", timeout=10)
         s.drain(4)
         self.assertIn("400k context window (the transcript)", self.logged())
+
+    def test_only_the_session_above_threshold_gets_a_fold(self):
+        # Two wrapped codex processes, same cwd, same CODEX_HOME (T03): the
+        # quiet one's rollout and the busy one's both pass `keep` -- cwd is
+        # all either wrapper has to go on -- so the quiet one has no way to
+        # be SURE the climbing count it can see belongs to somebody else. It
+        # has to hold its own restart back rather than guess, and only the
+        # session that is actually over the threshold may ever see the
+        # handoff phrase.
+        quiet = self.session(env=self.restart_env(FAKE_USAGE="1000"), cwd=self.work)
+        self.assertTrue(quiet.read_until("ready", timeout=10))
+        busy = self.session(env=self.restart_env(), cwd=self.work)
+        self.assertTrue(busy.read_until("GOT:handoff", timeout=30), busy.buf[-500:])
+        quiet.drain(3)
+        self.assertNotIn("GOT:handoff", quiet.buf)
+        # Read it through to the end -- see test_codex_has_a_threshold_of_its_own
+        # for why: torn down mid-restart, the kernel can hold the killed
+        # process past what close() waits for.
+        self.assertTrue(busy.read_until("GOT:resume", timeout=30), busy.buf[-500:])
 
 
 if __name__ == "__main__":

@@ -62,6 +62,41 @@ user` and whose `cwd` is the directory it is running in — reading a subagent's
 would report a limit this terminal never hit, and a context that is not ours to
 restart. When codex is given `--cd`, that directory is the one followed.
 
+### Two sessions in one directory
+
+A rollout's head names no pid, and codex ships nothing else that reliably
+does either (no usable lock file, and `lsof` does not report an append-open
+the way it would for a process holding the file for writing). So two codex
+sessions started in the same `cwd` are, on paper, indistinguishable: both
+pass the `cwd`/`thread_source` check above, and either one's rollout could be
+this terminal's.
+
+The wrapper picks a "current" candidate the same way it always has (whichever
+recently-created rollout is growing — see `TranscriptWatcher._pick_current`
+in the source), and reads usage from it right away. But that pick is only a
+guess until something proves it: the [context restart](context-restart.md)'s
+fold phrase carries a nonce unique machine-wide, and its echo landing in a
+rollout is the one piece of proof that rollout is really this session's.
+Until that has happened, and only while more than one rollout in the
+directory still qualifies as ours (created since this wrapper started, `cwd`
+matching, not yet ruled out), the controller keeps reading — the badge and
+the log still show a context percentage — but will not act on it: no fold is
+sent while a neighbour's climbing count could be the one it just read. Once
+the echo confirms a rollout, that one is locked in for the rest of the
+session, and every other candidate seen so far is permanently ruled out —
+a neighbour growing afterwards can no longer hand `current` back to it.
+
+### `codex resume` on an old session
+
+`codex resume <old>` reopens the rollout in the directory named for the day
+it was *created*, which can be long outside the three days the ordinary scan
+covers. So `CodexAgent.paths` also walks the rest of `$CODEX_HOME/sessions`
+looking for anything with a newer mtime than this wrapper's own start — the
+only sign, short of reading every file, that something out there was just
+resumed. That walk is throttled to once every 30 seconds; a directory tree
+going back months is not worth re-reading on every poll for a case that, by
+definition, changes rarely.
+
 ## Subcommands
 
 Most of what codex can be asked to do is not a session at all. `codex exec`,
