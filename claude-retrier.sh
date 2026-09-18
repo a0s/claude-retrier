@@ -49,7 +49,10 @@
 # CR_AGENTS_POS (right|label, default right) picks where the annotation goes;
 # CR_AGENTS_POLL_SEC (default 1) how often the subagent files are re-read; and
 # CR_PAT_AGENT_ROW is the pattern that finds a tree row on screen, in case
-# Claude Code's own render of it ever changes shape.
+# Claude Code's own render of it ever changes shape. CR_PAT_AGENTS_PANEL_ROW is
+# the same, for the separate row shape drawn in the persistent panel opened by
+# typing /tasks while a subagent is still running (no tree glyph; a
+# "(running)"/"(done)" marker instead) — both are annotated the same way.
 #
 # On startup it says so when a newer release exists, with the command that
 # updates the copy you are actually running — brew, git, or a link. The check
@@ -245,6 +248,27 @@ CR_AGENT_ROW_PATTERNS=(
   "^ {3}([├└│])\\s(.+)$"
 )
 
+# A row of the OTHER subagent view: the persistent panel opened by typing
+# /tasks while at least one Task-tool subagent is still running, which (unlike
+# the tree above) never collapses on its own — it stays until Esc closes it
+# (T29). Its rows carry no tree glyph: an unselected one is indented 5 spaces,
+# the one under the cursor has "❯" at column 4 instead, and both carry a
+# "(running)"/"(done)"/... state marker right after the label, often followed
+# by " · <model>". That "(word)" is also what tells a real row apart from the
+# section header ("Local agents (N)") sharing the exact same 6-column indent,
+# which never carries one — column position alone cannot distinguish them.
+# Matched as a PREFIX, not the whole line (no trailing $): whatever comes
+# after the state, model text or otherwise, is not this pattern's problem,
+# same as CR_AGENT_ROW_PATTERNS above never anchors past its own label.
+# Investigated live on 2.1.273 (T29): the footer's own "<- for agents" hint,
+# in both the default and "manual" permission mode, does NOT open this or any
+# per-session view — it backgrounds the conversation into the cross-session
+# roster instead (other, unrelated sessions), which is why that key is never
+# sent by anything in this file. /tasks is the only confirmed way in.
+CR_AGENTS_PANEL_ROW_PATTERNS=(
+  "^ {3}[ ❯]\\s(.+?) \\(([a-z]+)\\)"
+)
+
 # =============================================================================
 # SECTION 2 — configuration (all overridable from the environment)
 # =============================================================================
@@ -415,7 +439,7 @@ CR_RESUME_MSG_DEFAULT='Read `{file}` and continue from it.'
 case "${1:-}" in
   --cr-version) echo "claude-retrier $CR_VERSION"; exit 0 ;;
   --cr-help|-h|--help-retrier)
-    sed -n '2,59p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
 esac
 
@@ -903,6 +927,7 @@ PAT = {
     "roster": _patterns("CR_PAT_ROSTER"),
     "stall": _patterns("CR_PAT_STALL"),
     "agent_row": _patterns("CR_PAT_AGENT_ROW"),
+    "agents_panel_row": _patterns("CR_PAT_AGENTS_PANEL_ROW"),
 }
 
 
@@ -4100,6 +4125,30 @@ def find_agent_rows(screen):
     return found
 
 
+def find_panel_agent_rows(screen):
+    """[(row, label, label_col)] for every row of the OTHER subagent view
+    (T29): the persistent panel opened by typing /tasks while at least one
+    Task-tool subagent is still running. Unlike find_agent_rows's tree, this
+    one never collapses on its own — but it also carries a section header
+    ("Local agents (N)") at the exact same indent as a real row, with no tree
+    glyph to tell them apart by column alone. The discriminator is the
+    trailing "(running)"/"(done)"/... state marker CR_PAT_AGENTS_PANEL_ROW
+    requires and the header never has.
+    """
+    found = []
+    for r in range(1, screen.rows + 1):
+        line = screen.line(r)
+        for pat in PAT["agents_panel_row"]:
+            m = pat.match(line)
+            if not m:
+                continue
+            label = m.group(1).strip()
+            if label:
+                found.append((r, label, m.start(1) + 1))
+            break
+    return found
+
+
 _MODEL_DISPLAY = {
     "claude-sonnet-5": "sonnet-5",
     "claude-opus-5": "opus-5",
@@ -4254,7 +4303,11 @@ class AgentOverlay:
         avoid = rows if badge_row is None else badge_row
         seen = set()
         wrote = False
-        for row, label, label_col in find_agent_rows(screen):
+        # Two independent row shapes (T27's inline tree, T29's /tasks panel)
+        # can each have an agent on screen at once — neither ever produces a
+        # row the other one also matches (disjoint glyph sets), so this is a
+        # concatenation, not a merge that needs de-duplication.
+        for row, label, label_col in find_agent_rows(screen) + find_panel_agent_rows(screen):
             if row == avoid:
                 continue        # never contest the badge's own row for the corner
             model = registry.model_for(label)
@@ -4829,8 +4882,9 @@ CR_PAT_IGNORE=$(printf '%s\n' "${CR_IGNORE_PATTERNS[@]}")
 CR_PAT_ROSTER=$(printf '%s\n' "${CR_ROSTER_PATTERNS[@]}")
 CR_PAT_STALL=$(printf '%s\n' "${CR_STALL_PATTERNS[@]}")
 CR_PAT_AGENT_ROW=$(printf '%s\n' "${CR_AGENT_ROW_PATTERNS[@]}")
+CR_PAT_AGENTS_PANEL_ROW=$(printf '%s\n' "${CR_AGENTS_PANEL_ROW_PATTERNS[@]}")
 export CR_PAT_LIMIT CR_PAT_RESET CR_PAT_WORKING CR_PAT_MENU CR_PAT_IGNORE CR_PAT_ROSTER
-export CR_PAT_STALL CR_PAT_AGENT_ROW
+export CR_PAT_STALL CR_PAT_AGENT_ROW CR_PAT_AGENTS_PANEL_ROW
 
 case "${1:-}" in
   --cr-dump-python)
@@ -4839,7 +4893,7 @@ case "${1:-}" in
   --cr-dump-patterns)
     # The test suite reads the pattern arrays from here rather than re-declaring
     # them, so a pattern can never be tested in a form the wrapper doesn't use.
-    for _n in LIMIT RESET WORKING MENU IGNORE ROSTER STALL AGENT_ROW; do
+    for _n in LIMIT RESET WORKING MENU IGNORE ROSTER STALL AGENT_ROW AGENTS_PANEL_ROW; do
       eval "printf '### CR_PAT_%s\n%s\n' \"\$_n\" \"\$CR_PAT_$_n\""
     done
     exit 0 ;;

@@ -1,5 +1,5 @@
-"""The subagent tree overlay (T27): which rows on screen are agents, what each
-one is labelled, and which model it is really running on.
+"""The subagent tree overlay (T27, T29): which rows on screen are agents, what
+each one is labelled, and which model it is really running on.
 """
 import json
 import os
@@ -13,6 +13,7 @@ from screen import Screen
 
 cr = load()
 find_agent_rows = cr.find_agent_rows
+find_panel_agent_rows = cr.find_panel_agent_rows
 model_label = cr.model_label
 SubagentRegistry = cr.SubagentRegistry
 AgentOverlay = cr.AgentOverlay
@@ -56,6 +57,63 @@ class TestFindAgentRows(unittest.TestCase):
         s.feed("\x1b[3;4H├\x1b[30GReport first file in cwd")
         found = find_agent_rows(s)
         self.assertEqual(found, [(3, "Report first file in cwd", 30)])
+
+
+# T29: the OTHER subagent view, opened by typing /tasks while at least one is
+# still running. Live investigation on Claude Code 2.1.273 established that
+# the footer's own "<- for agents" hint does NOT open this (or anything
+# session-scoped) in either the default or "manual" permission mode -- it
+# backgrounds the whole conversation into the cross-session roster instead
+# (other, unrelated sessions), the exact screen CR_ROSTER_PATTERNS exists to
+# never scrape. /tasks is the confirmed way in; see
+# test/fixtures/agents-panel-2.1.273.bin for the real capture. Geometry below
+# matches that capture: no tree glyph, an unselected row indented 5 spaces, a
+# selected one carrying "❯" at column 4 instead, both ending in a
+# "(state)" marker a section header never has.
+PANEL_EVIDENCE = (
+    "\x1b[42;4HLocal agents (2)"
+    "\x1b[43;6HCount files under /usr (done) · Haiku 4.5"
+    "\x1b[44;4H❯\x1b[44;6HCount files under /System/Library (running) · Haiku 4.5"
+)
+
+
+def panel_grid(rows=50, cols=120):
+    s = Screen(rows, cols)
+    s.feed(PANEL_EVIDENCE)
+    return s
+
+
+class TestFindPanelAgentRows(unittest.TestCase):
+    def test_it_finds_both_agent_rows(self):
+        found = find_panel_agent_rows(panel_grid())
+        labels = [label for _, label, _ in found]
+        self.assertEqual(len(found), 2)
+        self.assertIn("Count files under /usr", labels)
+        self.assertIn("Count files under /System/Library", labels)
+
+    def test_the_section_header_is_not_mistaken_for_an_agent(self):
+        # "Local agents (2)" sits at the exact same 6-column indent as a real
+        # row -- only the trailing "(state)" marker (absent here) tells them
+        # apart, since column position alone cannot.
+        found = find_panel_agent_rows(panel_grid())
+        labels = [label for _, label, _ in found]
+        self.assertFalse(any("Local agents" in label for label in labels))
+
+    def test_the_selection_marker_does_not_shift_the_label_column(self):
+        found = find_panel_agent_rows(panel_grid())
+        cols = {label: col for _, label, col in found}
+        self.assertEqual(cols["Count files under /usr"], 6)
+        self.assertEqual(cols["Count files under /System/Library"], 6)
+
+    def test_an_empty_screen_finds_nothing(self):
+        self.assertEqual(find_panel_agent_rows(Screen(50, 120)), [])
+
+    def test_a_row_with_no_state_marker_is_not_matched(self):
+        # Without "(state)" there is nothing to distinguish this from a
+        # section header at the same indent -- must not be guessed at.
+        s = Screen(5, 120)
+        s.feed("\x1b[3;6HJust some ordinary text")
+        self.assertEqual(find_panel_agent_rows(s), [])
 
 
 class TestModelLabel(unittest.TestCase):
@@ -316,6 +374,40 @@ class TestAgentOverlay(unittest.TestCase):
         wrote = overlay.paint(fd, 5, 120, s, registry)
         self.assertFalse(wrote)
         self.assertEqual(read(), "")
+
+    def test_a_panel_row_is_annotated_too(self):
+        # T29: the /tasks panel's own rows, found by find_panel_agent_rows,
+        # are painted through the exact same path as the inline tree's.
+        overlay = AgentOverlay(self.cfg())
+        fd, read = _fd(self)
+        registry = self.FakeRegistry(
+            {"Count files under /System/Library": ("claude-haiku-4-5-20251001", None)})
+        self.assertTrue(overlay.paint(fd, 50, 120, panel_grid(), registry))
+        self.assertIn("haiku-4.5/?", read())
+
+    def test_the_panel_s_own_section_header_is_never_annotated(self):
+        overlay = AgentOverlay(self.cfg())
+        fd, read = _fd(self)
+        overlay.paint(fd, 50, 120, panel_grid(), self.FakeRegistry({}))
+        # row 42 is "Local agents (2)" in PANEL_EVIDENCE -- never a target
+        self.assertNotIn("\x1b[42;", read())
+
+    def test_a_tree_row_and_a_panel_row_on_the_same_screen_are_both_annotated(self):
+        # The two views can be on screen at once (history above, panel below)
+        # and never collide -- disjoint glyph sets, never the same row.
+        s = Screen(50, 120)
+        s.feed(EVIDENCE_5)
+        s.feed(PANEL_EVIDENCE)
+        overlay = AgentOverlay(self.cfg())
+        fd, read = _fd(self)
+        registry = self.FakeRegistry({
+            "Report first file in cwd": ("claude-sonnet-5", None),
+            "Count files under /usr": ("claude-haiku-4-5-20251001", None),
+        })
+        self.assertTrue(overlay.paint(fd, 50, 120, s, registry))
+        out = read()
+        self.assertIn("sonnet-5/?", out)
+        self.assertIn("haiku-4.5/?", out)
 
 
 if __name__ == "__main__":

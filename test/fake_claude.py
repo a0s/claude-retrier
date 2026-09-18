@@ -42,6 +42,14 @@ label from column 6, a frame closed by ESC[?2026l):
                     the frame is redrawn (with an ESC[K that wipes whatever the
                     wrapper painted over it, the way claude's own repaint does)
                     whenever the line `repaint-tree` is typed
+
+For T29 (the OTHER subagent view, opened by typing /tasks while agents are
+still running -- no glyph, a "(state)" marker instead) it can draw that one
+too, reproducing test/fixtures/agents-panel-2.1.273.bin:
+
+  FAKE_AGENTS_PANEL  1 = draw the panel once at startup; `repaint-panel`
+                    redraws it (state flips to "done", the same ESC[K erase
+                    the real repaint does)
 """
 import json
 import os
@@ -185,6 +193,14 @@ AGENT_A, AGENT_B = "aaa111", "bbb222"
 AGENT_A_LABEL, AGENT_B_LABEL = "Report first file in cwd", "Report second file in cwd"
 AGENT_A_MODEL, AGENT_B_MODEL = "claude-sonnet-5", "claude-haiku-4-5-20251001"
 
+# T29: the OTHER subagent view, opened by typing /tasks while agents are
+# still running -- a different row shape from the tree above (no glyph, a
+# "(state)" marker instead), reproducing test/fixtures/agents-panel-2.1.273.bin.
+# Rows picked well clear of the tree rows above, the badge, and the top.
+PANEL_ROW_HEADER = 30
+PANEL_ROW1 = 31
+PANEL_ROW2 = 32
+
 
 def subagents_dir():
     d = os.path.join(project_dir(), SESSION[0], "subagents")
@@ -217,6 +233,23 @@ def draw_agent_tree(out, suffix="0 tool uses"):
     ) % (AGENT_TREE_ROW1, AGENT_TREE_ROW1, suffix,
          AGENT_TREE_ROW2, AGENT_TREE_ROW2,
          AGENT_TREE_ROW3, AGENT_TREE_ROW3, suffix)
+    out.write(frame)
+    out.flush()
+
+
+def draw_agents_panel(out, state="running"):
+    # CUP (row;colH) for every field, never CHA (colG) with a row number
+    # smuggled into its params -- CHA takes exactly one, the column, and
+    # leaves the row wherever it already was.
+    frame = (
+        "\x1b[?2026h"
+        "\x1b[%d;4HLocal agents (2)\x1b[K"
+        "\x1b[%d;6H%s (%s)\x1b[K"
+        "\x1b[%d;4H❯\x1b[%d;6H%s (%s)\x1b[K"
+        "\x1b[?2026l"
+    ) % (PANEL_ROW_HEADER,
+         PANEL_ROW1, AGENT_A_LABEL, state,
+         PANEL_ROW2, PANEL_ROW2, AGENT_B_LABEL, state)
     out.write(frame)
     out.flush()
 
@@ -274,6 +307,16 @@ def main():
         write_subagent(AGENT_A, AGENT_A_LABEL, AGENT_A_MODEL)
         write_subagent(AGENT_B, AGENT_B_LABEL, AGENT_B_MODEL)
         draw_agent_tree(out)
+
+    if os.environ.get("FAKE_AGENTS_PANEL"):
+        # Same seeding reasoning as FAKE_AGENT_TREE above -- the overlay
+        # cannot resolve a row until the watcher is bound to this session.
+        time.sleep(float(os.environ.get("FAKE_AGENTS_PANEL_DELAY", "0.3")))
+        write_transcript("agents panel started", limited=False)
+        time.sleep(float(os.environ.get("FAKE_AGENTS_PANEL_SETTLE_SEC", "0.5")))
+        write_subagent(AGENT_A, AGENT_A_LABEL, AGENT_A_MODEL)
+        write_subagent(AGENT_B, AGENT_B_LABEL, AGENT_B_MODEL)
+        draw_agents_panel(out)
 
     time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
 
@@ -338,6 +381,11 @@ def main():
                 # to fix.
                 draw_agent_tree(out, suffix="1 tool use")
                 out.write("GOT:repaint-tree\r\n")
+                out.flush()
+                continue
+            if line == "repaint-panel":
+                draw_agents_panel(out, state="done")
+                out.write("GOT:repaint-panel\r\n")
                 out.flush()
                 continue
             if _MARKER.search(line) or "Write a complete handoff" in line:

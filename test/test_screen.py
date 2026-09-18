@@ -10,6 +10,7 @@ from screen import Screen
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIXTURE = os.path.join(HERE, "fixtures", "agent-tree-2.1.273.bin")
+FIXTURE_PANEL = os.path.join(HERE, "fixtures", "agents-panel-2.1.273.bin")
 
 
 class TestOneSource(unittest.TestCase):
@@ -46,6 +47,37 @@ class TestRealCapture(unittest.TestCase):
         self.assertIn("Count files in cwd", labels)
         # the child's own status line is never mistaken for an agent's row
         self.assertNotIn("Initializing…", " ".join(labels))
+
+
+class TestRealCaptureAgentsPanel(unittest.TestCase):
+    """T29: the OTHER subagent view, opened by typing /tasks while at least
+    one is still running -- a real Claude Code 2.1.273 capture
+    (test/fixtures/README.md), not the transient inline tree TestRealCapture
+    above already covers. Live investigation established the footer's own
+    "<- for agents" hint does NOT open this in either permission mode -- it
+    backgrounds the conversation into the cross-session roster instead, which
+    is why nothing in this file ever sends that key.
+    """
+
+    def setUp(self):
+        with open(FIXTURE_PANEL, "rb") as fh:
+            data = fh.read()
+        self.screen = Screen(50, 120)
+        self.screen.feed(data.decode("utf-8", "replace"))
+
+    def test_it_never_scrolled(self):
+        self.assertEqual(self.screen.scrolled, 0)
+
+    def test_the_panel_rows_land_where_a_human_sees_them(self):
+        cr = load()
+        found = cr.find_panel_agent_rows(self.screen)
+        labels = [label for _, label, _ in found]
+        self.assertEqual(len(found), 3)
+        self.assertIn("Count files under /usr", labels)
+        self.assertIn("Count files under /System/Library", labels)
+        self.assertIn("Count files under /Applications", labels)
+        # the section header ("Local agents (3)") is never one of them
+        self.assertFalse(any("Local agents" in label for label in labels))
 
 
 class TestScrollRegion(unittest.TestCase):
