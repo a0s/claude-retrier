@@ -274,6 +274,86 @@ class TestAgentOverlayLeavesTheBadgeAlone(unittest.TestCase):
         overlay.paint(fd, 23, 120, s, self.Reg(), badge_row=1)
         self.assertEqual(read(), "")     # the badge's own row (top-right), untouched
 
+    def test_a_row_claimed_through_the_shared_registry_is_left_alone_too(self):
+        # T28: the same coordination as the two tests above, but through
+        # OccupiedRows instead of the badge_row= override — this is what
+        # main() actually wires up now.
+        Screen = cr.Screen
+        s = Screen(23, 120)
+        s.feed("\x1b[23;4H└\x1b[23;6GReport second file in cwd")  # lands on row 23
+        overlay = cr.AgentOverlay(dict(agents_overlay=True, agents_pos="right"))
+        fd, read = self.fd()
+        occupied = cr.OccupiedRows()
+        occupied.claim(23)
+        overlay.paint(fd, 23, 120, s, self.Reg(), occupied=occupied)
+        self.assertEqual(read(), "")
+
+    def test_a_row_the_registry_did_not_claim_is_still_annotated(self):
+        Screen = cr.Screen
+        s = Screen(23, 120)
+        s.feed("\x1b[23;4H└\x1b[23;6GReport second file in cwd")
+        overlay = cr.AgentOverlay(dict(agents_overlay=True, agents_pos="right"))
+        fd, read = self.fd()
+        occupied = cr.OccupiedRows()   # nothing claimed
+        overlay.paint(fd, 23, 120, s, self.Reg(), occupied=occupied)
+        self.assertNotEqual(read(), "")
+
+
+class TestSharedPaintPrimitive(unittest.TestCase):
+    """T28: Badge and AgentOverlay both compute their column through
+    edge_column()/pad_to(), the same two functions, rather than two copies of
+    the same arithmetic. T27 shipped a real bug from exactly that drift — a
+    shrinking label's column computed from the new, narrower text while its
+    padding still reached out to the old, wider one — so this pins the two
+    painters to one shared answer instead of two that currently agree.
+    """
+
+    def fd(self):
+        import os
+        import tempfile
+        path = tempfile.mktemp(prefix="cr-shared-paint-")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, fd)
+
+        def read():
+            os.lseek(fd, 0, 0)
+            return os.read(fd, 65536).decode()
+        return fd, read
+
+    def test_badges_own_column_is_the_shared_functions_answer(self):
+        rows, cols, width = 40, 120, 10
+        row, col = badge().place(rows, cols, width)
+        self.assertEqual(col, cr.edge_column(cols, width, "right"))
+
+    def test_the_overlays_column_is_the_shared_functions_answer_when_shrinking(self):
+        # Same field-shape regression test_agents.py pins at the AgentOverlay
+        # level (a wide label giving way to a narrower one), but asserted
+        # here against cr.edge_column directly rather than a hardcoded
+        # column, so the two painters are proven to share the function, not
+        # just its current output.
+        import re
+        s = cr.Screen(5, 120)
+        s.feed("\x1b[3;4H└\x1b[6GReport second file in cwd")
+        overlay = cr.AgentOverlay(dict(agents_overlay=True, agents_pos="right"))
+        fd, read = self.fd()
+
+        class Reg:
+            def __init__(self, models):
+                self.models = models
+
+            def model_for(self, label):
+                return self.models.get(label)
+
+        wide = Reg({"Report second file in cwd": ("claude-fable-5-1", "high")})
+        overlay.paint(fd, 5, 120, s, wide)          # "fable-5.1/high" first
+        narrow = Reg({"Report second file in cwd": ("claude-fable-5-1", None)})
+        overlay.paint(fd, 5, 120, s, narrow)         # then the shrunk "fable-5.1/?"
+        last = read().split("\x1b7")[-1]
+        m = re.search(r"\x1b\[3;(\d+)H", last)
+        self.assertIsNotNone(m)
+        final_width = len("fable-5.1/high")   # the OLD, wider footprint still in play
+        self.assertEqual(int(m.group(1)), cr.edge_column(120, final_width, "right"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3940,6 +3940,59 @@ def human_left(secs):
 BADGE_POSITIONS = ("bottom-right", "bottom-left", "top-right", "top-left")
 
 
+# T27 shipped a copy of this arithmetic in AgentOverlay._paint_row that
+# computed the column from the NEW (narrower) text while padding out to the
+# OLD (wider) one -- a shrinking label could then reach past the protected
+# last column and scroll the screen. Badge never had that bug, because it
+# always derived the column from the padded string. Routing both painters
+# through the same three functions (T28) makes that class of bug impossible
+# to reintroduce, rather than merely absent today.
+def edge_column(edge, width, anchor):
+    """1-based column for a `width`-wide field anchored at `edge`: a "right"
+    anchor ends just before `edge`, a "left"/"start" anchor begins at it.
+    `width` must already be the FINAL width (maxed against whatever is
+    currently on screen) -- see the note above."""
+    return edge - width if anchor == "right" else edge
+
+
+def pad_to(text, width, anchor):
+    """Pad `text` out to `width`, on the side away from its anchor, so a
+    shorter frame covers every cell the previous, wider one used."""
+    if len(text) >= width:
+        return text
+    fill = " " * (width - len(text))
+    return fill + text if anchor == "right" else text + fill
+
+
+def annotation_bytes(row, col, text, sgr):
+    """DECSC -> CUP -> SGR -> text -> SGR reset -> DECRC: save the cursor and
+    colour, paint, restore both. Never emits a newline, so it can never
+    scroll the screen or leave a stray colour behind for Claude's own next
+    write."""
+    return ("\x1b7\x1b[%d;%dH\x1b[%sm%s\x1b[0m\x1b8" % (row, col, sgr, text)).encode()
+
+
+def write_annotation(fd, row, col, text, sgr):
+    return write_all(fd, annotation_bytes(row, col, text, sgr))
+
+
+class OccupiedRows:
+    """Which rows are already spoken for this frame, so a painter can avoid
+    them without being told by name which one belongs to somebody else (T28).
+    Badge registers its own row before AgentOverlay paints; a third
+    participant, if one ever exists, would do the same and need no change
+    here or in AgentOverlay."""
+    def __init__(self):
+        self._rows = set()
+
+    def claim(self, row):
+        if row is not None:
+            self._rows.add(row)
+
+    def __contains__(self, row):
+        return row in self._rows
+
+
 class Badge:
     MARK = "◆"
     MARK_ALT = "◇"
@@ -4025,15 +4078,25 @@ class Badge:
         return self.pending or text != self.painted
 
     # -- where it goes ------------------------------------------------------ #
+    def row(self, rows):
+        """The row this badge sits on, top or bottom -- independent of column
+        or of whether it actually repaints this tick. The corner is reserved
+        for as long as the badge is enabled, so AgentOverlay can avoid it
+        (via OccupiedRows) without knowing anything about Badge itself."""
+        return rows if self.pos.startswith("bottom") else 1
+
+    def _anchor(self):
+        return "right" if self.pos.endswith("right") else "left"
+
     def place(self, rows, cols, width):
         """(row, col), 1-based, or None if the terminal is too small to bother."""
         if rows < 2 or cols < width + 2:
             return None
-        row = rows if self.pos.startswith("bottom") else 1
+        anchor = self._anchor()
         # cols - width leaves the last cell untouched: writing into it is what
         # makes a terminal wrap and scroll the whole screen by one line.
-        col = (cols - width) if self.pos.endswith("right") else 1
-        return (row, max(1, col))
+        col = edge_column(cols if anchor == "right" else 1, width, anchor)
+        return (self.row(rows), max(1, col))
 
     def sequence(self, rows, cols, text, sgr):
         spot = self.place(rows, cols, len(text))
@@ -4042,7 +4105,7 @@ class Badge:
         row, col = spot
         # DECSC/DECRC rather than CSI s/u: it saves the SGR state too, so the
         # colour used here cannot leak into whatever claude draws next.
-        return ("\x1b7\x1b[%d;%dH\x1b[%sm%s\x1b[0m\x1b8" % (row, col, sgr, text)).encode()
+        return annotation_bytes(row, col, text, sgr)
 
     def paint(self, fd, rows, cols, state, remaining, attempts, max_attempts, now,
               blocked=False, deferred=False, restart=None, context=None, warn=None):
@@ -4054,10 +4117,7 @@ class Badge:
         # screen — "◇ cr 1m" becoming "◆ cr" reads as "◇ c◆ cr" until claude
         # happens to repaint that row. Pad away from the anchored edge so the
         # cells we used are the cells we clear.
-        draw = text
-        if len(draw) < self.painted_width:
-            pad = " " * (self.painted_width - len(draw))
-            draw = pad + draw if self.pos.endswith("right") else draw + pad
+        draw = pad_to(text, self.painted_width, self._anchor())
         seq = self.sequence(rows, cols, draw, sgr)
         if seq is None:
             return False
@@ -4624,13 +4684,18 @@ class AgentOverlay:
         self.pos = cfg["agents_pos"] if cfg["agents_pos"] in ("right", "label") else "right"
         self.painted = {}      # row -> width last painted there
 
-    def paint(self, fd, rows, cols, screen, registry, badge_row=None):
+    def paint(self, fd, rows, cols, screen, registry, badge_row=None, occupied=None):
         if not self.enabled:
             return False
-        # Which row the badge is anchored to — bottom-right/bottom-left share
-        # the last row, top-right/top-left the first — so the corner is only
-        # ever contested there, never assumed to be the bottom one.
-        avoid = rows if badge_row is None else badge_row
+        # Which rows are already spoken for. `occupied` (an OccupiedRows,
+        # T28) is how main() coordinates this with Badge now — Badge claims
+        # its own row without AgentOverlay having to know its geometry.
+        # `badge_row` stays as a direct single-row override for callers (unit
+        # tests) that have no registry to build; bottom-right/bottom-left
+        # share the last row, top-right/top-left the first, so with neither
+        # given the corner is assumed to be the bottom row, as before T28.
+        if occupied is None:
+            occupied = {rows if badge_row is None else badge_row}
         seen = set()
         wrote = False
         # Two independent row shapes (T27's inline tree, T29's /tasks panel)
@@ -4638,8 +4703,8 @@ class AgentOverlay:
         # row the other one also matches (disjoint glyph sets), so this is a
         # concatenation, not a merge that needs de-duplication.
         for row, label, label_col in find_agent_rows(screen) + find_panel_agent_rows(screen):
-            if row == avoid:
-                continue        # never contest the badge's own row for the corner
+            if row in occupied:
+                continue        # never contest a row somebody else already claimed
             model = registry.model_for(label)
             text = model_label(*model) if model else model_label(None)
             seen.add(row)
@@ -4656,29 +4721,27 @@ class AgentOverlay:
         # placed as if it were only as wide as the new text while still being
         # padded out to the old, wider one, and the write overruns past the
         # column it was placed at (in "right" mode: into or past the
-        # protected last column — exactly what Badge.sequence avoids by
-        # placing from len(draw), the already-padded string, not len(text)).
+        # protected last column). edge_column/pad_to (T28) are the same
+        # functions Badge uses for exactly this reason: the arithmetic can no
+        # longer drift between the two painters.
         prev = self.painted.get(row, 0)
         width = max(len(text), prev)
         if cols < width + 2:
             return False
         if self.pos == "label":
-            col = label_col - width - 1
+            col = edge_column(label_col - 1, width, "right")
             if col < 1:
                 return False
         else:
             # cols - width leaves the last cell untouched — writing into it is
             # what makes a terminal wrap and scroll the whole screen by one
             # line (the same rule Badge.place follows).
-            col = cols - width
+            col = edge_column(cols, width, "right")
             if own_width >= col - 1:
                 return False    # claude's own text already reaches into our column
-        draw = text
-        if len(draw) < width:
-            draw = (" " * (width - len(draw))) + draw
-        seq = ("\x1b7\x1b[%d;%dH\x1b[2m%s\x1b[0m\x1b8" % (row, col, draw)).encode()
+        draw = pad_to(text, width, "right")
         self.painted[row] = len(text)
-        return write_all(fd, seq)
+        return write_annotation(fd, row, col, draw, "2")
 
 
 class Logger:
@@ -4859,7 +4922,14 @@ def main(argv):
     agents = AgentOverlay(CFG)
     agent_registry = SubagentRegistry(poll=CFG["agents_poll"])
     # Nothing is built when the overlay is off: no Screen, no per-frame feed,
-    # not one extra byte (CR_AGENTS_OVERLAY=0 AC).
+    # not one extra byte (CR_AGENTS_OVERLAY=0 AC). T28 open question: Badge
+    # stays on its own due() quiet-gap timer rather than switching to this
+    # ESC[?2026l frame-closure trigger, even though the rendering primitive is
+    # now shared. Moving it over would require a Screen (and the per-frame
+    # feed cost) whenever CR_BADGE=1 — effectively always, since it defaults
+    # on — while CR_AGENTS_OVERLAY defaults off precisely to avoid that cost.
+    # Sharing the REDRAW trigger too would flip that default by the back
+    # door; sharing only the primitive keeps CR_BADGE's cost unchanged.
     tree_screen = Screen(rows, cols) if CFG["agents_overlay"] else None
     if not interactive:
         badge.enabled = False      # nothing to paint on when stdout is a pipe
@@ -5006,8 +5076,11 @@ def main(argv):
                     tree_screen.feed(text)
                     if frame_closed:
                         agent_registry.poll_now(watcher.current, now)
+                        occupied = OccupiedRows()
+                        if badge.enabled:
+                            occupied.claim(badge.row(rows))
                         agents.paint(stdout_fd, rows, cols, tree_screen, agent_registry,
-                                    badge_row=(1 if badge.pos.startswith("top") else rows))
+                                    occupied=occupied)
                 chunk = strip_ansi(text)
                 window = (window + chunk)[-8192:]
                 ctl.on_output(chunk, now)
@@ -5200,6 +5273,15 @@ def main(argv):
                 handoff_registry.unregister(os.getpid())
             except Exception:
                 pass
+        # AgentOverlay gets no erase() to match, even though T28 made the
+        # primitive shared: Badge always owns a fixed corner, so its erase
+        # blanks exactly the cells it last drew. A tree/panel row is not
+        # fixed — by exit time the row an annotation was painted on may have
+        # scrolled into history, been claimed by an unrelated later agent, or
+        # gone back to plain conversation text, and blanking it from stale
+        # (row, width) bookkeeping would overwrite whatever is there now
+        # rather than the annotation. The annotations that remain are inert
+        # text in the scrollback, same as T27 left them.
         try:
             badge.erase(stdout_fd, rows, cols)
         except Exception:
