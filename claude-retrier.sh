@@ -2853,6 +2853,11 @@ class Controller:
         self.rstate = None            # None | HANDOFF_SENT | HANDOFF_OK | CLEARED | RESUME_SENT
         self.nonce = None             # the marker only this attempt can satisfy
         self.handoff_sent_at = 0.0
+        self.end_turn_seen_at = 0.0   # when end_turn last landed on the attached
+                                       # transcript, at or after handoff_sent_at --
+                                       # a later tool_use must not erase this (T12)
+        self.handoff_verified_at = None   # when the latch caught (T12); None until it does
+        self._handoff_verified_st = None  # the file snapshot the latch was taken from
         self.handoff_tries = 0        # the model failing to fold, not the world failing
         self.resume_tries = 0
         self.restart_left = 0.0       # timeout budget for the current step
@@ -3405,6 +3410,12 @@ class Controller:
             return                       # a subagent's context, not the session's
         if rec.get("stop_reason") is not None:
             self.last_stop_reason = rec["stop_reason"]
+            if rec["stop_reason"] == "end_turn" and now >= self.handoff_sent_at:
+                self.end_turn_seen_at = now
+        if self.rstate == HANDOFF_OK:
+            # Latched already; a row here is the only sign that the file
+            # backing it might have moved out from under the wait for quiet.
+            self._recheck_handoff_latch(now)
         window = rec.get("window")
         model = rec.get("model")
         moved = False
@@ -3808,6 +3819,9 @@ class Controller:
         self.restart_left = self.cfg["handoff_timeout"]
         self.rwake = now
         self.last_stop_reason = None      # only the coming turn's ending counts
+        self.end_turn_seen_at = 0.0
+        self.handoff_verified_at = None   # a fresh nonce means a fresh proof, too
+        self._handoff_verified_st = None
         text = (self.cfg["handoff_msg"]
                 .replace("{file}", self.cfg["handoff_file"])
                 .replace("{marker}", self.nonce))
@@ -3856,14 +3870,23 @@ class Controller:
         busy = self._session_busy(now)
         st = self.probe(self.handoff_path)
         fault = self._handoff_fault(st)
-        if fault is None and not busy:
+        if fault is None:
             if not self.handoff_echoed:
                 # Everything about the file checks out, but the one thing that
                 # says the phrase ever reached this session has not shown up
                 # yet. Wait for it rather than clear on the strength of a file
                 # that, on its own, could belong to somebody else entirely.
                 return None
+            # Latch here rather than wait for `busy` to clear: background
+            # activity (an agent's notification, notify_idle, a hook) can start
+            # a new turn once the fold's end_turn already landed, and that turn
+            # would otherwise keep this file "not yet accepted" until the
+            # handoff_timeout aborts a restart that already succeeded (T12).
+            # Quiet is still required before `/clear` actually goes out --
+            # `_send_clear` enforces that on its own.
             self.rstate = HANDOFF_OK
+            self.handoff_verified_at = now
+            self._handoff_verified_st = st
             self.restart_left = self.cfg["handoff_timeout"]
             self.rwake = now
             self.log("handoff accepted: %d bytes ending in %s, turn closed with end_turn"
@@ -3918,12 +3941,33 @@ class Controller:
         if not re.search(r"(?:\A|\n)[ \t]*%s\Z" % re.escape(self.nonce or "\0"),
                          st["tail"].rstrip()):
             return "the handoff file does not end with %s" % self.nonce
-        if self.last_stop_reason != "end_turn":
+        if self.end_turn_seen_at < self.handoff_sent_at:
             # A fact from the runtime, not from the model: max_tokens is an
             # answer cut off by length and refusal is one that never started,
-            # and a marker that somehow survived either proves nothing.
+            # and a marker that somehow survived either proves nothing. Judged
+            # by whether end_turn was EVER seen for this attempt, not by
+            # `last_stop_reason` alone -- a later tool_use from background
+            # activity must not undo an end_turn this attempt already had (T12).
             return "the turn ended with stop_reason=%s" % self.last_stop_reason
         return None
+
+    def _recheck_handoff_latch(self, now):
+        """A latch is a claim about a snapshot, not a promise about the
+        future: the file can still be overwritten while the busy gate holds
+        `/clear` back. Skip the re-check whenever the snapshot has not
+        actually moved, so ordinary transcript growth is not a stat() and a
+        regex on every row.
+        """
+        st = self.probe(self.handoff_path)
+        if st == self._handoff_verified_st:
+            return
+        if self._handoff_fault(st) is None:
+            self._handoff_verified_st = st
+            return
+        self.rstate = HANDOFF_SENT
+        self.handoff_verified_at = None
+        self._handoff_verified_st = None
+        self.log("the handoff file changed after it was accepted")
 
     # -- did it work -------------------------------------------------------- #
     def _context_fell(self):

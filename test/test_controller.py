@@ -814,6 +814,47 @@ class TestACollapsedRowKeepsEndTurn(RestartTestCase):
         self.assertEqual(ctl.rstate, cr.CLEARED)
 
 
+class TestTheHandoffLatchSurvivesBackgroundActivity(RestartTestCase):
+    """T12: agent notifications, notify_idle, hooks -- any of them can wake the
+    model into a new turn once the fold turn's own end_turn already landed on
+    a valid file. Latching the moment those two line up, rather than waiting
+    for the transcript to fall quiet, is what keeps that later turn from
+    reading as "no usable handoff" 900s on.
+    """
+
+    def test_background_tool_use_after_end_turn_does_not_undo_the_latch(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        self.folded(ctl, written_at=40)             # file lands, turn ends with end_turn
+        self.assertIsNone(self.tick(ctl, 41))       # still inside root_idle: too soon for "quiet"
+        self.assertEqual(ctl.rstate, cr.HANDOFF_OK)
+        self.assertTrue(any("handoff accepted" in ln for ln in ctl.log_lines))
+
+        last = 41
+        for t in range(45, 345, 15):                # ~5 minutes of background chatter
+            usage(ctl, t, FULL, stop="tool_use")
+            self.assertIsNone(self.tick(ctl, t))
+            self.assertEqual(ctl.rstate, cr.HANDOFF_OK)   # the latch survives it
+            last = t
+        self.assertNeverCleared()
+
+        self.assertIsNone(self.tick(ctl, last + 5))       # still settling
+        self.assertEqual(self.tick(ctl, last + 25), ("inject", "/clear", False))
+
+    def test_the_file_losing_its_marker_after_the_latch_reopens_it(self):
+        ctl = restart_controller()
+        self.fold(ctl)
+        self.folded(ctl, written_at=40)
+        self.tick(ctl, 41)
+        self.assertEqual(ctl.rstate, cr.HANDOFF_OK)
+
+        ctl.handoff.write(ctl, at=45, marker=False)  # something rewrote the file
+        usage(ctl, 46, FULL, stop="tool_use")
+        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        self.assertIn("changed after it was accepted", ctl.log_lines[-1])
+        self.assertNeverCleared()
+
+
 class TestTheRegistryStatusIsAnExtraBusySignal(RestartTestCase):
     """T02 item 4: `sessions/<pid>.json`'s status/statusUpdatedAt holds the
     gate too, on top of the transcript-based checks -- never instead of them."""
@@ -826,7 +867,10 @@ class TestTheRegistryStatusIsAnExtraBusySignal(RestartTestCase):
         self.assertEqual(ctl._session_busy(65), "the session reports busy")
         self.assertIsNone(self.tick(ctl, 65))       # transcript alone would clear here
         ctl.on_agent_status("idle", 60)
-        self.assertEqual(self.tick(ctl, 66), ("inject", "/clear", False))
+        # T12: the latch already caught at t=65 regardless of busy, so what is
+        # being waited out here is `_send_clear`'s own backoff (GATE_RETRY),
+        # not the busy status -- it flipped idle before this tick either way.
+        self.assertEqual(self.tick(ctl, 65 + ctl.GATE_RETRY), ("inject", "/clear", False))
 
     def test_a_stale_busy_status_is_not_trusted(self):
         ctl = restart_controller()
@@ -921,15 +965,17 @@ class TestNothingIsClearedOnAPromise(RestartTestCase):
         self.assertNeverCleared()
 
     def test_a_session_that_kept_working_is_waited_for_not_cleared(self):
-        # The file is complete and the model ignored "do not start new work".
-        # Clearing now would take the new work with it.
+        # The file is complete and end_turn already landed, so T12 latches it
+        # (HANDOFF_OK) without waiting for the transcript to fall quiet -- but
+        # "do not start new work" was ignored, and clearing now would take that
+        # new work with it, so `/clear` itself still has to wait.
         ctl = self.failing()
         ctl.handoff.write(ctl, at=40)
         usage(ctl, 40, FULL)
         for t in range(45, 400, 10):
             ctl.note_growth([MINE], now=t)         # still writing
             self.assertIsNone(self.tick(ctl, t))
-        self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
+        self.assertEqual(ctl.rstate, cr.HANDOFF_OK)
         self.assertNeverCleared()
 
     def test_a_turn_still_in_flight_is_not_a_failed_one(self):
