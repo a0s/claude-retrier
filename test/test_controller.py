@@ -646,6 +646,14 @@ def usage(ctl, at, tokens, model="claude-opus-5", stop="end_turn", path=MINE,
                         stop_reason=stop, sidechain=sidechain), at)
 
 
+def moved(ctl, path, at, why="restart"):
+    """What `main()` does before handing over the first row of a new
+    transcript: `bind_transcript` is the only thing allowed to move
+    `context_path`, so a test standing in for a real `/clear` has to call it
+    too, the same as a neighbour's stray row must not."""
+    ctl.bind_transcript(path, why, at)
+
+
 class RestartTestCase(unittest.TestCase):
     """Every action the controller returns is recorded, because half of what is
     being asserted here is what it did NOT do — and `/clear` is the one action
@@ -710,6 +718,7 @@ class TestTheHappyPath(RestartTestCase):
         self.assertEqual(ctl.rstate, cr.RESUME_SENT)
 
         # The new session answers, and it answers small.
+        moved(ctl, "/proj/after.jsonl", 72)
         usage(ctl, 72, 8000, path="/proj/after.jsonl")
         action = self.tick(ctl, 73)
         self.assertEqual(action[0], "notify")
@@ -727,9 +736,10 @@ class TestTheHappyPath(RestartTestCase):
     def test_a_restart_is_followed_by_silence(self):
         ctl = restart_controller()
         self.unfolding(ctl)
+        moved(ctl, "/proj/after.jsonl", 72)
         usage(ctl, 72, 8000, path="/proj/after.jsonl")
         self.tick(ctl, 73)
-        usage(ctl, 100, FULL, path=MINE)           # full again straight away
+        usage(ctl, 100, FULL, path="/proj/after.jsonl")   # full again straight away
         self.assertIsNone(self.tick(ctl, 200))     # inside the cooldown
         self.assertIsNotNone(self.tick(ctl, 700))
 
@@ -931,11 +941,14 @@ class TestTheClearHasToHaveWorked(RestartTestCase):
         # /clear time rather than at the trigger would mean judging the restart
         # against whichever session happened to speak in between — and against a
         # small enough number, a real restart reads as a failure and switches the
-        # feature off for good.
+        # feature off for good. T04: the neighbour's row is not a `/clear`
+        # `bind_transcript` never runs for it, so `on_context` ignores it
+        # outright rather than needing `context_before`'s max() to paper over it.
         ctl = restart_controller()
         self.fold(ctl)
         self.folded(ctl)
         usage(ctl, 66, 9000, path="/proj/somebody-else.jsonl")
+        self.assertEqual(ctl.context_tokens, FULL)
         self.assertEqual(self.tick(ctl, 90), ("inject", "/clear", False))
         self.assertEqual(ctl.context_before, FULL)
 
@@ -963,6 +976,7 @@ class TestTheClearHasToHaveWorked(RestartTestCase):
         ctl = restart_controller()
         self.unfolding(ctl)
         ctl.on_resume_echo(70)
+        moved(ctl, "/proj/after.jsonl", 80)
         usage(ctl, 80, 600000, path="/proj/after.jsonl")   # 700k -> 600k: no
         self.assertEqual(self.tick(ctl, 130)[0], "notify")
         self.assertTrue(ctl.context_off)
@@ -1238,8 +1252,19 @@ class TestWhatCountsAsContext(RestartTestCase):
     def test_the_session_moving_to_a_new_transcript_replaces_the_reading(self):
         ctl = restart_controller()
         usage(ctl, 0, FULL, path=MINE)
+        moved(ctl, "/proj/after.jsonl", 1)
         usage(ctl, 1, 9000, path="/proj/after.jsonl")
         self.assertEqual(ctl.context_tokens, 9000)
+
+    def test_a_row_from_a_transcript_never_bound_to_is_ignored(self):
+        # T04: only `bind_transcript` may move `context_path`. A row that
+        # simply arrives on a different file — a neighbour's session, not a
+        # `/clear` — is not taken as one.
+        ctl = restart_controller()
+        usage(ctl, 0, FULL, path=MINE)
+        usage(ctl, 1, 9000, path="/proj/somebody-else.jsonl")
+        self.assertEqual(ctl.context_tokens, FULL)
+        self.assertEqual(ctl.context_path, MINE)
 
 
 class TestAPerModelTokenOverride(RestartTestCase):
@@ -1361,6 +1386,121 @@ class TestWhatTheCornerSays(RestartTestCase):
         badge = cr.Badge(dict(badge=1, badge_pos="bottom-right", badge_label="cr"))
         text, _ = badge.frame(cr.WAITING, 3600, 0, 3, now=0, restart=cr.HANDOFF_SENT)
         self.assertIn("1h00m", text)
+
+
+class TestBindTranscriptIsTheSoleSwitchPoint(RestartTestCase):
+    """T04: everything `on_context` used to reset by itself on a path change —
+    plus the fields it never did — now resets exactly once, exactly here."""
+
+    def test_binding_resets_every_per_transcript_field_but_the_model(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL, model="claude-opus-5", stop="tool_use")
+        ctl.on_turn("open", 0)
+        ctl.note_growth([MINE], 0)
+        ctl._window_bumped = True
+        ctl.codex_cap = 900000
+        ctl.counted_by_log = MINE
+        moved(ctl, "/proj/after.jsonl", 10)
+        self.assertIsNone(ctl.context_tokens)
+        self.assertIsNone(ctl.turn_open)
+        self.assertIsNone(ctl.codex_cap)
+        self.assertIsNone(ctl.context_window_hint)
+        self.assertIsNone(ctl.counted_by_log)
+        self.assertIsNone(ctl.last_stop_reason)
+        self.assertEqual(ctl.context_grew_at, 0.0)
+        self.assertFalse(ctl._window_bumped)
+        self.assertEqual(ctl.context_model, "claude-opus-5")   # the one survivor
+
+    def test_the_first_row_after_binding_reads_correctly(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        moved(ctl, "/proj/after.jsonl", 10)
+        usage(ctl, 10, 8000, path="/proj/after.jsonl")
+        self.assertEqual(ctl.context_tokens, 8000)
+        self.assertAlmostEqual(ctl.context_pct(), 0.8, delta=0.1)
+
+    def test_binding_logs_exactly_one_line(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        before = len(ctl.log_lines)
+        moved(ctl, "/proj/after.jsonl", 10)
+        switched = [l for l in ctl.log_lines[before:] if "transcript switched" in l]
+        self.assertEqual(len(switched), 1)
+        self.assertIn("mine.jsonl", switched[0])
+        self.assertIn("after.jsonl", switched[0])
+
+    def test_a_context_window_flip_flop_does_not_repeat_the_cap_line(self):
+        # The bug the old self-adopting on_context had: a row from any path
+        # different from context_path reset context_window_hint, and codex's
+        # own compaction line (_note_cap) re-fired on every such flip.
+        ctl = restart_controller(agent="codex")
+        ctl.on_context(dict(kind="alive", source="log", path=MINE, sidechain=False,
+                            tokens=100000, cap=900000), 0)
+        before = len(ctl.log_lines)
+        ctl.on_context(dict(kind="alive", source="log", path=MINE, sidechain=False,
+                            tokens=110000, cap=900000), 1)
+        self.assertFalse(any("codex compacts this thread" in l for l in ctl.log_lines[before:]))
+
+
+class TestOnAliveTrustsOnlyItsOwnTranscript(RestartTestCase):
+    """T04 item 3: clearing a wait from a transcript row requires the row's
+    path to be the one this session is bound to."""
+
+    def test_a_foreign_path_does_not_clear_the_wait(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)                       # binds context_path to MINE
+        ctl.on_limit(BANNER, now=10, source="transcript")
+        self.assertFalse(ctl.on_alive(now=1000, source="transcript",
+                                      path="/proj/somebody-else.jsonl"))
+        self.assertEqual(ctl.state, cr.WAITING)
+
+    def test_our_own_path_clears_the_wait(self):
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        ctl.on_limit(BANNER, now=10, source="transcript")
+        self.assertTrue(ctl.on_alive(now=1000, source="transcript", path=MINE))
+        self.assertEqual(ctl.state, cr.IDLE)
+
+    def test_no_path_at_all_is_trusted_as_before(self):
+        # A screen-sourced wake, or a caller with nothing to say about paths,
+        # is unaffected: only a path that actively disagrees is rejected.
+        ctl = restart_controller()
+        usage(ctl, 0, FULL)
+        ctl.on_limit(BANNER, now=10, source="transcript")
+        self.assertTrue(ctl.on_alive(now=1000, source="transcript"))
+
+
+class TestTheFallbackHeuristicStaysVisible(unittest.TestCase):
+    """T04 item 4: once a registry binds identity, `_pick_current`'s growth
+    guess only ever runs as a fallback — and when it does, every switch it
+    makes is logged, since a wrong guess is least expected right there."""
+
+    def test_a_switch_without_a_registry_is_logged(self):
+        cr_ = load()
+        logs = []
+        watcher = cr_.TranscriptWatcher.__new__(cr_.TranscriptWatcher)
+        watcher.log = logs.append
+        watcher.current = "/proj/a.jsonl"
+        watcher.grown = ["/proj/b.jsonl"]
+        watcher.preexisting = {"/proj/a.jsonl"}
+        watcher._mtime = lambda p: {"/proj/b.jsonl": 2.0}.get(p, 0.0)
+        watcher._pick_current()
+        self.assertEqual(watcher.current, "/proj/b.jsonl")
+        self.assertTrue(any("fallback heuristic" in l for l in logs))
+        self.assertTrue(any("a.jsonl" in l and "b.jsonl" in l for l in logs))
+
+    def test_the_first_pick_is_not_a_switch(self):
+        cr_ = load()
+        logs = []
+        watcher = cr_.TranscriptWatcher.__new__(cr_.TranscriptWatcher)
+        watcher.log = logs.append
+        watcher.current = None
+        watcher.grown = ["/proj/a.jsonl"]
+        watcher.preexisting = set()
+        watcher._mtime = lambda p: 1.0
+        watcher._pick_current()
+        self.assertEqual(watcher.current, "/proj/a.jsonl")
+        self.assertFalse(logs)
 
 
 if __name__ == "__main__":
