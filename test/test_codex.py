@@ -661,14 +661,46 @@ class TestACodexRestart(unittest.TestCase):
         feed(ctl, 41, turn="closed", stop_reason="end_turn")
         ctl.on_handoff_echo(ROLL, 41)               # T06: claude wrote the phrase back
         self.assertEqual(ctl.tick(70), ("inject", "/clear", False))
-        # The new chat is a new rollout, and it answers small.
+        self.assertEqual(ctl.rstate, cr.CLEAR_SENT)
+
+        # The new chat is a new rollout, which confirms the clear took (T08).
+        moved(ctl, "/codex/sessions/rollout-new.jsonl", 71)
+        self.assertIsNone(ctl.tick(71))
+        self.assertEqual(ctl.rstate, cr.CLEARED)
+
+        # ...and it answers small.
         self.assertEqual(ctl.tick(74)[1], "Read `H.md` and continue from it.")
-        moved(ctl, "/codex/sessions/rollout-new.jsonl", 80)
         feed(ctl, 80, path="/codex/sessions/rollout-new.jsonl", turn="open", window=WINDOW)
         feed(ctl, 82, path="/codex/sessions/rollout-new.jsonl", tokens=14000)
         action = ctl.tick(83)
         self.assertEqual(action[0], "notify")
         self.assertIn("restarted", action[1])
+
+    def test_resume_waits_for_the_screen_to_settle_after_clear(self):
+        # No rollout ever appears here, so the only signal available is the
+        # screen going quiet -- exactly the case codex hits until "a new
+        # rollout" (T08's other confirmation path) is wired up for it too.
+        ctl = codex_controller(context_pct=50)
+        self.full(ctl)
+        ctl.tick(30)
+        feed(ctl, 31, turn="open", window=WINDOW)
+        ctl.handoff.write(ctl, at=40)
+        feed(ctl, 40, tokens=201000)
+        feed(ctl, 41, turn="closed", stop_reason="end_turn")
+        ctl.on_handoff_echo(ROLL, 41)
+        self.assertEqual(ctl.tick(70), ("inject", "/clear", False))
+        self.assertEqual(ctl.rstate, cr.CLEAR_SENT)
+
+        ctl.on_output("repainting", now=71)      # the TUI is still drawing the new chat
+        self.assertIsNone(ctl.tick(72))           # 1s quiet: nowhere near CR_CLEAR_SETTLE_SEC
+        self.assertEqual(ctl.rstate, cr.CLEAR_SENT)
+        self.assertIsNone(ctl.tick(75))           # 4s quiet: still short
+        self.assertEqual(ctl.rstate, cr.CLEAR_SENT)
+
+        self.assertIsNone(ctl.tick(76))           # 5s quiet: settled
+        self.assertEqual(ctl.rstate, cr.CLEARED)
+        self.assertIsNone(ctl.tick(78))           # step_gap(3) since settling not up yet
+        self.assertEqual(ctl.tick(79)[1], "Read `H.md` and continue from it.")
 
     def test_an_open_turn_holds_the_fold_back_however_quiet_it_is(self):
         # A root waiting on its agents writes nothing for minutes. The byte

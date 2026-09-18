@@ -603,6 +603,7 @@ CTX = dict(
 )
 
 MINE = "/proj/mine.jsonl"          # the transcript this terminal's session writes
+AFTER = "/proj/after.jsonl"        # the fresh transcript /clear starts in its place
 FULL = 700000                      # past the 500k threshold
 RESUME = "Read `H.md` and continue from it."
 
@@ -702,10 +703,12 @@ class RestartTestCase(unittest.TestCase):
         usage(ctl, written_at, FULL)
 
     def cleared(self, ctl):
-        """...through the verification and out the other side of /clear."""
+        """...through the verification, /clear confirmed, and out the other side."""
         self.fold(ctl)
         self.folded(ctl)
-        self.tick(ctl, 65)
+        self.tick(ctl, 65)                  # /clear goes out (CLEAR_SENT)
+        moved(ctl, AFTER, 66)                # claude starts a new session in place (T02)
+        self.tick(ctl, 66)                   # confirmed: rstate -> CLEARED
         return ctl
 
     def unfolding(self, ctl):
@@ -727,15 +730,17 @@ class TestTheHappyPath(RestartTestCase):
         self.folded(ctl)
         self.assertIsNone(self.tick(ctl, 45))      # the transcript is still growing
         self.assertEqual(self.tick(ctl, 65), ("inject", "/clear", False))
+        self.assertEqual(ctl.rstate, cr.CLEAR_SENT)
+
+        moved(ctl, AFTER, 66)                      # claude starts a new session in place
+        self.assertIsNone(self.tick(ctl, 66))      # confirmed: CLEAR_SENT -> CLEARED
         self.assertEqual(ctl.rstate, cr.CLEARED)
 
-        self.assertIsNone(self.tick(ctl, 66))      # the gap between the two
         self.assertEqual(self.tick(ctl, 69), ("inject", RESUME, False))
         self.assertEqual(ctl.rstate, cr.RESUME_SENT)
 
         # The new session answers, and it answers small.
-        moved(ctl, "/proj/after.jsonl", 72)
-        usage(ctl, 72, 8000, path="/proj/after.jsonl")
+        usage(ctl, 72, 8000, path=AFTER)
         action = self.tick(ctl, 73)
         self.assertEqual(action[0], "notify")
         self.assertIn("restarted", action[1])
@@ -811,7 +816,7 @@ class TestACollapsedRowKeepsEndTurn(RestartTestCase):
                             model=rec["model"], stop_reason=rec["stop_reason"],
                             sidechain=rec["sidechain"]), 40)
         self.assertEqual(self.tick(ctl, 65), ("inject", "/clear", False))
-        self.assertEqual(ctl.rstate, cr.CLEARED)
+        self.assertEqual(ctl.rstate, cr.CLEAR_SENT)
 
 
 class TestTheRegistryStatusIsAnExtraBusySignal(RestartTestCase):
@@ -834,6 +839,62 @@ class TestTheRegistryStatusIsAnExtraBusySignal(RestartTestCase):
         self.folded(ctl, written_at=40)
         ctl.on_agent_status("busy", 4)              # 61s old by t=65: too stale
         self.assertEqual(self.tick(ctl, 65), ("inject", "/clear", False))
+
+
+class TestTheClearNeedsConfirmation(RestartTestCase):
+    """T08: `/clear` going out is not proof it landed. `CLEAR_SENT` sits between
+    the send and `CLEARED` until something says it actually happened -- a rebind
+    to a fresh transcript, or (see `TestCodexSettling` in test_codex.py) the
+    screen simply going quiet."""
+
+    def test_no_trace_within_verify_sends_clear_again_then_confirms_and_resumes(self):
+        # A huge clear_settle isolates the rebind-only path: nothing here is
+        # allowed to confirm on its own just because the screen went quiet.
+        ctl = restart_controller(clear_settle=10000)
+        self.fold(ctl)
+        self.folded(ctl)
+        self.assertEqual(self.tick(ctl, 65), ("inject", "/clear", False))
+        self.assertEqual(ctl.rstate, cr.CLEAR_SENT)
+
+        self.assertIsNone(self.tick(ctl, 100))      # under CR_VERIFY_SEC(60) since the send
+        self.assertEqual(ctl.rstate, cr.CLEAR_SENT)
+
+        action = self.tick(ctl, 126)                # 60s+ since the send: retype
+        self.assertEqual(action, ("inject", "/clear", False))
+        self.assertIn("left no trace; sending it again", ctl.log_lines[-1])
+        self.assertEqual(ctl.rstate, cr.CLEAR_SENT)
+
+        moved(ctl, AFTER, 130)                       # claude starts a new session in place
+        self.assertIsNone(self.tick(ctl, 130))
+        self.assertEqual(ctl.rstate, cr.CLEARED)
+
+        self.assertEqual(self.tick(ctl, 133), ("inject", RESUME, False))
+        self.assertEqual(ctl.rstate, cr.RESUME_SENT)
+
+    def test_cleared_waits_out_a_typing_person_for_as_long_as_it_takes(self):
+        ctl = restart_controller(clear_settle=10000)
+        self.cleared(ctl)
+        self.assertEqual(ctl.rstate, cr.CLEARED)
+
+        notifies = []
+        t = 70
+        while t < 1070:
+            ctl.on_user_bytes(b"\r", now=t)          # a person at the keyboard, never idle
+            action = self.tick(ctl, t)
+            if action:
+                notifies.append(action)
+            t += 5
+        # No abort in 1000s of being held, and it kept saying so.
+        self.assertEqual(ctl.rstate, cr.CLEARED)
+        self.assertGreaterEqual(len(notifies), 2)
+        for action in notifies:
+            self.assertEqual(action[0], "notify")
+            self.assertIn("unfold is waiting for", action[1])
+
+        # The last keystroke was at t=1065; the gate opens CR_USER_IDLE_SEC(20)
+        # later, and the resume goes out the moment it does.
+        self.assertIsNone(self.tick(ctl, 1080))
+        self.assertEqual(self.tick(ctl, 1090), ("inject", RESUME, False))
 
 
 class TestNothingIsClearedOnAPromise(RestartTestCase):
@@ -1035,7 +1096,7 @@ class TestTheClearHasToHaveWorked(RestartTestCase):
         ctl = restart_controller()
         self.unfolding(ctl)
         ctl.on_resume_echo(70)                     # the phrase was accepted...
-        usage(ctl, 80, FULL, path=MINE)            # ...and the context is untouched
+        usage(ctl, 80, FULL, path=AFTER)           # ...and the context is untouched
         action = self.tick(ctl, 130)
         self.assertEqual(action[0], "notify")
         self.assertIn("did not fall", action[1])
@@ -1063,19 +1124,20 @@ class TestTheClearHasToHaveWorked(RestartTestCase):
     def test_a_resume_that_never_lands_says_that_and_not_something_else(self):
         # Two failures end in the same place and read completely differently in
         # a log: a clear that did nothing, and a phrase that never arrived.
-        ctl = restart_controller(handoff_attempts=1)
+        ctl = restart_controller(resume_attempts=1)
         self.unfolding(ctl)
-        usage(ctl, 80, FULL, path=MINE)
-        self.assertEqual(self.tick(ctl, 130), ("inject", RESUME, False))
-        action = self.tick(ctl, 200)
+        usage(ctl, 80, FULL, path=AFTER)
+        self.assertEqual(self.tick(ctl, ctl.rwake), ("inject", RESUME, False))
+        action = self.tick(ctl, ctl.rwake)
         self.assertEqual(action[0], "notify")
         self.assertIn("never reached the session", action[1])
         self.assertTrue(ctl.context_off)
+        self.assertEqual(ctl.rstate, cr.UNFOLD_FAILED)
 
     def test_a_resume_that_left_no_trace_is_sent_again(self):
         ctl = restart_controller()
         self.unfolding(ctl)
-        usage(ctl, 80, FULL, path=MINE)
+        usage(ctl, 80, FULL, path=AFTER)
         action = self.tick(ctl, 130)
         self.assertEqual(action, ("inject", RESUME, False))
         self.assertEqual(ctl.resume_tries, 1)
@@ -1106,6 +1168,46 @@ class TestTheClearHasToHaveWorked(RestartTestCase):
         self.assertEqual(action[0], "notify")
         self.assertIn("restarted", action[1])
         self.assertIsNone(ctl.rstate)
+
+
+class TestUnfoldCanFail(RestartTestCase):
+    """T08: a resume phrase that never once reaches the session is not the
+    world's problem to retry forever, but it is not a one-way failure either --
+    the context really is gone, so the debt has to stay visible until a human
+    does something about it."""
+
+    def test_five_reprints_without_echo_fail_the_unfold_visibly(self):
+        ctl = restart_controller()             # CR_RESUME_ATTEMPTS defaults to 5
+        self.unfolding(ctl)
+        self.assertEqual(ctl.rstate, cr.RESUME_SENT)
+
+        for n in range(1, 6):
+            t = ctl.rwake
+            action = self.tick(ctl, t)
+            self.assertEqual(action, ("inject", RESUME, False))
+            self.assertEqual(ctl.resume_tries, n)
+
+        t = ctl.rwake
+        action = self.tick(ctl, t)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("never reached the session", action[1])
+        self.assertEqual(ctl.rstate, cr.UNFOLD_FAILED)
+        self.assertTrue(ctl.context_off)
+        self.assertFalse(ctl.context_enabled)
+
+        badge = cr.Badge(dict(badge=1, badge_pos="bottom-right", badge_label="cr"))
+        text, sgr = badge.frame(cr.IDLE, 0, 0, 3, now=0, restart=ctl.rstate)
+        self.assertIn("unfold failed", text)
+        self.assertEqual(sgr, "2;31")               # red, not the blinking magenta
+
+        self.assertIsNone(self.tick(ctl, t + 1))    # too soon to say it again
+        again = self.tick(ctl, t + 301)
+        self.assertEqual(again[0], "notify")
+        self.assertIn("never reached the session", again[1])
+
+        ctl.on_user_bytes(b"\r", now=t + 302)       # any key dismisses the notice
+        self.assertIsNone(ctl.rstate)
+        self.assertTrue(ctl.context_off)            # ...but the trigger stays off
 
 
 class TestTheLimitOutranksTheContext(RestartTestCase):

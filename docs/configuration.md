@@ -85,7 +85,9 @@ More in [context-restart.md](context-restart.md). All of these do nothing until
 | `CR_HANDOFF_ATTEMPTS` | `2` | folds attempted before giving up |
 | `CR_ROOT_IDLE_SEC` | `20` | transcript quiet this long means the turn is over |
 | `CR_HANDOFF_TIMEOUT_SEC` | `900` | per step, and frozen while a limit runs |
+| `CR_CLEAR_SETTLE_SEC` | `5` | screen quiet this long after `/clear` counts as confirmation on its own |
 | `CR_STEP_GAP_SEC` | `3` | between `/clear` and the resume phrase |
+| `CR_RESUME_ATTEMPTS` | `5` | unfold retries, each wait doubling, before the debt becomes visible instead of retried |
 | `CR_CONTEXT_COOLDOWN_SEC` | `600` | silence after any restart |
 | `CR_CONTEXT_MAX_CYCLES` | `0` | `0` = no cap; a fuse against a loop |
 | `CR_SLASH_ENTER` | `2` | Enters sent for a `/command` |

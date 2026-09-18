@@ -850,6 +850,16 @@ class TestContextRestart(PtyTestCase):
             handoff = fh.read()
         self.assertTrue(handoff.rstrip().split("\n")[-1].startswith("HANDOFF-"))
 
+    def test_a_slow_clear_still_finishes_the_restart(self):
+        # T08: the resume phrase used to go out CR_STEP_GAP_SEC after `/clear`
+        # was TYPED, not after it took hold. fake_claude here does not even
+        # accept it for 4s -- long enough to catch a resume sent too early, and
+        # short enough that the restart still finishes well inside the timeout.
+        s = self.session(env=self.env(FAKE_SCRIPT="delayclear=4"), cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_log("context restarted", s), self.logged())
+
     def test_a_clear_rebinds_the_watcher_and_unfold_lands_in_the_new_file(self):
         # T02 AC: `/clear` moves the session's identity, and the watcher has to
         # follow it through the registry — not the old growth heuristic — for

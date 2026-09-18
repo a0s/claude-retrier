@@ -148,6 +148,24 @@ promise. If `/clear` did go out and the context did not actually fall, the
 feature switches itself off for the rest of the session rather than typing into
 a full one for ever.
 
+And the unfold is owed after it. Once `/clear` has gone out, the session sitting
+there has nothing in it — the one thing left to do is type the resume phrase,
+and giving up part-way through would leave it empty forever. So `/clear` itself
+is confirmed rather than trusted: the wrapper waits for the session's identity
+to move on (a fresh transcript, the same signal a normal restart rebinds on) or
+for the screen to go quiet for `CR_CLEAR_SETTLE_SEC`, and reprints `/clear` once
+if neither shows up in time. Past that point there is no timeout that gives up
+on its own — a person typing, or a foreign transcript still finishing a turn,
+just holds the step, with a reminder every five minutes ("unfold is waiting
+for: ..."), and the resume phrase goes out the moment the gate opens. If the
+resume phrase itself keeps leaving no trace, it is retyped with a growing gap
+between attempts (a minute, then two, then four, ...) up to `CR_RESUME_ATTEMPTS`
+times before the wrapper stops trying — but even then it does not go quiet: the
+badge turns red ("unfold failed"), a notice repeats until someone reads the
+handoff file by hand, and the debt only clears once a key is pressed. What does
+switch off for good, the same as before, is the *trigger* — nothing here starts
+another restart on top of a session nobody has looked at yet.
+
 A usage limit landing in the middle suspends the restart rather than cancelling
 it. Every clock it runs on stops for the duration, because a weekly limit is
 days long and would otherwise expire a fifteen-minute fold timeout from the
