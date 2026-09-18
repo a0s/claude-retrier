@@ -89,12 +89,14 @@ def write_record(rtype, payload, ts=None):
         os.fsync(fh.fileno())
 
 
-def new_rollout():
+def new_rollout(age_days=0):
     """Start a brand new rollout file, the way a fresh codex session does.
 
-    The date directories come from the session start time, UTC.
+    The date directories come from the session start time, UTC. `age_days`
+    backdates that directory (and the timestamp in it), for tests exercising
+    `codex resume`'s visibility into yesterday's sessions.
     """
-    now = time.gmtime()
+    now = time.gmtime(time.time() - age_days * 86400)
     d = os.path.join(codex_home(), "sessions",
                       time.strftime("%Y", now), time.strftime("%m", now), time.strftime("%d", now))
     os.makedirs(d, exist_ok=True)
@@ -104,7 +106,7 @@ def new_rollout():
     SESSION[0] = os.path.join(d, name)
     ORDINAL[0] = 0
 
-    ts = now_iso()
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S", now) + ".000Z"
     subagent = os.environ.get("FAKE_SUBAGENT")
     payload = {
         "session_id": sid,
@@ -265,7 +267,7 @@ def main():
         out.write("winsize unknown\r\n")
     out.flush()
 
-    new_rollout()
+    new_rollout(age_days=int(os.environ.get("FAKE_ROLLOUT_AGE_DAYS", "0")))
 
     time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
 
@@ -304,6 +306,7 @@ def main():
     # readline(), not `for line in sys.stdin`: iterating a TextIOWrapper reads
     # ahead in blocks, so on a tty it sits on a complete line until the buffer
     # fills. A real TUI is character-driven and never has this problem.
+    pending_popup = [None]
     while True:
         line = sys.stdin.readline()
         if not line:
@@ -311,6 +314,16 @@ def main():
         line = line.strip()
         if not line:
             continue                          # an empty box: codex ignores it too
+        if os.environ.get("FAKE_POPUP") and (line.startswith("$") or line.startswith("/")):
+            # `$` and `/` both open a selector popup (T15); the first Enter is
+            # spent closing it, not submitting — only a retyped, identical line
+            # gets through. Nothing is written for the swallowed attempt.
+            if pending_popup[0] != line:
+                pending_popup[0] = line
+                out.write("POPUP:%s\r\n" % line)
+                out.flush()
+                continue
+            pending_popup[0] = None
         write_user_message(line)
         if line.startswith("quit"):
             break

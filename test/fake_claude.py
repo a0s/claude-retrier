@@ -27,11 +27,17 @@ answers with numbers rather than words:
 
 `/clear` moves the fake to a fresh transcript file, which is what Claude Code
 does and what the wrapper's "did the context actually fall" check reads.
+
+It also writes `$CLAUDE_CONFIG_DIR/sessions/<pid>.json`, the way Claude Code
+>=2.1.273 does, so identity-binding code (T02) has something real to read:
+
+  FAKE_SCRIPT      comma-separated scenario directives (see `run_script`)
 """
 import json
 import os
 import re
 import sys
+import threading
 import time
 
 # The phrase the wrapper types is configurable, so the fake recognises it by the
@@ -40,6 +46,8 @@ _MARKER = re.compile(r"must be exactly (\S+) and nothing else")
 _TARGET = re.compile(r"handoff to `([^`]+)`")
 
 SESSION = ["fake-session"]
+STARTED_AT = [None]
+DROP_NEXT_FOLD = [False]
 
 
 def project_dir():
@@ -54,13 +62,47 @@ def transcript_path():
     return os.path.join(project_dir(), SESSION[0] + ".jsonl")
 
 
-def write_transcript(text, limited=True, tokens=None, stop_reason=None):
+def sessions_dir():
+    cfg = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    d = os.path.join(cfg, "sessions")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def pid_file_path():
+    return os.path.join(sessions_dir(), "%d.json" % os.getpid())
+
+
+def write_pid_file(status):
+    """The identity record TranscriptWatcher (T02) binds on: pid -> sessionId."""
+    rec = {"pid": os.getpid(), "sessionId": SESSION[0], "cwd": os.getcwd(),
+           "startedAt": STARTED_AT[0], "version": "1.0.0-fake",
+           "kind": "interactive", "status": status,
+           "statusUpdatedAt": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())}
+    tmp = pid_file_path() + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(rec, fh)
+    os.replace(tmp, pid_file_path())
+
+
+def remove_pid_file():
+    try:
+        os.unlink(pid_file_path())
+    except OSError:
+        pass
+
+
+def write_transcript(text, limited=True, tokens=None, stop_reason=None, model=None, synthetic=False):
     msg = {"role": "assistant", "content": [{"type": "text", "text": text}]}
-    if os.environ.get("FAKE_MODEL", "claude-opus-5"):
-        msg["model"] = os.environ.get("FAKE_MODEL", "claude-opus-5")
+    msg_model = "<synthetic>" if synthetic else (model or os.environ.get("FAKE_MODEL", "claude-opus-5"))
+    if msg_model:
+        msg["model"] = msg_model
     if stop_reason:
         msg["stop_reason"] = stop_reason
-    if tokens is not None:
+    if synthetic:
+        msg["usage"] = {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0, "output_tokens": 0}
+    elif tokens is not None:
         # Split across the three counters the wrapper adds up, so the test
         # exercises the sum rather than a single field.
         msg["usage"] = {"input_tokens": 2,
@@ -75,6 +117,55 @@ def write_transcript(text, limited=True, tokens=None, stop_reason=None):
         fh.write(json.dumps(rec) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
+
+
+def write_streaming_turn(tokens, final_stop_reason="end_turn"):
+    """A turn as it looks mid-stream: a delta row with no stop_reason yet,
+    then the row that closes it (T11 row-collapse)."""
+    write_transcript("partial", limited=False, tokens=tokens, stop_reason=None)
+    write_transcript("partial and final", limited=False, tokens=tokens,
+                     stop_reason=final_stop_reason)
+
+
+def _grow_loop(step, period):
+    total = int(step)
+    while True:
+        time.sleep(period)
+        write_transcript("growing", limited=False, tokens=total, stop_reason="end_turn")
+        total += int(step)
+
+
+def run_script(spec):
+    """Apply `FAKE_SCRIPT` directives, comma-separated `name` or `name=value`.
+
+      grow=N:M          append a full-looking turn worth N tokens every M
+                         seconds, forever (a session that keeps climbing)
+      dropfirstfold      swallow the first handoff request entirely: no file,
+                         no transcript row, no GOT reply (the lost-message case)
+      synthetic          write a `<synthetic>`, all-zero-usage row at startup
+      delayclear=K       stall K seconds before acking FAKE_CLEAR_CMD/`/clear`
+      stream=N           write a streaming turn at startup: a delta row with
+                         no stop_reason, then the row that closes it at N tokens
+    """
+    if not spec:
+        return
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, value = part.partition("=")
+        if name == "grow":
+            step, _, period = value.partition(":")
+            t = threading.Thread(target=_grow_loop, args=(step or "1000", float(period or "1")), daemon=True)
+            t.start()
+        elif name == "dropfirstfold":
+            DROP_NEXT_FOLD[0] = True
+        elif name == "synthetic":
+            write_transcript("<synthetic>", limited=False, synthetic=True, stop_reason="stop_sequence")
+        elif name == "delayclear":
+            os.environ["FAKE_CLEAR_DELAY"] = value or "1"
+        elif name == "stream":
+            write_streaming_turn(int(value or "10000"))
 
 
 def fold_up(line):
@@ -101,6 +192,8 @@ def fold_up(line):
 
 def main():
     out = sys.stdout
+    STARTED_AT[0] = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
+    SESSION[0] = "fake-session-%d" % os.getpid()  # distinct per process, like a real sessionId
     out.write("fake-claude ready argv=%s\r\n" % " ".join(sys.argv[1:]))
     try:
         cols, rows = os.get_terminal_size()   # os.terminal_size is (columns, lines)
@@ -108,6 +201,9 @@ def main():
     except OSError:
         out.write("winsize unknown\r\n")
     out.flush()
+
+    write_pid_file("idle")
+    run_script(os.environ.get("FAKE_SCRIPT"))
 
     time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
 
@@ -139,50 +235,62 @@ def main():
     # readline(), not `for line in sys.stdin`: iterating a TextIOWrapper reads
     # ahead in blocks, so on a tty it sits on a complete line until the buffer
     # fills. A real TUI is character-driven and never has this problem.
-    while True:
-        line = sys.stdin.readline()
-        if not line:
-            break
-        line = line.strip()
-        if not line:
-            continue                          # an empty box: Claude Code ignores it too
-        if line.startswith("quit"):
-            break
-        if line == "answer":
-            write_transcript("an ordinary answer", limited=False)
-            out.write("GOT:answer\r\n")
+    try:
+        while True:
+            write_pid_file("idle")             # waiting for input
+            line = sys.stdin.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue                      # an empty box: Claude Code ignores it too
+            write_pid_file("busy")
+            if line.startswith("quit"):
+                break
+            if line == "answer":
+                write_transcript("an ordinary answer", limited=False)
+                out.write("GOT:answer\r\n")
+                out.flush()
+                continue
+            if line == "winsize":
+                try:
+                    cols, rows = os.get_terminal_size()   # os.terminal_size is (columns, lines)
+                    out.write("winsize %dx%d\r\n" % (cols, rows))
+                except OSError:
+                    out.write("winsize unknown\r\n")
+                out.flush()
+                continue
+            if _MARKER.search(line) or "Write a complete handoff" in line:
+                if DROP_NEXT_FOLD[0]:
+                    # The lost-message case: the fold request is swallowed as if
+                    # it never reached the session at all.
+                    DROP_NEXT_FOLD[0] = False
+                    continue
+                fold_up(line)
+                out.write("GOT:handoff\r\n")
+                out.flush()
+                continue
+            if line == os.environ.get("FAKE_CLEAR_CMD", "/clear"):
+                # Claude Code starts a new session in place, and a new session means
+                # a new transcript. Nothing is written into it until someone speaks.
+                time.sleep(float(os.environ.get("FAKE_CLEAR_DELAY", "0")))
+                SESSION[0] = "fake-session-%d" % (int(time.time() * 1000) % 100000)
+                write_pid_file("busy")         # sessionId changed under the same pid
+                out.write("GOT:/clear\r\n")
+                out.flush()
+                continue
+            if os.environ.get("FAKE_RESUME_MATCH", "continue from it") in line:
+                write_transcript("picked the handoff up", limited=False,
+                                 tokens=int(os.environ.get("FAKE_USAGE_AFTER", "5000")),
+                                 stop_reason="end_turn")
+                out.write("GOT:resume\r\n")
+                out.flush()
+                continue
+            out.write("GOT:%s\r\n" % line)
             out.flush()
-            continue
-        if line == "winsize":
-            try:
-                cols, rows = os.get_terminal_size()   # os.terminal_size is (columns, lines)
-                out.write("winsize %dx%d\r\n" % (cols, rows))
-            except OSError:
-                out.write("winsize unknown\r\n")
-            out.flush()
-            continue
-        if _MARKER.search(line) or "Write a complete handoff" in line:
-            fold_up(line)
-            out.write("GOT:handoff\r\n")
-            out.flush()
-            continue
-        if line == os.environ.get("FAKE_CLEAR_CMD", "/clear"):
-            # Claude Code starts a new session in place, and a new session means
-            # a new transcript. Nothing is written into it until someone speaks.
-            SESSION[0] = "fake-session-%d" % (int(time.time() * 1000) % 100000)
-            out.write("GOT:/clear\r\n")
-            out.flush()
-            continue
-        if os.environ.get("FAKE_RESUME_MATCH", "continue from it") in line:
-            write_transcript("picked the handoff up", limited=False,
-                             tokens=int(os.environ.get("FAKE_USAGE_AFTER", "5000")),
-                             stop_reason="end_turn")
-            out.write("GOT:resume\r\n")
-            out.flush()
-            continue
-        out.write("GOT:%s\r\n" % line)
-        out.flush()
-    return int(os.environ.get("FAKE_EXIT", "0"))
+        return int(os.environ.get("FAKE_EXIT", "0"))
+    finally:
+        remove_pid_file()
 
 
 if __name__ == "__main__":

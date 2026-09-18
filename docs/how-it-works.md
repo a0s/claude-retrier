@@ -119,14 +119,38 @@ Windows is not supported (no pty).
 ## Tests
 
 ```sh
-./test/run.sh              # 429 tests: patterns, time parsing, transcript, model
+./test/run.sh              # 500+ tests: patterns, time parsing, transcript, model
                            # windows, update checks, state machine, the badge, custom
-                           # commands, degradation, and end-to-end runs on a real pty
+                           # commands, degradation, end-to-end runs on a real pty
                            # (rendered through a terminal emulator, so "what the user
-                           # sees" is asserted)
+                           # sees" is asserted), and two wrappers sharing one project
+                           # dir (the "wrong session's numbers" bug class)
 ./test/run.sh --docker     # the same suite on Linux, from anywhere with docker
 ./test/run.sh test_time.py # just one file
 ```
+
+Two wrappers over one project dir — the shape a "chose the wrong session's
+transcript" bug (fold on someone else's numbers, unfold lost) needs to
+reproduce — are covered by `test/test_two_wrappers.py` and
+`test/test_fake_agents.py`, built on `helper.two_wrappers()`. That helper runs
+both `fake_claude.py`/`fake_codex.py` at once in one project dir and one
+shared `CR_LOG`, filters each wrapper's own log lines by its T01 `[cr <pid>
+...]` tag, and kills the whole process tree on close — including the agent
+process, which `os.setsid()` deliberately moves out of the wrapper's own
+process group, so a plain `killpg` on the wrapper alone would leave it
+running. `fake_claude.py`'s `FAKE_SCRIPT` directives (`grow`, `dropfirstfold`,
+`synthetic`, `delayclear`, `stream`) and `fake_codex.py`'s `FAKE_POPUP` /
+`FAKE_ROLLOUT_AGE_DAYS` reproduce the scenarios those bugs need: a session
+that keeps climbing, a lost handoff reply, a `<synthetic>` row, a slow
+`/clear` ack, a mid-stream row with no `stop_reason` yet, a `$`/`/` popup that
+eats the first Enter, and an old rollout `codex resume` should still see.
+
+`./test/run.sh` ends with an orphan check (`test/check-orphans.py`): any
+process still carrying `CR_CLAUDE_ARGV` in its environment after the suite
+finished is a supervisor (or agent under it) that should have been reaped and
+was not. It reads `/proc/<pid>/environ`, so it is authoritative under
+`--docker` (Linux) and a documented no-op on macOS, where there is no portable
+equivalent.
 
 Prior art: [claude-auto-retry](https://github.com/cheapestinference/claude-auto-retry),
 whose issue tracker supplied most of the edge cases tested here.
