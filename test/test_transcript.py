@@ -31,6 +31,15 @@ def record(text, error="rate_limit", status=429, api_error=True):
 
 ORDINARY = {"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}
 
+# A "No response requested" / interrupted-request row: Claude Code writes it
+# with a model that is not a real slug and usage every counter of which is 0.
+SYNTHETIC = {"type": "assistant", "message": {
+    "role": "assistant", "model": "<synthetic>",
+    "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+              "cache_read_input_tokens": 0, "output_tokens": 0},
+    "stop_reason": "stop_sequence",
+    "content": [{"type": "text", "text": "No response requested."}]}}
+
 
 def user_row(text):
     return {"type": "user", "timestamp": "2026-08-01T18:20:45.715Z",
@@ -144,6 +153,23 @@ class TestRecordParsing(unittest.TestCase):
         self.write(ORDINARY)
         _, found = cr.transcript_limit_records(self.path, 0)
         self.assertEqual([r["kind"] for r in found], ["alive"])
+
+    def test_synthetic_row_reports_nothing_but_stays_alive(self):
+        # It still proves the account answered ("alive"), but carries no usable
+        # tokens/model/stop_reason: reading them would reset the badge to 0 and
+        # make the window lookup fail on the fake slug.
+        row = cr.assistant_row(SYNTHETIC)
+        self.assertEqual(row["kind"], "alive")
+        self.assertIsNone(row["tokens"])
+        self.assertIsNone(row["model"])
+        self.assertIsNone(row["stop_reason"])
+
+    def test_synthetic_row_through_transcript_limit_records(self):
+        self.write(SYNTHETIC)
+        _, found = cr.transcript_limit_records(self.path, 0)
+        self.assertEqual([r["kind"] for r in found], ["alive"])
+        self.assertIsNone(found[0]["tokens"])
+        self.assertIsNone(found[0]["model"])
 
     def test_a_run_of_assistant_rows_collapses_into_one(self):
         # One answer is many rows (a thought, three tool calls, a summary). The
@@ -392,6 +418,15 @@ class TestContextFigures(unittest.TestCase):
 
     def test_missing_counters_do_not_zero_the_others(self):
         self.assertEqual(cr.usage_tokens({"cache_read_input_tokens": 500}), 500)
+
+    def test_all_zero_counters_say_nothing(self):
+        # "<synthetic>" rows ("No response requested", an interrupted request)
+        # carry a real usage dict with every counter at 0. That is not a context
+        # of zero tokens; it is a row with nothing to report, same as no usage
+        # dict at all.
+        self.assertIsNone(cr.usage_tokens(
+            {"input_tokens": 0, "cache_creation_input_tokens": 0,
+             "cache_read_input_tokens": 0, "output_tokens": 0}))
 
 
 class TestModelWindows(unittest.TestCase):

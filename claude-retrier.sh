@@ -1264,9 +1264,18 @@ def assistant_row(rec):
     grew large.
     """
     msg = rec.get("message") or {}
+    model = msg.get("model")
+    if isinstance(model, str) and model.startswith("<"):
+        # "<synthetic>" etc: Claude Code's stand-in for a turn with no real
+        # model response ("No response requested", an interrupted request).
+        # The row still proves the account answered, but it carries no
+        # usable data about tokens/model/stop_reason.
+        return dict(kind="alive", ts=rec.get("timestamp"),
+                    tokens=None, model=None, stop_reason=None,
+                    sidechain=bool(rec.get("isSidechain")))
     return dict(kind="alive", ts=rec.get("timestamp"),
                 tokens=usage_tokens(msg.get("usage")),
-                model=msg.get("model"),
+                model=model,
                 stop_reason=msg.get("stop_reason"),
                 sidechain=bool(rec.get("isSidechain")))
 
@@ -2170,7 +2179,10 @@ def usage_tokens(usage):
         return None
     nums = [usage.get(k) for k in _USAGE_KEYS]
     nums = [n for n in nums if isinstance(n, (int, float)) and not isinstance(n, bool)]
-    return int(sum(nums)) if nums else None
+    if not nums:
+        return None
+    total = int(sum(nums))
+    return total if total else None
 
 
 def model_slug(model):
@@ -3827,6 +3839,8 @@ class Controller:
         """Did the context actually go away? The only evidence `/clear` landed."""
         if not self.context_before or self.context_tokens is None:
             return False
+        if self.context_tokens <= 0:
+            return False              # a zero reading is a synthetic/empty row, not a /clear
         return self.context_tokens <= self.context_before * self.RESTART_DROP
 
     def _check_resume(self, now):
