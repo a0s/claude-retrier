@@ -1866,6 +1866,7 @@ class TestTheFallbackHeuristicStaysVisible(unittest.TestCase):
         watcher.current = "/proj/a.jsonl"
         watcher.grown = ["/proj/b.jsonl"]
         watcher.preexisting = {"/proj/a.jsonl"}
+        watcher._demoted = set()
         watcher._mtime = lambda p: {"/proj/b.jsonl": 2.0}.get(p, 0.0)
         watcher._pick_current()
         self.assertEqual(watcher.current, "/proj/b.jsonl")
@@ -1880,6 +1881,7 @@ class TestTheFallbackHeuristicStaysVisible(unittest.TestCase):
         watcher.current = None
         watcher.grown = ["/proj/a.jsonl"]
         watcher.preexisting = set()
+        watcher._demoted = set()
         watcher._mtime = lambda p: 1.0
         watcher._pick_current()
         self.assertEqual(watcher.current, "/proj/a.jsonl")
