@@ -539,6 +539,33 @@ class TestAgentOverlay(PtyTestCase):
         sc = self.wait_for(s, "sonnet-5/?")
         self.assertIn("haiku-4.5/?", sc.line(self.ROW_B))
 
+    def test_a_tree_row_that_lands_on_the_badges_row_is_left_to_the_badge(self):
+        # T28: a terminal small enough (12 rows) that the last agent tree row
+        # (fake_claude's fixed AGENT_TREE_ROW3 = 12) IS the badge's own
+        # bottom-right row. Coordination now goes through the shared
+        # OccupiedRows registry, not a badge_row= computed once by name at
+        # the call site -- this is the end-to-end proof that path still
+        # avoids the collision.
+        rows, cols = 12, 120
+        e = {"CR_AGENTS_OVERLAY": "1", "CLAUDE_CONFIG_DIR": self.cfg,
+             "FAKE_AGENT_TREE": "1", "CR_POLL_SEC": "0.05", "CR_BADGE": "1"}
+        s = self.session(env=e, cwd=self.work, rows=rows, cols=cols)
+        self.assertTrue(s.read_until("winsize"))
+        deadline = time.time() + 10
+        sc = None
+        while time.time() < deadline:
+            s.drain(0.2)
+            sc = self.screen(s, rows=rows, cols=cols)
+            if "sonnet-5/?" in sc.line(self.ROW_A):
+                break
+        s.drain(1.0)      # let the badge settle on its own due() timer too
+        sc = self.screen(s, rows=rows, cols=cols)
+        self.assertIsNotNone(sc)
+        self.assertIn("sonnet-5/?", sc.line(self.ROW_A))     # row 10: no collision
+        self.assertNotIn("haiku-4.5/?", sc.line(rows))       # row 12: the badge's row
+        self.assertIn("◆ cr", sc.line(rows))                 # the badge, undisturbed
+        self.assertEqual(sc.scrolled, 0)
+
 
 class TestAgentsPanelOverlay(PtyTestCase):
     """T29: the OTHER subagent view, opened by typing /tasks while at least
