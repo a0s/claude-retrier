@@ -282,6 +282,17 @@ def main():
             "codex_error_info": os.environ.get("FAKE_STALL_INFO", "server_overloaded"),
         })
     if os.environ.get("FAKE_USAGE"):
+        # Real codex never sends a token_count outside a turn — turn_context
+        # (the model) always comes first, and a model-keyed threshold (T18's
+        # MODEL_PROFILES) cannot answer at all until one has been. Writing it
+        # alone, without task_started, announces the model without opening a
+        # turn — everything below still behaves as if nothing has happened yet.
+        write_record("turn_context", {
+            "turn_id": str(uuid.uuid4()),
+            "cwd": os.environ.get("FAKE_CWD") or os.getcwd(),
+            "model": os.environ.get("FAKE_MODEL", "gpt-5.6-sol"),
+            "effort": "high",
+        })
         # Twice, after a pause. The wrapper seeds its watcher at the size every
         # rollout file already has, so a resumed session never replays
         # yesterday's numbers — which means a record written before the

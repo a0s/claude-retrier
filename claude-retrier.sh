@@ -12,6 +12,7 @@
 #         claude-retrier.sh --agent codex --cmd codex [codex args...]
 #         codex-retrier [codex args...]          # the same file, codex by default
 #         claude-retrier.sh --cr-dump-python      # print the embedded Python (used by tests)
+#         claude-retrier.sh --cr-models           # print the model profile table (T18)
 #         claude-retrier.sh --cr-version
 #
 # `--cmd` (or CR_CLAUDE_CMD) is whatever YOU type to start the agent: a binary, a
@@ -459,7 +460,7 @@ CR_CANCEL_MSG_DEFAULT='The context restart was cancelled — the handoff is not 
 case "${1:-}" in
   --cr-version) echo "claude-retrier $CR_VERSION"; exit 0 ;;
   --cr-help|-h|--help-retrier)
-    sed -n '2,62p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
 esac
 
@@ -751,6 +752,7 @@ message into the pty — but only while the human is idle and claude is not busy
 The wait also ends early if the session starts answering again, which is the only
 evidence there is that a limit lifted before the reset it announced.
 """
+import collections
 import errno
 import fcntl
 import glob
@@ -807,26 +809,16 @@ def _env(name, default, cast=str):
 # No single number is "the" community consensus — recommendations run 40-70%,
 # with "around 60%" and "half the window" both common — but 51% is what this
 # project's own docs have suggested from the start and what every claude
-# session in its own logs has actually restarted at, so it is the one
-# CR_CONTEXT_RESTART reaches for rather than inventing a second number nobody
-# has run yet.
+# session in its own logs has actually restarted at. It no longer lives here as
+# a CFG default (see MODEL_PROFILES below, and model_restart_at) but the claude
+# entries in that table are the same 51% baked in per model instead of applied
+# blind to whatever window a session happens to report.
 DEFAULT_RESTART_PCT = 51.0
 
-# codex's OWN number, not claude's borrowed one: a flat fraction-of-window means
-# nothing on codex, which restarts against a hard cap under CR_CODEX_RESERVE_TOKENS
-# tuned specifically for this, not against "half the window". 90% mirrors codex's
-# own documented soft-compaction point (see docs/codex.md) purely as a ceiling that
-# never binds ahead of the reserve — trigger_limit() already takes the smaller of
-# the two, so as long as this stays comfortably above cap - CR_CODEX_RESERVE_TOKENS
-# the reserve is what actually decides, and this only matters as a fallback for
-# the rare case codex's own count cannot be read at all.
-DEFAULT_CODEX_RESTART_PCT = 90.0
-
-# CR_CONTEXT_PCT stays empty by default (see its declaration above) precisely so
-# this can tell "the user typed a number" apart from "nothing was ever set" —
-# collapsing both into a concrete 0 here would erase that distinction before
-# either CR_CONTEXT_RESTART's default or codex's own default could apply.
-_CONTEXT_PCT_SET = os.environ.get("CR_CONTEXT_PCT") not in (None, "")
+# CR_CONTEXT_RESTART=1 arms the restart without making you pick a number — see
+# model_restart_at for what it reaches for once armed. An explicit CR_CONTEXT_PCT
+# or CR_CONTEXT_TOKENS (0 included) still wins outright, exactly as if this flag
+# did not exist.
 _CONTEXT_RESTART_ON = _env("CR_CONTEXT_RESTART", "0") != "0"
 
 CFG = dict(
@@ -860,23 +852,19 @@ CFG = dict(
     stall_max_wait=_env("CR_STALL_MAX_WAIT_SEC", 600.0, float),
     stall_max_attempts=_env("CR_STALL_MAX_ATTEMPTS", 8, int),
     # -- context restart --
-    # CR_CONTEXT_RESTART=1 turns the restart on at DEFAULT_RESTART_PCT without
-    # making you pick a number; CR_CONTEXT_PCT, set to anything (0 included),
-    # still wins outright, exactly as if CR_CONTEXT_RESTART did not exist.
-    context_pct=_env("CR_CONTEXT_PCT",
-                     DEFAULT_RESTART_PCT if _CONTEXT_RESTART_ON else 0.0,
-                     float),
+    # An explicit number here always means exactly that number; CR_CONTEXT_RESTART
+    # arming the trigger with nothing else set is handled entirely in
+    # model_restart_at (via context_restart_on below), not by defaulting these
+    # to some percentage — a bare percentage is exactly the "one global number"
+    # MODEL_PROFILES replaced.
+    context_pct=_env("CR_CONTEXT_PCT", 0.0, float),
     context_tokens=parse_tokens(os.environ.get("CR_CONTEXT_TOKENS")) or 0,
     context_window=_env("CR_CONTEXT_WINDOW", "auto"),
+    context_restart_on=_CONTEXT_RESTART_ON,
     # None means unset, which means "the same as claude's" (see `agent_cfg`) —
     # exactly what you get from an explicit CR_CONTEXT_PCT, because a number you
-    # typed yourself is meant for both agents until told otherwise. Only when
-    # CR_CONTEXT_RESTART is the one supplying the default does codex get its own
-    # DEFAULT_CODEX_RESTART_PCT instead of inheriting claude's.
-    codex_context_pct=_env("CR_CODEX_CONTEXT_PCT",
-                           None if (_CONTEXT_PCT_SET or not _CONTEXT_RESTART_ON)
-                           else DEFAULT_CODEX_RESTART_PCT,
-                           float),
+    # typed yourself is meant for both agents until told otherwise.
+    codex_context_pct=_env("CR_CODEX_CONTEXT_PCT", None, float),
     codex_context_tokens=(None if not os.environ.get("CR_CODEX_CONTEXT_TOKENS")
                           else parse_tokens(os.environ["CR_CODEX_CONTEXT_TOKENS"]) or 0),
     codex_hold_compact=_env("CR_CODEX_HOLD_COMPACT", "1") != "0",
@@ -2215,32 +2203,65 @@ class TranscriptWatcher:
 # then they are inside cache_creation.
 _USAGE_KEYS = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 
-# Native context window per model slug. The transcript writes the slug clean —
-# "claude-opus-5", no [1m] suffix — so a table answers it with no network call
-# and no guessing from the numbers themselves.
-#
-# Guessing LOW is the safe direction and the table leans that way: a window
-# assumed too small restarts a little early, one assumed too large never
-# restarts at all, and "never" is the failure that is invisible until the
-# session dies of a full context.
-CONTEXT_WINDOWS = {
-    "claude-opus-5": 1000000,
-    "claude-opus-4-8": 1000000,
-    "claude-opus-4-7": 1000000,
-    "claude-opus-4-6": 1000000,
-    "claude-sonnet-5": 1000000,
-    "claude-sonnet-4-6": 1000000,
-    "claude-fable-5": 1000000,
-    "claude-fable-5-1": 1000000,
-    "claude-mythos-5": 1000000,
-    "claude-mythos-5-1": 1000000,
-    "claude-opus-4-5": 200000,
-    "claude-opus-4-1": 200000,
-    "claude-sonnet-4-5": 200000,
-    "claude-haiku-4-5": 200000,
-}
+# --------------------------------------------------------------------------- #
+# model profiles — window, restart threshold, and where the agent compacts on
+# its own (T18)
+# --------------------------------------------------------------------------- #
+# One row states three things this file used to keep in three different
+# places: the window (used to live alone in CONTEXT_WINDOWS, claude only), the
+# restart threshold (used to be one global percentage, DEFAULT_RESTART_PCT /
+# DEFAULT_CODEX_RESTART_PCT), and the point the agent folds the context on its
+# own (a comment, or codex's `codex_cap` read live from its log). `since` is
+# when a row was last checked against the model's own docs — models move, and
+# a stale row needs to be findable.
+Profile = collections.namedtuple(
+    "Profile", "window restart_at compact_at since note",
+    defaults=(None, "2026-09-18", ""))
+
 SMALL_WINDOW = 200000
 BIG_WINDOW = 1000000
+
+# claude: restart_at is the same 51% (DEFAULT_RESTART_PCT) this project has
+# always used, now baked in per model rather than applied blind to whatever
+# window a session happens to report. compact_at is Claude Code's own
+# auto-compact point: "~967K" for the 1M family per its docs; nothing that
+# precise is published for the 200k family, so ~0.95 of the window stands in.
+_BIG_CLAUDE = ("claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-mythos-5",
+              "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6")
+_SMALL_CLAUDE = ("claude-opus-4-5", "claude-opus-4-1", "claude-sonnet-4-5", "claude-haiku-4-5")
+
+# codex: from ~/.codex/models_cache.json on codex 0.154, window is EFFECTIVE
+# (context_window × effective_context_window_percent) = 258,400, not the raw
+# 272k. restart_at is that window minus the reserve this project already tuned
+# for it (CR_CODEX_RESERVE_TOKENS, 64k) — model_restart_at reclamps against the
+# live value of that knob rather than trusting this frozen number. compact_at
+# is the hard cap (== window): codex's softer 90%-of-raw-window compaction
+# (244,800) only applies with CR_CODEX_HOLD_COMPACT=0, and the hard cap is what
+# binds under this wrapper's default of holding that back.
+_CODEX_5_6 = ("gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5")
+_CODEX_NOTE = ("hard cap; the softer 244,800 (90% of the raw window) applies "
+              "only with CR_CODEX_HOLD_COMPACT=0. max_context_window is "
+              "872,000 for sol/terra/luna/astra — raising model_context_window "
+              "in config.toml makes the rollout report a window this profile "
+              "was not written for; model_restart_at then sits this out.")
+
+MODEL_PROFILES = {
+    "claude": dict(
+        [(slug, Profile(BIG_WINDOW, int(BIG_WINDOW * DEFAULT_RESTART_PCT / 100), 967000))
+         for slug in _BIG_CLAUDE] +
+        [(slug, Profile(SMALL_WINDOW, int(SMALL_WINDOW * DEFAULT_RESTART_PCT / 100),
+                        int(SMALL_WINDOW * 0.95)))
+         for slug in _SMALL_CLAUDE]),
+    "codex": {slug: Profile(258400, 194400, 258400, note=_CODEX_NOTE) for slug in _CODEX_5_6},
+}
+
+# Native context window per model slug, the way model_window() has always
+# looked it up — sourced from MODEL_PROFILES now instead of kept separately.
+# Guessing LOW is still the safe direction: a window assumed too small
+# restarts a little early, one assumed too large never restarts at all, and
+# "never" is the failure that is invisible until the session dies of a full
+# context.
+CONTEXT_WINDOWS = {slug: p.window for slug, p in MODEL_PROFILES["claude"].items()}
 
 # codex keeps this much of every window out of its "Context N% used": the system
 # prompt and tools a session carries before anyone has said anything. Its status
@@ -2295,7 +2316,8 @@ def codex_launch_args(cfg):
     """Arguments put in front of the user's own when the wrapper starts codex."""
     if cfg.get("agent") != "codex" or not cfg.get("codex_hold_compact", True):
         return []
-    if cfg.get("context_pct", 0) <= 0 and cfg.get("context_tokens", 0) <= 0:
+    if (cfg.get("context_pct", 0) <= 0 and cfg.get("context_tokens", 0) <= 0
+            and not cfg.get("context_restart_on")):
         return []                    # nothing is racing codex, so leave it be
     return list(CODEX_HOLD_ARGS)
 
@@ -2349,6 +2371,44 @@ def model_window(model):
     return None
 
 
+def model_restart_at(agent, slug, window):
+    """The one remaining stage of the threshold order `_recompute_limit` does
+    not already cover on its own: the model's own profile. Full order, top to
+    bottom:
+
+      1. CR_<AGENT>_TOKENS_<SLUG>            (`_model_tokens_override`)
+      2. CR_CONTEXT_TOKENS / CR_CODEX_CONTEXT_TOKENS
+      3. CR_CONTEXT_PCT / CR_CODEX_CONTEXT_PCT × window
+      4. this: MODEL_PROFILES[agent][slug].restart_at, armed by CR_CONTEXT_RESTART=1
+      5. nothing — an unmatched model with no explicit number stays disarmed
+         rather than guessing (T19 is where that gets a real fallback)
+
+    Stages 1-3, and whether CR_CONTEXT_RESTART=1 armed stage 4 at all, are the
+    caller's job (`cfg["context_restart_on"]`, already agent-resolved by
+    `agent_cfg`) — this function is only ever reached once all of that is
+    settled, so it does not re-check the flag itself.
+
+    Only fires when `window` is the EXACT window the profile was written
+    against: a model whose window has been raised past what the profile
+    assumes (`model_context_window` in codex's config.toml, an explicit
+    CR_CONTEXT_WINDOW) is a model this row no longer describes, and guessing a
+    number for it is exactly the mistake T19 exists to fix properly.
+
+    Whatever this returns is reclamped under `compact_at - reserve` using the
+    LIVE value of CR_CODEX_RESERVE_TOKENS, not the frozen number baked into the
+    profile — that knob is one the profile has no way to see.
+    """
+    prof = MODEL_PROFILES.get(agent, {}).get(slug)
+    if not prof or prof.window != window:
+        return None
+    candidate = prof.restart_at
+    if prof.compact_at:
+        reserve = (parse_tokens(os.environ.get("CR_CODEX_RESERVE_TOKENS") or "64k") or 0) \
+            if agent == "codex" else 0
+        candidate = min(candidate, prof.compact_at - reserve)
+    return max(0, int(candidate))
+
+
 def human_tokens(n):
     if n is None:
         return "?"
@@ -2357,6 +2417,56 @@ def human_tokens(n):
     if n >= 1000:
         return "%dk" % (n // 1000)
     return str(int(n))
+
+
+def _cr_models_rows():
+    """(agent, slug, window, restart_at, compact_at, source) for every entry in
+    MODEL_PROFILES, resolved against THIS process's environment — the same
+    order `_recompute_limit` runs, for a session that would be running that
+    model at its profile's own window, without ever opening one. `--cr-models`
+    is the only caller; it exists so a person can check what the wrapper
+    thinks about their model without starting a session.
+    """
+    rows = []
+    for agent in ("claude", "codex"):
+        cfg = agent_cfg(CFG, agent)
+        base = CODEX_BASELINE_TOKENS if agent == "codex" else 0
+        for slug in sorted(MODEL_PROFILES.get(agent, {})):
+            prof = MODEL_PROFILES[agent][slug]
+            window = prof.window
+            over_name = "CR_%s_TOKENS_%s" % ("CODEX" if agent == "codex" else "CLAUDE",
+                                             model_env_slug(slug))
+            over = parse_tokens(os.environ.get(over_name))
+            if over:
+                restart_at, source = over, over_name
+            elif cfg["context_tokens"] > 0:
+                restart_at = int(cfg["context_tokens"])
+                source = "CR_CODEX_CONTEXT_TOKENS" if agent == "codex" else "CR_CONTEXT_TOKENS"
+            elif cfg["context_pct"] > 0 and window > base:
+                restart_at = int(base + (window - base) * cfg["context_pct"] / 100.0)
+                source = "CR_CODEX_CONTEXT_PCT" if agent == "codex" else "CR_CONTEXT_PCT"
+            elif cfg.get("context_restart_on"):
+                restart_at = model_restart_at(agent, slug, window)
+                source = "CR_CONTEXT_RESTART" if restart_at is not None else "disarmed"
+            else:
+                restart_at, source = None, "off"
+            rows.append((agent, slug, window, restart_at, prof.compact_at, source))
+    return rows
+
+
+def print_models_table(out=None):
+    out = out or sys.stdout
+    headers = ("agent", "model", "window", "restart_at", "compact_at", "source")
+    lines = [headers]
+    for agent, slug, window, restart_at, compact_at, source in _cr_models_rows():
+        lines.append((agent, slug, human_tokens(window), human_tokens(restart_at),
+                      human_tokens(compact_at), source))
+    widths = [max(len(row[i]) for row in lines) for i in range(len(headers))]
+    for i, row in enumerate(lines):
+        out.write("  ".join(cell.ljust(w) for cell, w in zip(row, widths)).rstrip() + "\n")
+        if i == 0:
+            out.write("  ".join("-" * w for w in widths) + "\n")
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -3444,7 +3554,8 @@ class Controller:
     @property
     def context_enabled(self):
         return not self.context_off and (
-            self.cfg["context_tokens"] > 0 or self.cfg["context_pct"] > 0)
+            self.cfg["context_tokens"] > 0 or self.cfg["context_pct"] > 0
+            or self.cfg.get("context_restart_on", False))
 
     def context_pct(self):
         """How full, in the accounting of the agent's own status line."""
@@ -3850,6 +3961,13 @@ class Controller:
         elif self.cfg["context_pct"] > 0 and self.context_window and self.context_window > base:
             self.context_limit = int(base + (self.context_window - base)
                                      * self.cfg["context_pct"] / 100.0)
+        elif self.cfg.get("context_restart_on") and self.context_window:
+            # Stage 4 of the order documented on model_restart_at: nothing more
+            # specific than the bare flag has answered the question, so the
+            # model's own profile does, or nothing does.
+            self.context_limit = model_restart_at(
+                "codex" if self.codex else "claude",
+                model_slug(self.context_model), self.context_window)
         else:
             self.context_limit = None
 
@@ -5255,7 +5373,8 @@ def main(argv):
     run_cfg = agent_cfg(CFG, agent_name)
     session_id = os.urandom(4).hex()
     handoff_registry = None
-    if run_cfg["context_tokens"] > 0 or run_cfg["context_pct"] > 0:
+    if (run_cfg["context_tokens"] > 0 or run_cfg["context_pct"] > 0
+            or run_cfg.get("context_restart_on")):
         # A custom phrase that drops {file} cannot carry a per-session handoff
         # path — worth one line in the log, once, rather than a silent fold
         # into a path nobody told the model about (T05).
@@ -5353,7 +5472,8 @@ def main(argv):
         log("context restart armed: handoff -> %s, %s"
             % (ctl.handoff_path,
                ("%d tokens" % ctl.cfg["context_tokens"]) if ctl.cfg["context_tokens"] > 0
-               else "%g%% of the window" % ctl.cfg["context_pct"]))
+               else ("%g%% of the window" % ctl.cfg["context_pct"]) if ctl.cfg["context_pct"] > 0
+               else "the model's own profile"))
         # The Write tool would create it, but a directory that is already there
         # is one fewer thing for the folding turn to get wrong.
         parent = os.path.dirname(ctl.handoff_path)
@@ -5758,6 +5878,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--cr-models"]:
+        # A pure lookup, not a session: no pty, no fork, nothing to supervise.
+        sys.exit(print_models_table())
     code = main(sys.argv[1:])
     # waitstatus_to_exitcode reports a signal death as a negative number, which
     # sys.exit would turn into 255. Report it the way a shell does.
@@ -5787,6 +5910,23 @@ case "${1:-}" in
       eval "printf '### CR_PAT_%s\n%s\n' \"\$_n\" \"\$CR_PAT_$_n\""
     done
     exit 0 ;;
+  --cr-models)
+    # A lookup, not a session — no claude/codex needs to be installed for
+    # this. Whatever CR_* the caller already exported reaches python exactly
+    # as it would for a real run: nothing here needs re-exporting.
+    CR_PYTHON_BIN=$(cr_find_python) || {
+      echo "claude-retrier: no usable python3 found" >&2
+      exit 1
+    }
+    CR_MODELS_TMP=$(mktemp "${TMPDIR:-/tmp}/claude-retrier.XXXXXX") || {
+      echo "claude-retrier: cannot write a temporary file" >&2
+      exit 1
+    }
+    printf '%s' "$CR_PY" >"$CR_MODELS_TMP"
+    "$CR_PYTHON_BIN" "$CR_MODELS_TMP" --cr-models
+    CR_MODELS_RC=$?
+    rm -f "$CR_MODELS_TMP"
+    exit "$CR_MODELS_RC" ;;
 esac
 
 # ---- degrade paths: any of these and we run claude untouched -----------------

@@ -36,11 +36,14 @@ CR_CONTEXT_PCT=51 claude-retrier          # restart at 51% of the context window
 ```
 
 `CR_CONTEXT_RESTART=1` is the same thing without having to pick a number: it
-turns the restart on at 51% (`DEFAULT_RESTART_PCT`, half the window and this
-project's own long-standing recommendation) for claude, unless `CR_CONTEXT_PCT`
-or `CR_CONTEXT_TOKENS` says otherwise. Codex does **not** inherit that 51% —
-its own hard cap and reserve already give it a number of its own, tuned for
-that cap rather than borrowed from claude's window; see
+arms the model's own row in the [profile table](#the-context-window) instead —
+`--cr-models` prints exactly what that resolves to for your environment — unless
+`CR_CONTEXT_PCT` or `CR_CONTEXT_TOKENS` says otherwise. For the claude models
+this project has always shipped 1M/200k windows for, that row's `restart_at` is
+the same 51% (`DEFAULT_RESTART_PCT`) it has always used, just baked in per
+model now instead of applied blind to whatever window a session happens to
+report. Codex's row is not a percentage at all — its own hard cap and reserve
+already give it a number of its own; see
 [codex](codex.md#context-restart-on-codex) for what actually decides codex's
 threshold under this flag.
 
@@ -238,7 +241,45 @@ two is set.
 export CR_CLAUDE_TOKENS_CLAUDE_HAIKU_4_5=90000   # this one model folds sooner
 ```
 
+Putting all of the above together, the full order a threshold is resolved in,
+top to bottom, is:
+
+1. `CR_CLAUDE_TOKENS_<SLUG>` / `CR_CODEX_TOKENS_<SLUG>` — one exact model.
+2. `CR_CONTEXT_TOKENS` / `CR_CODEX_CONTEXT_TOKENS` — an absolute number, never
+   shared between agents (codex never inherits claude's).
+3. `CR_CONTEXT_PCT` / `CR_CODEX_CONTEXT_PCT` × the window.
+4. the model's own row in the [profile table](#the-context-window), armed by
+   `CR_CONTEXT_RESTART=1`, and only when the window matches what that row was
+   written for.
+5. nothing — a model this build has never heard of, with no explicit number
+   from you, stays disarmed rather than guessing.
+
+Whatever (4) answers is always capped under that row's `compact_at` minus
+`CR_CODEX_RESERVE_TOKENS` (0 for claude), read live rather than trusted frozen
+into the table.
+
 ## The context window
+
+Every model this build knows about is one row in a profile table — window,
+where the wrapper restarts by default, and where the agent folds the context
+on its own (`compact_at`, used only for the capping in stage 4 above).
+`--cr-models` prints it resolved against your actual environment:
+
+```
+$ CR_CONTEXT_RESTART=1 claude-retrier.sh --cr-models
+agent   model              window  restart_at  compact_at  source
+------  -----------------  ------  ----------  ----------  ------------------
+claude  claude-opus-5      1.0M    510k        967k        CR_CONTEXT_RESTART
+claude  claude-haiku-4-5   200k    102k        190k        CR_CONTEXT_RESTART
+...
+codex   gpt-5.6-sol        258k    194k        258k        CR_CONTEXT_RESTART
+```
+
+| models | window | restart_at | compact_at |
+|---|---|---|---|
+| opus/sonnet/fable/mythos 5, opus 4-6/4-7/4-8, sonnet 4-6 | 1M | 510k (51%) | ~967k (Claude Code's own auto-compact point) |
+| opus 4-1/4-5, sonnet 4-5, haiku 4-5 | 200k | 102k (51%) | ~190k |
+| codex 5.6 (sol/terra/luna/astra) and 5.5 | 258.4k (effective) | 194.4k (cap − 64k reserve) | 258.4k (hard cap) |
 
 `CR_CONTEXT_WINDOW=auto` reads the model slug out of the transcript and looks
 it up. It narrows to 200k if `CLAUDE_CODE_DISABLE_1M_CONTEXT` or
@@ -246,7 +287,9 @@ it up. It narrows to 200k if `CLAUDE_CODE_DISABLE_1M_CONTEXT` or
 with, and it widens if the session is ever seen past the window it assumed.
 Name a number if your setup narrows the window some way the wrapper cannot see.
 (On codex the window is read from the rollout, and `CR_CONTEXT_WINDOW` is not
-needed.)
+needed — which is also why raising `model_context_window` in codex's
+`config.toml` past what the profile table lists moves the window the wrapper
+sees, and the table's row for that model stops applying; see stage 4 above.)
 
 A model the built-in table does not list is not guessed at. A point release
 resolves to its family (`claude-fable-5-1` is whatever `claude-fable-5` is), and
