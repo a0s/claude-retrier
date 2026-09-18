@@ -986,6 +986,24 @@ class TestTheClearHasToHaveWorked(RestartTestCase):
         self.assertEqual(self.tick(ctl, 130)[0], "notify")
         self.assertTrue(ctl.context_off)
 
+    def test_a_zero_reading_does_not_complete_a_restart(self):
+        # A "<synthetic>"/no-usage row on the new transcript reads as
+        # tokens=0, not as "the context is empty". Reading it as a fall would
+        # end the restart on a row that never actually measured anything, with
+        # no real `/clear` verification behind it.
+        ctl = restart_controller()
+        self.unfolding(ctl)
+        moved(ctl, "/proj/after.jsonl", 72)
+        usage(ctl, 72, 0, path="/proj/after.jsonl")
+        self.assertIsNone(self.tick(ctl, 73))
+        self.assertEqual(ctl.rstate, cr.RESUME_SENT)
+        # A real answer on the same transcript still completes it.
+        usage(ctl, 80, 55000, path="/proj/after.jsonl")
+        action = self.tick(ctl, 81)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("restarted", action[1])
+        self.assertIsNone(ctl.rstate)
+
 
 class TestTheLimitOutranksTheContext(RestartTestCase):
     """A session that is out of quota is stopped either way, so there is nothing
@@ -1174,6 +1192,34 @@ class TestWhatCountsAsContext(RestartTestCase):
         self.assertIsNone(ctl.context_window)
         self.assertIsNone(ctl.context_limit)
         self.assertEqual(ctl.window_unknown, "claude-something-9")
+
+    def test_a_synthetic_row_between_two_real_ones_is_not_a_model_change(self):
+        # "<synthetic>" ("No response requested", an interrupted request) sits
+        # between two real rows in the transcript. `assistant_row` already
+        # reports its model as None, and here that must not read as "the model
+        # changed": no `_resolve_window` re-run and no "unfamiliar model slug"
+        # log noise over a row that never named a model at all.
+        ctl = restart_controller(context_window="auto")
+        usage(ctl, 0, 10, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 1000000)
+        logged_before = len(ctl.log_lines)
+
+        synthetic = cr.assistant_row({"message": {
+            "model": "<synthetic>",
+            "usage": {"input_tokens": 0, "cache_creation_input_tokens": 0,
+                      "cache_read_input_tokens": 0, "output_tokens": 0},
+            "stop_reason": "stop_sequence"}})
+        self.assertIsNone(synthetic["model"])
+        ctl.on_context(dict(synthetic, path=MINE), 5)
+
+        self.assertEqual(ctl.context_window, 1000000)      # untouched
+        self.assertIsNone(ctl.window_unknown)
+        new_logs = ctl.log_lines[logged_before:]
+        self.assertFalse(any("unfamiliar model slug" in ln for ln in new_logs))
+        self.assertFalse(any("context is" in ln for ln in new_logs))
+
+        usage(ctl, 10, 20, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 1000000)
 
     def test_a_point_release_is_its_familys_window(self):
         # The actual bug: claude-fable-5-1 is a 1M model, the table knew only
