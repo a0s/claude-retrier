@@ -1,171 +1,287 @@
 # claude-retrier Plans.md
 
-Создан 2026-09-18 из `docs/backlog/` (T01–T26, аудит 1.11.0 + 4
-незарелизенных коммита; T27 добавлена тем же днём по отдельному расследованию
-рендера дерева субагентов). Task-нумерация = ID бэклога (`T01`…`T27`); полные
-Проблема/Улики/Что сделать/AC/Где-в-коде — в соответствующем
-`docs/backlog/T##-*.md`, DoD здесь — сжатая, проверяемая версия. Спек: `docs/spec/00-project-spec.md`.
+Created on 2026-09-18 from `docs/backlog/` (T01–T26, 1.11.0 audit + 4
+unreleased commits; T27 was added the same day after a separate investigation
+of subagent-tree rendering). Task numbering equals backlog IDs (`T01`…`T27`);
+full Problem/Evidence/What to do/AC/Where in code are in the corresponding
+`docs/backlog/T##-*.md`; the DoD here is a compact, verifiable version. Spec:
+`docs/spec/00-project-spec.md`.
 
 Spec delta:
 - path: docs/spec/00-project-spec.md
-- change: создан root spec с 4 инвариантными блоками (identity / model
-  profile / restart machine G1–G8 / limits) — раньше эта модель жила только
-  в `docs/backlog/README.md` как неформальный аудит.
-- why: 22 из 26 задач меняют user-visible поведение (какая сессия чья, когда
-  рестарт, что видно в бейдже) и без зафиксированного contract реализация
-  могла разойтись с логической моделью аудита.
+- change: created a root spec with 4 invariant blocks (identity / model profile / restart machine G1–G8 / limits); previously this model existed only in `docs/backlog/README.md` as an informal audit.
+- why: 22 of 26 tasks change user-visible behavior (session ownership, restart timing, badge contents), and without a fixed contract implementation could diverge from the audit model.
 
-Team validation: `team_validation_mode: manual-pass` (Task-агент доступен, но
-не запускался: исходный аудит уже даёт log-evidence по каждой задаче —
-повторное discovery-ревью того же материала пятью персонами избыточно).
-Перспективы ниже — однопроходная само-проверка, не параллельные агенты.
+Team validation: `team_validation_mode: manual-pass` (the Task agent is available but was not run: the original audit already provides log evidence for each task; repeating discovery review with five personas would be redundant). The perspectives below are a one-pass self-check, not parallel agents.
 
-- **Product**: закрывает наблюдаемые пользователем баги (fold по чужим
-  цифрам, мёртвая сессия после abort, рестарт каждые 30–40 мин) — высокий
-  Product Fit.
-- **Architecture**: вводит единственную точку смены транскрипта
-  (`bind_transcript`) и единственную структуру профилей моделей — снижает, а
-  не увеличивает поверхность состояния; T02→T04→T06 — правильный порядок
-  (identity раньше path-bound сигналов раньше echo-верификации).
-- **Security**: секретов не читает; T24 требует внешней отправки (git push,
-  gh release, homebrew tap) — вынесено в «Событие для подтверждения» ниже.
-- **QA**: каждая T-задача уже несёт AC с конкретными юнит/pty-тестами;
-  `test/run.sh` — floor для каждой; T26 (двухсессионная test-инфраструктура)
-  сознательно ведётся параллельно с Phase 1, а не после неё (см. Depends).
-- **Skeptic**: T15 и T20 содержат непроверенное вживую поведение (codex
-  `$skill` popup, `--settings` merge/replace) — оба помечены `unknown` в
-  spec и не должны блокировать остальной Phase 1/2, если конкретно эти два
-  расследования уйдут дольше.
+- **Product**: addresses user-visible bugs (folding with another session's numbers, dead session after abort, restarts every 30–40 minutes) — high Product Fit.
+- **Architecture**: introduces one transcript-switch point (`bind_transcript`) and one model-profile structure, reducing the state surface; T02→T04→T06 is the correct order (identity, path-bound signals, then echo verification).
+- **Security**: reads no secrets; T24 requires external sending (git push, gh release, homebrew tap), covered by the confirmation event below.
+- **QA**: each T-task carries AC with unit/pty tests; `test/run.sh` is the floor; T26 (two-session test infrastructure) intentionally runs in parallel with Phase 1 (see Depends).
+- **Skeptic**: T15 and T20 contain behavior not tested live (codex `$skill` popup, `--settings` merge/replace); both are `unknown` in the spec and should not block Phase 1/2.
 
 formatter_baseline: missing
-formatter_baseline_evidence: нет `.shellcheckrc`/`pyproject.toml`/lint-шага в `.github/workflows/test.yml`; только `./test/run.sh`.
-formatter_baseline_action: skip_with_reason — bash+Python-heredoc в одном файле, задачи бэклога не меняют стиль кода, вводить lint-инфраструктуру этим бэклогом не запрошено.
+formatter_baseline_evidence: no `.shellcheckrc`/`pyproject.toml`/lint step in `.github/workflows/test.yml`; only `./test/run.sh`.
+formatter_baseline_action: skip_with_reason — bash+Python-heredoc in one file; backlog tasks do not change code style, and lint infrastructure was not requested.
 
-## Событие для подтверждения (pre-approval, T24)
+## Event requiring confirmation (pre-approval, T24)
 
-- событие: `external-send` — `git push --tags`, `gh release create`, обновление формулы в соседнем репозитории `homebrew-claude-retrier` (новый tarball URL + sha256)
-  причина: релизная процедура проекта требует публикации тега/релиза и синхронной формулы (память проекта: тег без формулы = релиз не сделан)
+- event: `external-send` — `git push --tags`, `gh release create`, updating the formula in adjacent `homebrew-claude-retrier` (new tarball URL + sha256)
+  reason: release procedure requires publishing a tag/release and synchronized formula (a tag without a formula is not a release)
   scope: Phase 8 / T24
 
 ---
 
-## Phase 0: Наблюдаемость субагентов (Эпик F)
+## Phase 0: Subagent observability (Epic F)
 
-Purpose: сессия с `harness-loop` тратит квоту на дереве субагентов, про которое TUI не сообщает ни модели, ни effort, ни стоимости (апстрим закрыл запрос как «not planned»). Обёртка — единственный наблюдатель, способный это показать. Поставлено первым по явному требованию пользователя; технически от Phase 1 не зависит.
+Purpose: a `harness-loop` session spends quota on a subagent tree that the TUI does not report by model, effort, or cost (upstream marked the request “not planned”). The wrapper is the only observer able to show this. It was placed first at the user's request and does not technically depend on Phase 1.
 
-| Task | Содержание | DoD | Depends | Status |
+| Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| T29 | `[lane:gate]` `[tdd:required]` Оверлей на развёрнутой панели агентов — том дереве, что реально держит перед глазами пользователь и которое не схлопывается само; живой повторный захват (метод T27) + распознавание строк панели. Живое расследование опровергло исходную гипотезу: `←` из футера открывает не субагентов, а межсессионный ростер (чужие сессии) — экран, который `CR_ROSTER_PATTERNS` никогда не трогает; реальный, воспроизводимый способ — команда `/tasks`, формат строк `<label> (running\|done) · <Model>` (не `○ Explore label · tokens` со скриншота, который не воспроизведён за 5 живых попыток) | Все AC T29 зелёные (новая фикстура `agents-panel-2.1.273.bin`; `find_panel_agent_rows` находит каждую строку панели, не путает с заголовком `Local agents (N)`; `CR_AGENTS_OVERLAY=1` даёт видимую подпись модели в панели, открытой `/tasks`, живьём через `test_pty.py`; `screen.scrolled == 0`); открытые вопросы T27/T29 про `←`/`↓` закрыты по факту захвата; `./test/run.sh` зелёный | T27 | cc:完了 [ccee293] |
-| T28 | `[lane:gate]` `[tdd:required]` Перенести `Badge` на общий с `AgentOverlay` примитив отрисовки (`DECSC→CUP→SGR→текст→DECRC`, колонка от финальной дополненной ширины) вместо двух дублирующих реализаций и ручной передачи `badge_row`; общий реестр занятых строк на кадр | Все AC T28 зелёные (`test_badge.py` и `test_agents.py` — без изменений ожидаемых байтов; новый тест доказывает, что оба рисовальщика используют один и тот же примитив, а не совпадающие числа; координация через общий реестр строк, не через `badge_row` по имени); открытый вопрос «создаётся ли `Screen` по умолчанию» закрыт явным решением; `./test/run.sh` зелёный | T27 | cc:TODO |
-| T27 | `[lane:gate]` `[tdd:required]` Эмулятор экрана (`Screen`) в супервизоре из `test/screen.py` + `find_agent_rows` по сетке + `SubagentRegistry` (`subagents/agent-*.{jsonl,meta.json}`) + `AgentOverlay`, рисующий `sonnet-5/?` у правого края строки агента и возвращающий подпись после каждого кадра `ESC[?2026l` | Все AC T27 зелёные (модель только из `agent-<id>.jsonl`, не из инпута тула; последняя колонка не трогается; `screen.scrolled == 0`; `CR_AGENTS_OVERLAY=0` не даёт ни одного лишнего байта); новый `test/fake_claude.py`-сценарий воспроизводит захваченную геометрию дерева; `--cr-help` содержит все четыре новые переменные; `./test/run.sh` зелёный | - | cc:完了 [2ee1e58] |
+| T29 | `[lane:gate]` `[tdd:required]` Overlay on the expanded agent panel; live recapture (T27 method) and row recognition. Investigation disproved the original hypothesis: `←` opens the cross-session roster, not subagents; the reproducible method is `/tasks`, rows `<label> (running\|done) · <Model>` | All AC green: new `agents-panel-2.1.273.bin`; `find_panel_agent_rows` finds every row without `Local agents (N)`; `CR_AGENTS_OVERLAY=1` labels the model through `test_pty.py`; `screen.scrolled == 0`; T27/T29 `←`/`↓` questions closed; `./test/run.sh` green | T27 | cc:完了 [ccee293] |
+| T28 | `[lane:gate]` `[tdd:required]` Move `Badge` to the primitive shared with `AgentOverlay` (`DECSC→CUP→SGR→text→DECRC`) and use one per-frame occupied-row registry | All AC green; expected bytes unchanged; shared primitive and registry proven by tests; `Screen` default behavior resolved; `./test/run.sh` green | T27 | cc:done [b83d0d1] |
+| T27 | `[lane:gate]` `[tdd:required]` `Screen` emulator from `test/screen.py`, grid `find_agent_rows`, `SubagentRegistry` (`subagents/agent-*.{jsonl,meta.json}`), and `AgentOverlay` drawing `sonnet-5/?` at the row edge after each `ESC[?2026l` frame | Model only from `agent-<id>.jsonl`; final column untouched; no scroll; overlay-off adds no bytes; fake scenario reproduces geometry; `--cr-help` includes four variables; tests green | - | cc:done [2ee1e58] |
 
-## Phase 1: Идентичность сессии и целостность сигналов (Эпик A, часть B)
+## Phase 1: Session identity and signal integrity (Epic A, part B)
 
-Purpose: убрать корневую причину «fold по чужим цифрам» и «unfold теряется» — без этого остальные эпики чинят симптомы, а не причину.
+Purpose: remove the root cause of folding with another session's numbers and losing unfold.
 
-| Task | Содержание | DoD | Depends | Status |
+| Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| T01 | `[lane:gate]` `[tdd:required]` Тег `[cr <pid> <agent>]` в каждой строке `Logger`; `start:`/`exit:` несут cwd и длительность | Формат строки соответствует AC T01; новый тест в `test_pty.py` (две обёртки, один `CR_LOG`, `grep` по pid даёт связную последовательность); `./test/run.sh` зелёный | - | cc:完了 [fe4df9d] |
-| T26 | `[lane:gate]` `[tdd:required]` Тестовая инфраструктура для двух сессий в одном project-dir (`fake_claude`/`fake_codex` сценарии, `helper.two_wrappers`, проверка на сирот в `run.sh`) | `two_wrappers` используется минимум в 3 тестах, 10 прогонов подряд < 60с без флапа; `run.sh` печатает `FAILURES` при оставленном сироте; `./test/run.sh` зелёный | T01 | cc:完了 [d3ea768] |
-| T02 | `[lane:gate]` `[tdd:required]` Claude: привязка транскрипта через `~/.claude/sessions/<pid>.json` (`ClaudeSessionRegistry`, `TranscriptWatcher.bind`), живая проверка на Claude Code ≥2.1.273 | Все юнит- и pty-тесты AC T02 зелёные; раздел «Проверено» в T02 заполнен; `docs/context-restart.md` Caveats про «файл, который вырос последним» переписан; `./test/run.sh` зелёный | T01, T26 | cc:TODO |
-| T04 | `[lane:gate]` `[tdd:required]` Контроллер: `bind_transcript` — единственная точка смены транскрипта; `on_echo`/`on_resume_echo`/`on_alive`/`on_turn_done` фильтруются по `path == watcher.current` | Все тесты AC T04 зелёные (чужой echo/alive не влияет, `bind_transcript` сбрасывает per-transcript state); лог не содержит строк про окно при flip-flop; `./test/run.sh` зелёный | T01, T02 | cc:TODO |
-| T05 | `[lane:gate]` `[tdd:required]` Уникальный handoff-файл на сессию (`{id}` в `CR_HANDOFF_FILE` или реестр `~/.claude-retrier/sessions/<pid>.json` с авто-суффиксом) | Все тесты AC T05 зелёные (авто-суффикс при коллизии, мёртвый pid не считается занятым, предупреждение об отсутствии `{file}` печатается один раз); `./test/run.sh` зелёный | T01 | cc:TODO |
-| T10 | `[lane:gate]` `[tdd:required]` Игнорировать `<synthetic>`/нулевые usage-строки в `assistant_row`/`usage_tokens`/`on_context`/`_context_fell` | Все тесты AC T10 зелёные (synthetic → `tokens=None,model=None`; `_context_fell` требует `context_tokens>0`); `./test/run.sh` зелёный | - | cc:TODO |
-| T11 | `[lane:gate]` `[tdd:required]` Схлопывание assistant-строк не теряет `end_turn` и не путает sidechain | Все тесты AC T11 зелёные (`[end_turn, None]` → `end_turn`; root+sidechain → 2 записи); `./test/run.sh` зелёный | - | cc:TODO |
-| T06 | `[lane:gate]` `[tdd:required]` Echo-верификация fold-фразы (`watcher.expect/forget`, `on_handoff_echo`) как единственное подтверждение привязки и предпосылка `/clear` | Все тесты AC T06 зелёные (нет echo 60с → повтор → abort после 2; echo из другого path → перепривязка; `/clear` не уходит без `handoff_echoed`); `./test/run.sh` зелёный | T02, T04 | cc:TODO |
+| T01 | `[lane:gate]` `[tdd:required]` `[cr <pid> <agent>]` on every `Logger` line; `start:`/`exit:` include cwd and duration | AC format and two-wrapper pty test pass; `./test/run.sh` green | - | cc:完了 [fe4df9d] |
+| T26 | `[lane:gate]` `[tdd:required]` Two sessions in one project-dir (`fake_claude`/`fake_codex`, `helper.two_wrappers`, orphan check) | Used in 3+ tests; 10 runs under 60s; orphan produces `FAILURES`; tests green | T01 | cc:完了 [d3ea768] |
+| T02 | `[lane:gate]` `[tdd:required]` Claude transcript binding via `~/.claude/sessions/<pid>.json` (`ClaudeSessionRegistry`, `TranscriptWatcher.bind`) | Unit/pty AC, live verification, and updated Caveats pass | T01, T26 | cc:完了 [5e3010d] |
+| T04 | `[lane:gate]` `[tdd:required]` `bind_transcript` is the sole switch point; callbacks filter on `path == watcher.current` | Foreign signals have no effect; state resets; tests green | T01, T02 | cc:done [84ef121] |
+| T05 | `[lane:gate]` `[tdd:required]` Unique handoff file per session (`{id}` or session registry with suffix) | Collision, dead-pid, and one-warning tests pass | T01 | cc:done [13e4720] |
+| T10 | `[lane:gate]` `[tdd:required]` Ignore `<synthetic>`/zero-usage rows in context helpers | Synthetic gives `tokens=None,model=None`; positive context required | - | cc:done [08c9680] |
+| T11 | `[lane:gate]` `[tdd:required]` Assistant-row collapsing preserves `end_turn` and separates sidechains | AC tests pass (`[end_turn, None]` and root+sidechain) | - | cc:done [277a446] |
+| T06 | `[lane:gate]` `[tdd:required]` Echo verification (`watcher.expect/forget`, `on_handoff_echo`) is the sole binding confirmation and `/clear` prerequisite | Retry/abort, foreign-path rebind, and guarded `/clear` tests pass | T02, T04 | cc:done [7bb1656] |
 
-## Phase 2: Гарантии машины рестарта (Эпик B)
+## Phase 2: Restart-machine guarantees (Epic B)
 
-Purpose: закрыть тихие исходы (`CLEARED` навсегда, `RESUME_SENT` без unfold, мёртвая сессия после abort) гарантиями G4/G5 из spec.
+Purpose: guarantee recovery from `CLEARED`, `RESUME_SENT` without unfold, and dead sessions after abort (G4/G5).
 
-| Task | Содержание | DoD | Depends | Status |
+| Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| T08 | `[lane:gate]` `[tdd:required]` После `/clear` unfold обязателен: состояние `CLEAR_SENT`, таймаут в `CLEARED` не абортит, `RESUME_SENT` растит `CR_RESUME_ATTEMPTS` до `UNFOLD_FAILED` вместо `permanent` | Все тесты AC T08 зелёные (claude и codex сценарии, `docs/context-restart.md` дополнен); `./test/run.sh` зелёный | T04, T06 | cc:TODO |
-| T09 | `[lane:gate]` `[tdd:required]` Cancel-фраза (`CR_CANCEL_MSG`) после abort доставленного fold — `CANCEL_PENDING` вместо тихого «leaves session as is» | Все тесты AC T09 зелёные (`inject` cancel только если `handoff_echoed=True`, не в `CLEARED`/`RESUME_SENT`); `--cr-help` показывает дефолт; `./test/run.sh` зелёный | T06 | cc:TODO |
-| T12 | `[lane:gate]` `[tdd:required]` Латч верификации handoff: `handoff_verified_at` фиксируется по совпадению файла и `end_turn`, не требует тишины транскрипта | Все тесты AC T12 зелёные (латч держится через фоновые `tool_use`; файл без маркера после латча возвращает в `HANDOFF_SENT`); `./test/run.sh` зелёный | T06, T11 | cc:TODO |
+| T08 | `[lane:gate]` `[tdd:required]` Unfold mandatory after `/clear`; `CLEAR_SENT`, safe timeout, and `CR_RESUME_ATTEMPTS` to `UNFOLD_FAILED` | Claude/Codex AC and docs pass | T04, T06 | cc:done [8e8adba] |
+| T09 | `[lane:gate]` `[tdd:required]` `CR_CANCEL_MSG` after aborted delivered fold enters `CANCEL_PENDING` | Guarded injection, help text, and tests pass | T06 | cc:done [df16021] |
+| T12 | `[lane:gate]` `[tdd:required]` Handoff latch `handoff_verified_at` uses file plus `end_turn`, not transcript silence | Background tools preserve latch; missing marker returns to `HANDOFF_SENT` | T06, T11 | cc:done [91f94c9] |
 
-## Phase 3: Codex — ввод и грамматика агента (Эпик D)
+## Phase 3: Codex — input and agent grammar (Epic D)
 
-Purpose: unfold на codex не сработал у пользователя ни разу — сначала выяснить фактическое поведение TUI, потом закодировать его.
+Purpose: determine why Codex unfold never worked, then encode observed TUI behavior.
 
-| Task | Содержание | DoD | Depends | Status |
+| Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| T15 | `[lane:gate]` `[tdd:skip:live-investigation]` Живое расследование codex 0.154: `/clear`, `/new`, `$skill …`, `@file`, кириллица — какой рецепт ввода трижды подряд доставляет сообщение | Раздел «Результаты» в T15 заполнен для всех 8 пунктов с версией/датой; для каждого пункта дан воспроизводимый (3× подряд) рецепт; решение по `CR_CLEAR_SETTLE_SEC` сформулировано | T01 | cc:TODO |
-| T16 | `[lane:gate]` `[tdd:required]` Per-agent грамматика ввода: `AGENT_INPUT`/`typing_plan(agent, text)` заменяет бинарное `/`-vs-остальное в `schedule_injection` | Все юнит-тесты `typing_plan` AC T16 зелёные (оба агента, кириллица); pty-тест доставляет `$skill`-фразу и `@file`-фразу с первой попытки; живой прогон по рецепту T15 отмечен; `./test/run.sh` зелёный | T15 | cc:TODO |
-| T17 | `[lane:gate]` `[tdd:required]` Per-agent дефолты команд (`CR_CLAUDE_CLEAR_CMD`/`CR_CODEX_CLEAR_CMD`) и `{skill:NAME}` → `/NAME`/`$NAME` | Все тесты AC T17 зелёные; `--cr-help` содержит оба дефолта; `./test/run.sh` зелёный | T15, T16 | cc:TODO |
+| T15 | `[lane:gate]` `[tdd:skip:live-investigation]` Live Codex 0.154 recipes for `/clear`, `/new`, `$skill …`, `@file`, and Cyrillic | Eight results with version/date and reproducible 3× recipes; `CR_CLEAR_SETTLE_SEC` decision | T01 | cc:TODO |
+| T16 | `[lane:gate]` `[tdd:required]` Per-agent `AGENT_INPUT`/`typing_plan(agent, text)` replaces binary slash logic | Unit/pty and live recipe tests pass | T15 | cc:TODO |
+| T17 | `[lane:gate]` `[tdd:required]` Per-agent clear-command defaults and `{skill:NAME}` → `/NAME`/`$NAME` | AC and `--cr-help` defaults pass | T15, T16 | cc:TODO |
 
-## Phase 4: Codex — идентичность сессии (Эпик A, продолжение)
+## Phase 4: Codex — session identity (Epic A, continuation)
 
-Purpose: закрывает последний пробел identity-блока — codex-эквивалент T02, требует того, что T01/T04/T06 уже дали (echo, path-bound фильтр).
+Purpose: close the Codex equivalent of T02 using echo and path-bound filtering.
 
-| Task | Содержание | DoD | Depends | Status |
+| Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| T03 | `[lane:gate]` `[tdd:required]` Codex: привязка rollout (lock-файл/lsof/эвристика + echo nonce), видимость `codex resume` старых сессий в `paths()` | Раздел «Проверено» заполнен; все тесты AC T03 зелёные (два user-rollout, старый rollout после resume, subagent никогда не привязывается); `docs/codex.md` описывает механизм; `./test/run.sh` зелёный | T01, T04, T06 | cc:TODO |
+| T03 | `[lane:gate]` `[tdd:required]` Bind Codex rollout using lock/lsof/heuristic plus echo nonce; expose old `codex resume` sessions in `paths()` | Verified section, rollout/subagent tests, docs, and test suite pass | T01, T04, T06 | cc:done [16a92e4] |
 
-## Phase 5: Профили и окна моделей (Эпик C)
+## Phase 5: Model profiles and windows (Epic C)
 
-Purpose: одна таблица истины вместо размазанных констант — предпосылка для T13 (headroom) и T21 (real-time смена модели).
+Purpose: one source-of-truth table for T13 headroom and T21 real-time model changes.
 
-| Task | Содержание | DoD | Depends | Status |
+| Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| T18 | `[lane:gate]` `[tdd:required]` `MODEL_PROFILES` (window/restart_at/compact_at) для claude и codex, `model_restart_at()`, `--cr-models` | Все тесты AC T18 зелёные (самосогласованность профилей, порядок разрешения порога, `--cr-models` печатает таблицу); `./test/run.sh` зелёный | T01 | cc:TODO |
-| T19 | `[lane:gate]` `[tdd:required]` Fallback-оценка окна для неизвестного slug с самокоррекцией вверх/вниз (`resolve_window()`, `estimated=True`) | Все тесты AC T19 зелёные (family fallback, модальное окно, самокоррекция по `compact_boundary`); бейдж показывает `~` при оценке; `./test/run.sh` зелёный | T18 | cc:TODO |
-| T21 | `[lane:gate]` `[tdd:required]` Смена модели внутри сессии в реальном времени: `Controller.on_model()`, ранний намёк из `local-command-stdout` | Все тесты AC T21 зелёные (туда-обратно, немедленный fold при уменьшении окна, per-model override, codex `codex_cap` сброс); `./test/run.sh` зелёный | T04, T18, T19 | cc:TODO |
-| T20 | `[lane:gate]` `[tdd:required]` Claude: эффективное окно сессии через statusline-прокси (`--cr-statusline`), дешёвые сигналы (`[1m]`, env, settings) как первый слой | «Проверено» заполнено (merge/replace `--settings`, частота вызова); все тесты AC T20 зелёные; пользовательский statusline виден на экране в pty-тесте; `CR_STATUSLINE_PROXY=0` отключает; `./test/run.sh` зелёный | T18, T19 | cc:TODO |
+| T18 | `[lane:gate]` `[tdd:required]` `MODEL_PROFILES` (window/restart_at/compact_at), `model_restart_at()`, `--cr-models` | Profile consistency, threshold precedence, and table tests pass | T01 | cc:done [0f90975] |
+| T19 | `[lane:gate]` `[tdd:required]` Unknown-slug window fallback with correction (`resolve_window()`, `estimated=True`) | Family/modal fallback, boundary correction, and `~` badge tests pass | T18 | cc:done [76e3d05] |
+| T21 | `[lane:gate]` `[tdd:required]` Real-time model changes via `Controller.on_model()` and `local-command-stdout` hint | Round-trip, shrinking-window, override, and `codex_cap` tests pass | T04, T18, T19 | cc:in-progress (`task/t21-model-switch-realtime`) |
+| T20 | `[lane:gate]` `[tdd:required]` Claude effective window through `--cr-statusline` proxy; cheap signals first | Settings behavior, call frequency, pty statusline, and disable switch tests pass | T18, T19 | cc:in-progress (`task/t20-claude-effective-window`, started in parallel with T21 — see Next step) |
 
-## Phase 6: Стабильность рестарта и видимость отказов (Эпик B, остаток)
+## Phase 6: Restart stability and failure visibility (Epic B, remainder)
 
-Purpose: без профилей моделей (Phase 5) нельзя корректно посчитать headroom/compaction_line — отсюда зависимость T13→T18.
+Purpose: model profiles are required to calculate headroom/compaction_line correctly.
 
-| Task | Содержание | DoD | Depends | Status |
+| Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| T13 | `[lane:gate]` `[tdd:required]` Защита от рестартов по кругу: `headroom`-подъём порога после рестарта, частотный предохранитель `CR_CONTEXT_MAX_PER_HOUR` | Все тесты AC T13 зелёные (200k/1M сценарии, 4-й рестарт за час выключает триггер); `./test/run.sh` зелёный | T18 | cc:TODO |
-| T14 | `[lane:gate]` `[tdd:required]` Отказы видны в бейдже: `badge_warn()` приоритет `unfold failed`/`unfold?`/`restart off`/`window?`/`~est`, повтор `notify` каждые `CR_NOTIFY_REPEAT_SEC` | Все тесты AC T14 зелёные (`test_badge.py` кадры, `restart off` до конца сессии, `unfold failed` сбрасывается по keystroke); `./test/run.sh` зелёный | T08 | cc:TODO |
+| T13 | `[lane:gate]` `[tdd:required]` Raise `headroom` after restart; frequency guard `CR_CONTEXT_MAX_PER_HOUR` | 200k/1M scenarios and fourth-restart guard pass | T18 | cc:done [14f5378] |
+| T14 | `[lane:gate]` `[tdd:required]` Badge failure priority via `badge_warn()`; repeat `notify` every `CR_NOTIFY_REPEAT_SEC` | Badge frames, persistent `restart off`, and keystroke reset pass | T08 | cc:done [6a7693d] |
 
-## Phase 7: Хвосты (Эпик C/A остаток)
+## Phase 7: Tail work (Epic C/A remainder)
 
-Purpose: упрощения и passthrough, не блокирующие остальной бэклог, но зависящие от профилей моделей.
+Purpose: non-blocking simplifications and passthrough dependent on model profiles.
 
-| Task | Содержание | DoD | Depends | Status |
+| Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| T22 | `[lane:gate]` `[tdd:required]` Codex: одно число порога из профиля, `min(…, compact_at − reserve)`, лог стоимости fold-хода, опциональный автоподъём резерва | Все тесты AC T22 зелёные (`DEFAULT_CODEX_RESTART_PCT` удалён, стоимость/рекомендация/адаптация резерва, `CR_CODEX_INTERRUPT_AFTER_SEC`); `docs/codex.md` сокращён; `./test/run.sh` зелёный | T18 | cc:TODO |
-| T07 | `[lane:gate]` `[tdd:required]` Passthrough не-сессионных подкоманд claude (`auth`, `mcp`, `update`, `stop`, …) — exec напрямую, без pty-супервизора | Все тесты AC T07 зелёные (`stop`/`mcp list` не создают `start:`; `attach`/`agents`/промпт по-прежнему оборачиваются); `./test/run.sh` зелёный | - | cc:TODO |
+| T22 | `[lane:gate]` `[tdd:required]` Codex profile threshold `min(…, compact_at − reserve)`, fold cost log, optional reserve increase | Constant removal, cost/recommendation/adaptation, interrupt timeout, docs, and tests pass | T18 | cc:in-progress (`task/t22-codex-threshold-semantics`; the "constant removal" AC item was already done by T18 before this task started) |
+| T07 | `[lane:gate]` `[tdd:required]` Direct passthrough for non-session Claude subcommands (`auth`, `mcp`, `update`, `stop`, …) | `stop`/`mcp list` avoid `start:`; wrapped commands remain wrapped | - | cc:done [bbbb81f] |
 
-## Phase 8: Эксплуатация и релиз (Эпик E)
+## Phase 8: Operations and release (Epic E)
 
-Purpose: закрыть техдолг (лог без ротации, 4 незарелизенных коммита) и обновить документацию под новую модель после эпиков A/B.
+Purpose: close technical debt (unrotated log, 4 unreleased commits) and update documentation after Epics A/B.
 
-| Task | Содержание | DoD | Depends | Status |
+| Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| T23 | `[lane:gate]` `[tdd:required]` Ротация лога (`CR_LOG_MAX_BYTES`/`CR_LOG_KEEP`), безопасная для конкурентных писателей | Все тесты AC T23 зелёные (ротация при старте, отсутствие ротации ниже лимита); `./test/run.sh` зелёный | - | cc:TODO |
-| T25 | `[lane:fast]` `[tdd:skip:docs-only]` Документация после эпиков A/B: `docs/context-restart.md`/`docs/codex.md`/`docs/how-it-works.md`/`docs/troubleshooting.md` без устаревших Caveats | `grep -n "grew last\|left untouched\|Caveats" docs/` пусто; ссылки/якоря между документами валидны | T02, T04, T05, T08, T09 | cc:TODO |
-| T24 | `[lane:release]` `[tdd:skip:release-prep]` CHANGELOG для 4 незарелизенных коммитов + всех вошедших в релиз задач бэклога, `CR_VERSION`, тег, GitHub release, homebrew tap формула | `CHANGELOG.md` содержит запись на каждый коммит/задачу; version-тест зелёный; тег и release созданы, формула в tap обновлена (без `brew install/upgrade` на машине пользователя — память проекта); `./test/run.sh` зелёный | выполненные P0-задачи | cc:TODO |
-| T26-live | `[lane:fast]` `[tdd:skip:optional-manual]` `test/run.sh --live-codex`: опциональный чек-лист из T15 как скрипт с подтверждением и очисткой сирот | Скрипт запускается только с явным подтверждением, тратит квоту осознанно, гарантированно убивает группы процессов после | T15, T26 | cc:TODO |
+| T23 | `[lane:gate]` `[tdd:required]` Concurrent-safe log rotation (`CR_LOG_MAX_BYTES`/`CR_LOG_KEEP`) | Startup rotation and below-limit tests pass | - | cc:done [2b5201c] |
+| T25 | `[lane:fast]` `[tdd:skip:docs-only]` Update four docs without stale Caveats | Grep is empty; links and anchors valid | T02, T04, T05, T08, T09 | cc:in-progress (`task/t25-docs-after-binding`) |
+| T24 | `[lane:release]` `[tdd:skip:release-prep]` CHANGELOG, `CR_VERSION`, tag, GitHub release, and Homebrew formula | Every commit/task recorded; version tests, tag, release, and formula pass (no user-machine brew install/upgrade) | completed P0 tasks | cc:TODO |
+| T26-live | `[lane:fast]` `[tdd:skip:optional-manual]` Optional `test/run.sh --live-codex` checklist with confirmation and orphan cleanup | Explicit confirmation required; quota deliberate; process groups killed afterward | T15, T26 | cc:TODO |
 
 ---
 
-## Следующий шаг
+## Next step
 
-Сначала T27 (Phase 0): она не трогает ни `Controller`, ни
-`TranscriptWatcher`, поэтому не конфликтует с Phase 1 и может идти до неё или
-рядом с ней. Внутри T27 порядок обязателен: `Screen` в супервизор →
-`find_agent_rows` по сетке → `SubagentRegistry` → `AgentOverlay` — каждый шаг
-тестируется предыдущим.
+Phases 1, 2, and 4 are complete, and Phase 5/6 are now complete except T20/T21
+(in progress) — done: T01, T02, T03, T04, T05, T06, T08, T09, T10, T11, T12,
+T13, T14, T18, T19, T26, T27, T28. T07 and T23 (Phase 7/8) are also done. In
+progress right now: T20, T21, T22, T25 (see the 2026-09-19 batch entry below).
 
-После неё Phase 1 — семь задач с общими инвариантами
-(identity → path-bound → handoff), лучше вести последовательно одной
-сессией, а не параллельным breezing — порядок T01→T26→T02→T04→T05/T10/T11→T06
-важен для того, чтобы тесты каждой задачи опирались на инфраструктуру
-предыдущей.
+Still open after this batch lands:
+- **T15** (Phase 3) is still blocked on a live, manual codex 0.154 TUI
+  investigation (`[tdd:skip:live-investigation]`) — not something to hand to
+  an unsupervised coding subagent; needs a human-in-the-loop session. T16/T17
+  depend on it and stay blocked until it's done.
+- **T24** (release) and **T26-live** both need explicit user confirmation
+  before running — T24 for the external-send event listed above (git push,
+  gh release, homebrew formula), T26-live because it deliberately burns quota
+  on a live codex session. Neither was started in this batch.
 
-Новая сессия: `claude`
-Первый ввод: `/harness-work T27`
-Почему: T27 — единственная задача, отвечающая на вопрос «куда уходит квота
-прямо сейчас», и её тестовая инфраструктура (эмулятор экрана в супервизоре,
-фейк с деревом субагентов) переиспользуется в AC T14. Phase 1 после неё
-по-прежнему идёт последовательно одной сессией: её задачи меняют одни и те же
-функции контроллера, и параллельный запуск увеличит риск конфликтов правки
-одного файла (`claude-retrier.sh` однофайловый).
+New session: `claude`
+First input: `/harness-work T14`
 
-Альтернатива для длинной сессии без пересборки контекста между T01…T06:
-`ENABLE_PROMPT_CACHING_1H=1 claude`, первый ввод `/harness-loop T01`.
+2026-09-19: user asked for the next 5 ready backlog tasks, each in its own
+subagent, with an explicit parallel-vs-sequential check first. Status check
+via `git log` found T13, T14, T18, T19, T26 already merged to `main` from a
+prior session whose work never got recorded here — this file's status column
+was stale for all five; corrected above with their actual commit hashes
+(T13 14f5378, T14 6a7693d, T19 00b99cc, T26 already had d3ea768 recorded
+correctly). Real next-ready set was therefore T07, T20, T21, T22, T23 (T24/
+T25/T26-live/T15 excluded per the "Still open" reasons above and below).
+
+CodeGraph code-region check (current line numbers, not the backlog docs')
+found T20 and T21 are NOT actually independent despite Plans.md listing no
+cross-dependency between them: `_resolve_window`'s own docstring says
+"T20 will have claude's own statusline do the same" as codex's window hint,
+and T20's spec explicitly routes a claude-statusline model-id change through
+`Controller.on_model()` — the exact entry point T21 introduces. T07
+(bash-tail passthrough dispatch), T22 (`interrupt_line`/`trigger_limit`/
+`_maybe_restart`, codex-only), and T23 (`Logger`, log rotation) were confirmed
+disjoint from T21 and from each other. So T07, T21, T22, T23 were started
+first, concurrently, in git worktrees under `claude-retrier-worktrees/`
+(`task/t07-claude-passthrough`, `task/t21-model-switch-realtime`,
+`task/t22-codex-threshold-semantics`, `task/t23-log-rotation`; the usual
+untracked `CLAUDE.md`/`docs/backlog/`/`docs/spec/`/`codegraph.json`/
+`test/codegraph-sync.sh` seeded into each). T22's own backlog doc turned out
+partially stale too — its "remove `DEFAULT_CODEX_RESTART_PCT`" item was
+already done by T18; the T22 agent was told to skip straight to the
+remaining scope (interrupt-after-seconds, fold-cost logging/reserve-adapt).
+
+T23 and T07 finished first and were merged into `main` as 2b5201c (T23,
+fast-forward) then a merge commit (T07, `git merge` auto-resolved the one
+overlapping hunk in `claude-retrier.sh`); `./test/run.sh` green after each.
+While T21/T22 were still running, the user asked for 2 more tasks from the
+queue to keep 4 agents busy: **T25** (docs-only, depends only on already-
+merged T02/T04/T05/T08/T09, told to steer clear of the exact threshold
+paragraph in `docs/codex.md` that T22 is concurrently rewriting) and **T20**
+— started now rather than waiting for T21 to merge, since T20's own
+acceptance criteria don't actually require `on_model()` to exist yet; its
+agent was told explicitly not to reference T21's (not-yet-merged, not-in-its-
+worktree) `on_model()` and instead do the minimal inline equivalent (set
+`context_model` + call `_resolve_window()`, matching what `on_context`
+already does), with a comment flagging it as a candidate for later
+consolidation once T21 lands. Both launched in `task/t25-docs-after-binding`
+and `task/t20-claude-effective-window`, branched from post-T23 `main`.
+
+2026-09-18/09-19 (Phase 2, T08/T09/T12, then T03/T18): code-region check via
+CodeGraph on the current (post-T01–T28) line numbers — not the stale ones in
+the backlog docs — found T08 and T09 both edit the same small
+`_abort_restart`/`_tick_restart` dispatcher and the state tuple/
+`RESTART_LABELS`, while T12 only touches `_check_handoff`/`_handoff_fault`/
+`on_context`'s `last_stop_reason` handling, disjoint from both. So T08 and
+T12 ran concurrently in worktrees `task/t08-unfold-owed` and
+`task/t12-handoff-latch` (untracked `CLAUDE.md`/`docs/backlog/`/`docs/spec/`/
+`test/codegraph-sync.sh`/`.codegraph*` seeded into each, same reason as the
+T10/T11/T06 batch). Merged into `main` as 91f94c9 (T12, no conflicts) then
+8e8adba (T08, `git merge` auto-resolved overlapping edits in
+`claude-retrier.sh`/`test_controller.py`); `./test/run.sh` green on the
+merged tree (one `test_the_restart_flag_reaches_codex_through_bash_too`
+failure seen under full-suite CPU load, confirmed as a pre-existing
+`test_pty.py`-style flake by 3/3 clean isolated reruns at the time, not a
+regression from T08/T12). T09 was then branched as
+`task/t09-cancel-after-abort` from the post-T08+T12 `main` (so its edits to
+the now-larger `_abort_restart` land on top of T08's version instead of
+racing it) and merged as df16021; `./test/run.sh` green again.
+
+The user then asked for the next two ready backlog tasks in parallel too:
+T03 (Phase 4, `CodexAgent` rollout binding) and T18 (Phase 5, model profile
+table) — both depend only on already-merged tasks and touch disjoint code
+(T03: `CodexAgent.paths`/`keep`, `TranscriptWatcher`, new
+`Controller.on_candidates`/`context_ambiguous`; T18: `MODEL_PROFILES`,
+`model_restart_at`, `_recompute_limit`, `--cr-models`), so both ran
+concurrently in `task/t03-codex-session-binding` and
+`task/t18-model-profiles-table`, branched from post-T09 `main`. T15 (next in
+Phase 3 by table order) was again skipped for this batch — live manual
+investigation, not delegable. Merged as 16a92e4 (T03) then 0f90975 (T18);
+`git merge` auto-resolved every overlapping hunk (`claude-retrier.sh`,
+`docs/codex.md`, `docs/configuration.md`, `docs/context-restart.md`,
+`test_codex.py`, `test_controller.py`) with no manual conflict resolution.
+Notably, T18's own work surfaced and fixed a real (pre-existing, not
+T18-caused) gap: `test/fake_codex.py`'s `FAKE_USAGE` path never wrote
+`turn_context`, so no model name was ever on record for that test path —
+harmless under the old flat-percentage threshold, but it meant
+`model_restart_at`'s new model-keyed profile lookup couldn't resolve, and
+separately `codex_launch_args()` failed to hold codex's own compaction back
+when only the bare `CR_CONTEXT_RESTART=1` flag was set (codex would still
+self-compact at its 90% soft cap, undermining the point of arming the
+restart). Both fixed as part of T18's commit. `./test/run.sh` was green
+after each merge and on the final tree (`ALL PASS`, all 17 files, including
+the previously-flaky-looking codex end-to-end test, which passed reliably
+every time post-fix).
+
+2026-09-18: T04, T05, and T28 implemented in parallel git worktrees (T04/T05
+share no code with T28, so all three ran concurrently; T10 was deliberately
+left out of this batch because it touches `on_context` the same way T04 does,
+and merging two independent rewrites of the same function was judged riskier
+than sequencing them). Merged into `main` as 326ab72 (T04), b7b664f (T05),
+b0fe1c6 (T28); `./test/run.sh` green after each merge and on the final tree.
+
+2026-09-18 (later): T10, T11, and T06 implemented in parallel, each in its own
+`git worktree` (branched from local `HEAD`, not `origin/main`, which was 16
+commits behind — a `test/codegraph-sync.sh` copy was seeded into each
+worktree since it was untracked). Code-region check confirmed no overlap:
+T10 touches `assistant_row`/`usage_tokens`/`on_context`/`_context_fell`; T11
+touches only the collapse branch of `transcript_limit_records`; T06 touches
+`TranscriptWatcher.expect/forget`, `on_handoff_echo`, and the
+`_send_handoff`/`_check_handoff`/`_send_clear` trio plus `main()`'s wiring —
+so all three ran concurrently rather than sequentially. Merged into `main`
+one at a time as 08c9680 (T10), 277a446 (T11), 7bb1656 (T06); `git merge`
+auto-resolved every touched file (including `test_controller.py`, which all
+three branches extended) with no manual conflict resolution needed, and
+`./test/run.sh` was green after each merge and on the final tree (one
+`test_pty.py` timeout seen once, reproduced as a pre-existing ~25-30% flake
+unrelated to these changes via repeated reruns on both the unmodified and
+modified tree).
+
+2026-09-18 (Phase 2, T08/T09/T12): code-region check via CodeGraph on the
+current (post-T01–T28) line numbers — not the stale ones in the backlog docs
+— found T08 and T09 both edit the same small `_abort_restart`/`_tick_restart`
+dispatcher and the state tuple/`RESTART_LABELS`, while T12 only touches
+`_check_handoff`/`_handoff_fault`/`on_context`'s `last_stop_reason` handling,
+disjoint from both. So T08 and T12 ran concurrently in worktrees
+`task/t08-unfold-owed` and `task/t12-handoff-latch` (untracked
+`CLAUDE.md`/`docs/backlog/`/`docs/spec/`/`test/codegraph-sync.sh`/`.codegraph*`
+seeded into each, same reason as the T10/T11/T06 batch). Merged into `main`
+as 91f94c9 (T12, no conflicts) then 8e8adba (T08, `git merge` auto-resolved
+overlapping edits in `claude-retrier.sh`/`test_controller.py`); `./test/run.sh`
+green on the merged tree (one `test_the_restart_flag_reaches_codex_through_bash_too`
+failure seen under full-suite CPU load, confirmed as the pre-existing
+`test_pty.py`-style flake by 3/3 clean isolated reruns, not a regression).
+T09 was then branched as `task/t09-cancel-after-abort` from the post-T08+T12
+`main` (so its edits to the now-larger `_abort_restart` land on top of T08's
+version instead of racing it) and is still running. T03 and T18 were started
+in parallel with it in `task/t03-codex-session-binding` and
+`task/t18-model-profiles-table`, since both depend only on already-merged
+tasks and touch code neither T09 nor each other touch (T03: `CodexAgent`
+binding/`paths()`; T18: `MODEL_PROFILES`/`model_window`/`--cr-models`). T15
+(next in Phase 3 by table order) was intentionally skipped over for this
+batch — it is a live, manual Codex-TUI investigation
+(`[tdd:skip:live-investigation]`), not a fire-and-forget coding task for an
+unsupervised subagent.
