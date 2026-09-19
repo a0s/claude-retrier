@@ -70,7 +70,7 @@
 
 set -u
 
-CR_VERSION="1.11.0"
+CR_VERSION="1.12.0"
 # Which copy of this file is running. The update notice prints the command
 # that updates THIS one, and `brew upgrade` at someone running a git clone
 # would be advice that does nothing.

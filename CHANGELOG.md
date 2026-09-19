@@ -7,6 +7,125 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [1.12.0] - 2026-09-19
+
+Two sessions in one project used to be indistinguishable — the wrapper would
+fold on a neighbour's numbers, clobber its handoff file, or lose an unfold to
+whichever transcript grew last. This release gives every session a
+fingerprint of its own (a registered `sessionId`/rollout, a unique handoff
+file, a fold phrase the wrapper waits to see echoed back) and makes every
+signal it reacts to — usage, "still writing", "session is responding again"
+— provably about that session and no other. On top of that identity, the
+restart machine itself is now a closed loop: `/clear` is confirmed before the
+resume phrase goes out, the resume phrase is retried and never silently
+dropped, and an abort after a delivered fold no longer strands the model on
+an empty prompt. Models get a real per-model table instead of one global
+percentage, and the subagent tree finally shows what each agent is actually
+running and costing.
+
+### Fixed
+- Two sessions in the same project could fold on each other's context
+  numbers, write over each other's handoff file, or accept a foreign
+  session's "still writing"/"idle again" signal, because `TranscriptWatcher`
+  picked "the current file" by which one grew last. Claude sessions are now
+  bound through `~/.claude/sessions/<pid>.json` (`ClaudeSessionRegistry`),
+  codex sessions through the rollout that echoes our own nonce back
+  (`Controller.on_candidates` holds the restart back while more than one
+  unconfirmed rollout exists), `bind_transcript` is the only place the bound
+  path ever changes, and every callback (echo, alive, limit, context) drops
+  anything not on `watcher.current`. The handoff file is unique per session
+  (`CR_HANDOFF_FILE`'s `{id}`, or a `HandoffRegistry` suffix on collision),
+  and the fold phrase itself is only considered delivered once its nonce
+  comes back through the transcript — not after a timeout.
+- `/clear` used to flip to `CLEARED` on a timer, so a slow or dropped clear
+  meant typing the resume phrase into a session that had not actually
+  cleared, and a resume phrase that never landed (a codex `$skill` popup
+  eating the first Enter, most often) silently left the session empty
+  forever. `/clear` now waits for confirmation before `CLEARED`, the resume
+  phrase retries with growing gaps up to `CR_RESUME_ATTEMPTS` before landing
+  in a red `UNFOLD_FAILED` badge instead of quietly giving up, and codex
+  self-compacting mid-race no longer aborts a fold that had already landed —
+  it re-probes the handoff file and drops straight into `CLEARED`.
+- Aborting a restart after the fold phrase had already been echoed back used
+  to leave the session as-is, with the model already told to wrap up and
+  start nothing new — an unattended session stuck on an empty prompt. A
+  `CANCEL_PENDING` state now sends `CR_CANCEL_MSG` through the same
+  identity-bound gates before ending the restart.
+- Claude Code's `<synthetic>`/all-zero-usage rows (a turn with no real
+  response) used to reset the badge to 0, look like an unfamiliar model, and
+  make a completed `/clear` indistinguishable from one still in flight;
+  they're now recognized and ignored. Collapsing consecutive assistant rows
+  could also drop a real `end_turn` under a same-poll streaming fragment, or
+  merge a root row into a sidechain one — aborting an already-landed fold
+  with no unfold, or dropping the observation for that poll entirely. Rows
+  now only merge when they agree on `sidechain`, and a later `None`
+  `stop_reason` never overwrites a real one.
+- An unfamiliar model slug used to disarm the context-restart trigger
+  entirely (`cr window?`) — exactly when a new model ships and the table is
+  stalest. It now falls back to an estimate (same-family for claude, the
+  agent's own cache for codex), keeps asking the network in the background,
+  and self-corrects from the agent's own compaction point in both
+  directions. A small window's baseline cost (system prompt, `CLAUDE.md`,
+  MCP tool defs, the resume read) alone used to eat most of a fresh session's
+  headroom and fire the next restart 30-40 minutes later; `context_limit` is
+  now raised to a baseline-aware floor after every restart, and more than
+  `CR_CONTEXT_MAX_PER_HOUR` restarts inside an hour switches the trigger off
+  for the session instead of thrashing.
+- Codex inherited claude's 51% restart default even though codex folds
+  against a hard compaction cap, not a fraction of its window; it now
+  defaults to codex's own 90% soft-cap semantics, with the reserve line
+  (raised from 32k to 64k after a live fold burned through the old one) doing
+  the real work. A session's effective window (`[1m]`, a custom
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS`) is also no longer guessed at: a
+  `--cr-statusline` proxy reads it straight from Claude Code's own statusLine
+  data.
+- `claude stop <id>`, `claude mcp list`, `claude update` and similar control
+  subcommands were launched under the pty supervisor like a real session
+  (sleeping for the update-notice delay, writing `start:`/`exit:`, even
+  having "continue" injected into their output); they now exec directly
+  instead.
+- Two wrapper sessions writing into one shared `CR_LOG` produced
+  indistinguishable lines; every line is now tagged `[cr <pid> <agent>]`,
+  with `start:`/`exit:` carrying cwd and session duration.
+
+### Added
+- `MODEL_PROFILES`: one `(window, restart_at, compact_at)` per model, for
+  both agents, replacing the scattered window table and single global
+  restart percentage (`--cr-models` prints the resolved table). Switching
+  models mid-session is recognized in real time (`Controller.on_model`) and
+  recomputes the threshold immediately rather than on the next restart.
+- Codex rollouts are tracked the same way old sessions are exposed to
+  `codex resume`: `CodexAgent.paths` now also walks recently-touched files
+  under `sessions/`, not just the one rollout created at startup.
+- `CR_CODEX_INTERRUPT_AFTER_SEC` interrupts a codex turn that has simply sat
+  past the ordinary threshold too long, instead of only ever restarting at
+  the hard cap-minus-reserve line. Fold cost is now logged and accumulated
+  (`~/.claude-retrier/folds.json`), and `CR_CODEX_RESERVE_ADAPT=1` raises the
+  effective reserve to 1.25x the largest observed cost.
+- The badge now ranks its warnings by severity — an unfold failure or a
+  restart switched off for the session stays on screen (repeating every
+  `CR_NOTIFY_REPEAT_SEC`) instead of fading behind a passing `~est` — and
+  marks an unconfirmed window estimate with `~`.
+- `CR_CLAUDE_<X>`/`CR_CODEX_<X>` override `CR_HANDOFF_MSG`/`CR_CLEAR_CMD`/
+  `CR_RESUME_MSG` for one agent only, since a skill invoked as `/foo` means
+  nothing to codex. `CR_CONTEXT_RESTART=1` alone now arms a sane default
+  threshold without anyone picking a percentage first, and
+  `CR_CLAUDE_TOKENS_<SLUG>`/`CR_CODEX_TOKENS_<SLUG>` set one for a single
+  model by name.
+- `CR_AGENTS_OVERLAY=1` renders the subagent tree's own terminal output
+  through a small screen emulator and paints each agent's real model
+  (`sonnet-5/?`, read only from its own transcript, never the spawn request)
+  at the row's right edge — including on the persistent `/tasks` panel, not
+  only the live tree. `Badge` and the overlay now share one row-paint
+  primitive and an occupied-row registry instead of two copies of the same
+  column arithmetic.
+- Log rotation is now concurrency-safe under two wrapper sessions.
+- Test infrastructure for exactly the class of bug this release fixes:
+  `helper.two_wrappers` runs two wrappers over one project dir at once,
+  `fake_claude`/`fake_codex` gained scenario scripting (growth, dropped
+  phrases, synthetic rows, popups, backdated rollouts), and `run.sh` now
+  fails with `FAILURES` if any wrapped process is still alive afterward.
+
 ## [1.11.0] - 2026-09-14
 
 The context restart never once worked on codex, and now does — with a threshold
