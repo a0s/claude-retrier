@@ -54,6 +54,12 @@ that, so the wrapper takes the session answering again as the answer.
 Nothing goes into your shell config, no background process outlives the session,
 and the only file it writes under your home directory is the log.
 
+Two sessions share that same log file, and every line says which one wrote
+it: `[cr <pid> <agent>]` right after the timestamp, the pid being the
+supervisor process itself (`Logger`'s `tag`). See
+[troubleshooting.md](troubleshooting.md#how-to-read-the-log-by-pid) for
+filtering one session's lines out of the interleaved file.
+
 No python3, a `claude -p` batch run, `CR_DISABLE=1`: any of those and it execs
 plain claude rather than becoming the reason your session will not start.
 

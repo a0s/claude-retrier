@@ -9,6 +9,7 @@ subcommands are wrapped, and the codex context-restart threshold.
 - [Which agent: `--agent`](#which-agent---agent)
 - [Rollouts: what the wrapper reads](#rollouts-what-the-wrapper-reads)
 - [Subcommands](#subcommands)
+- [Skills and file mentions in codex](#skills-and-file-mentions-in-codex)
 - [Context restart on codex](#context-restart-on-codex)
 - [How it differs from claude underneath](#how-it-differs-from-claude-underneath)
 - [Staying ahead of codex's own compaction](#staying-ahead-of-codexs-own-compaction)
@@ -102,6 +103,25 @@ definition, changes rarely.
 Most of what codex can be asked to do is not a session at all. `codex exec`,
 `codex login`, `codex mcp` and the rest run untouched, the way `claude -p`
 already does; `codex resume` and `codex fork` are sessions, and are wrapped.
+
+## Skills and file mentions in codex
+
+Typing `/` at the start of a codex prompt opens its command list, the same as
+Claude Code — `CR_SLASH_ENTER`'s longer pause and extra Enter exist for
+exactly that hazard (see
+[context-restart.md](context-restart.md#slash-commands-and-cr_slash_enter)).
+codex opens a popup of the same kind for two more leading characters this
+wrapper does not yet give the same treatment to: `$` lists codex's own
+skills, and `@` opens a file mention, both closed the way `/`'s list is —
+by a following space.
+
+`schedule_injection`, the routine that types a phrase safely, only checks for
+a leading `/`; a phrase starting with `$` or `@` is typed as plain text, with
+no extra pause for the popup to settle and no second Enter as insurance. Its
+Enter can land on a highlighted popup entry instead of submitting the phrase,
+the same class of hazard `CR_SLASH_ENTER` exists to prevent for `/`. Until
+that is fixed, a resume or handoff phrase on codex is most reliable as plain
+text or a bare `/command` — hold off on a `$skill` phrase there.
 
 ## Context restart on codex
 
