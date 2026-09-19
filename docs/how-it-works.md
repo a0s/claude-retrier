@@ -66,6 +66,31 @@ the reset has passed but you are still at the keyboard. With the
 [context restart](context-restart.md#what-you-will-see) on, it also shows the
 percentage (`◆ cr 47%`) as the session nears the threshold.
 
+Everything else the badge can say:
+
+| you see | meaning |
+| --- | --- |
+| `◆ cr` | idle, watching |
+| `◆ cr 1h59m` | waiting out a limit, blinking |
+| `◆ cr held` | the reset passed; still waiting on you |
+| `◆ cr 2/3` | retyping the message, verifying it landed |
+| `◆ cr stopped` | gave up after `CR_MAX_ATTEMPTS` |
+| `◆ cr folding` / `clearing` / `unfolding` | a context restart in progress, blinking |
+| `◆ cr 47%` (`~47%` if the window is a guess) | context restart armed, nearing the threshold |
+| `◆ cr unfold failed` | the resume phrase never reached the session in `CR_RESUME_ATTEMPTS` tries — read `CR_HANDOFF_FILE` by hand; clears on the next key you press |
+| `◆ cr unfold?` | `/clear` landed but the unfold has been waiting on you or a busy session for over a minute |
+| `◆ cr restart off` | the trigger is off for the rest of the session (a failed unfold, or too many restarts in an hour) — permanent, not cleared by a key |
+| `◆ cr window?` | the restart is armed but nothing has said how big the context window is yet |
+| `◆ cr ~est` | the window is a guess (T19), not yet confirmed by usage |
+
+`unfold failed` and `restart off` are debts, not moments — `notify()` repeats
+them every `CR_NOTIFY_REPEAT_SEC` (default 300) on top of the badge, because a
+line Claude's own repaint erases within a frame is not enough for something
+that can sit unnoticed for hours. `unfold failed`'s repeat stops the moment you
+press any key (the debt itself, `restart off`, does not go away — only the
+nagging about it does); a `restart off` reached directly, without ever
+passing through `unfold failed`, stops nagging the same way.
+
 <p align="center">
   <img src="badge.svg" width="620"
        alt="Two terminal frames: an idle session with a dim '◆ cr' in the bottom-right corner, and the same session after a limit, showing '◆ cr 1h59m'">
