@@ -221,7 +221,16 @@ Read from the codex-cli 0.154 source and checked against real sessions:
    typing. `CR_CODEX_INTERRUPT=0` turns this off, and the restart then only ever
    happens between turns.
 
-Below the line, a running turn is left to finish and the restart waits for it.
+Below the line, a running turn is left to finish and the restart waits for it —
+but for codex that check *between* turns is nearly irrelevant on its own: an
+orchestrator turn can run for hours, so in practice the cap-minus-reserve line
+above is the only restart that actually happens. `CR_CODEX_INTERRUPT_AFTER_SEC`
+(default `0`, unchanged behavior) interrupts a turn early instead of waiting
+for that line, once it has sat past the ordinary threshold this many seconds:
+
+```sh
+CR_CODEX_INTERRUPT_AFTER_SEC=1800 claude-retrier --cmd codex
+```
 
 ### If codex still gets there first
 
@@ -233,6 +242,27 @@ had — the file already passes every check `/clear` would have waited for — t
 wrapper skips straight to sending the resume phrase instead of aborting, since
 codex already did the clearing for it. A larger `CR_CODEX_RESERVE_TOKENS` or a
 lower `CR_CODEX_CONTEXT_PCT` gives the next one more room either way.
+
+### Judging the reserve against real folds
+
+`CR_CODEX_RESERVE_TOKENS` (64k) was picked from one incident, not measured
+across many. The wrapper already knows what a fold costs — tokens when the
+handoff is accepted minus tokens when it was asked for — so after every codex
+fold it logs that number and appends `{agent, cwd, cost, date}` to
+`CR_CODEX_FOLDS_FILE` (default `~/.claude-retrier/folds.json`):
+
+```
+the fold cost 31k tokens (reserve 64k)
+```
+
+A fold that burns more than 80% of the configured reserve gets a line
+recommending a larger `CR_CODEX_RESERVE_TOKENS`. `CR_CODEX_RESERVE_ADAPT=1`
+acts on that automatically instead of just recommending it: `1.25×` the
+largest fold cost ever seen in the file (this session's own folds included)
+becomes the effective reserve used by every later computation, whenever that
+is larger than the configured number — never lower than it, only ever
+raising it, and seeded from the file so a fresh session benefits from what an
+earlier one already learned.
 
 ### Why not a PreCompact hook
 

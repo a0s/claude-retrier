@@ -1082,6 +1082,145 @@ class TestStayingAheadOfCodex(unittest.TestCase):
         self.assertEqual(ctl.trigger_limit(), ctl.context_limit)
 
 
+class TestInterruptingAStuckTurnByTime(unittest.TestCase):
+    """T22: the threshold between turns is nearly irrelevant on its own — a
+    codex orchestrator turn can run for hours, and without this the only real
+    restart is the cap-reserve line in TestStayingAheadOfCodex above.
+    CR_CODEX_INTERRUPT_AFTER_SEC interrupts a turn that has simply sat past the
+    ordinary threshold (trigger_limit) too long, whether or not it ever reaches
+    that harder line."""
+
+    def ctl(self, **over):
+        cfg = dict(context_pct=60, codex_reserve=32000, codex_interrupt=True)
+        cfg.update(over)
+        ctl = codex_controller(**cfg)
+        feed(ctl, 0, window=WINDOW, model="gpt-5.6-sol")
+        return ctl
+
+    def test_a_turn_stuck_over_the_threshold_is_interrupted_after_the_timeout(self):
+        ctl = self.ctl(codex_interrupt_after_sec=600)
+        feed(ctl, 1, turn="open")
+        logged_usage(ctl, 2, 200000)            # past 60% (155040), short of 226400
+        self.assertIsNone(ctl.tick(2))          # just crossed; nowhere near 600s yet
+        self.assertIsNone(ctl.tick(500))        # under 600s since crossing
+        action = ctl.tick(2 + 700)
+        self.assertEqual(action[0], "interrupt")
+
+    def test_the_default_of_zero_never_interrupts_by_time_alone(self):
+        # Regression: without CR_CODEX_INTERRUPT_AFTER_SEC, behavior is
+        # unchanged from before T22 — only the cap-reserve line interrupts,
+        # however long the turn sits above the ordinary threshold.
+        ctl = self.ctl()
+        feed(ctl, 1, turn="open")
+        logged_usage(ctl, 2, 200000)
+        self.assertIsNone(ctl.tick(2))
+        self.assertIsNone(ctl.tick(100000))
+
+    def test_a_new_turn_resets_the_clock(self):
+        ctl = self.ctl(codex_interrupt_after_sec=600)
+        feed(ctl, 1, turn="open")
+        logged_usage(ctl, 2, 200000)
+        self.assertIsNone(ctl.tick(2))
+        feed(ctl, 400, turn="closed", stop_reason="end_turn")
+        feed(ctl, 401, turn="open")
+        # 700s since the FIRST crossing, but this turn only just opened.
+        self.assertIsNone(ctl.tick(702))
+
+
+class TestFoldCostAndReserve(unittest.TestCase):
+    """T22: the wrapper already knows what a fold turn costs -- log it, keep a
+    durable history in codex_folds_file, recommend a bigger reserve once a
+    fold burns through most of it, and (CR_CODEX_RESERVE_ADAPT=1) raise the
+    effective reserve itself once that happens."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-codex-folds-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.folds_file = os.path.join(self.dir, "folds.json")
+
+    def ctl(self, **over):
+        cfg = dict(context_pct=50, codex_reserve=64000, codex_folds_file=self.folds_file)
+        cfg.update(over)
+        ctl = codex_controller(**cfg)
+        feed(ctl, 0, window=WINDOW, model="gpt-5.6-sol")
+        return ctl
+
+    def _fold(self, ctl, before, after):
+        """Drive one full codex fold cycle through to the handoff being
+        accepted -- the same steps as TestACodexRestart.full/
+        test_a_clean_task_complete_lets_the_clear_go_out, with `logged_usage`
+        standing in for the plain rollout tokens so codex_cap is wired up too.
+        """
+        feed(ctl, 1, turn="open", window=WINDOW)
+        logged_usage(ctl, 1, before, cap=WINDOW)
+        feed(ctl, 1, turn="closed", stop_reason="end_turn")
+        self.assertEqual(ctl.tick(30)[0], "inject")
+        feed(ctl, 31, turn="open", window=WINDOW)
+        ctl.handoff.write(ctl, at=40)
+        logged_usage(ctl, 40, after, cap=WINDOW)
+        feed(ctl, 41, turn="closed", stop_reason="end_turn")
+        ctl.on_handoff_echo(ROLL, 41)
+        self.assertEqual(ctl.tick(70), ("inject", "/clear", False))
+
+    def test_the_fold_cost_is_logged_and_recorded(self):
+        ctl = self.ctl()
+        self._fold(ctl, 200000, 231000)         # 31k, the backlog's own example
+        self.assertIn("the fold cost 31k tokens (reserve 64k)", ctl.log_lines)
+        with open(self.folds_file) as fh:
+            records = json.load(fh)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["agent"], "codex")
+        self.assertEqual(records[0]["cost"], 31000)
+        self.assertIn("cwd", records[0])
+        self.assertIn("date", records[0])
+
+    def test_a_missing_or_corrupt_file_is_started_fresh(self):
+        os.makedirs(os.path.dirname(self.folds_file), exist_ok=True)
+        with open(self.folds_file, "w") as fh:
+            fh.write("{not valid json")
+        ctl = self.ctl()
+        self._fold(ctl, 200000, 210000)
+        with open(self.folds_file) as fh:
+            records = json.load(fh)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["cost"], 10000)
+
+    def test_a_heavy_fold_recommends_raising_the_reserve(self):
+        ctl = self.ctl()
+        self._fold(ctl, 200000, 255000)         # 55k against a 64k reserve
+        self.assertIn("the fold cost more than 80% of the 64k reserve; "
+                      "CR_CODEX_RESERVE_TOKENS could stand to be raised",
+                      ctl.log_lines)
+
+    def test_a_light_fold_recommends_nothing(self):
+        ctl = self.ctl()
+        self._fold(ctl, 200000, 210000)         # 10k, well under 80% of 64k
+        self.assertFalse(any("could stand to be raised" in l for l in ctl.log_lines))
+
+    def test_reserve_adapt_raises_the_effective_reserve(self):
+        # context_pct=95: high enough that trigger_limit is pinned to the
+        # interrupt line itself, so both reflect the adapted reserve.
+        ctl = self.ctl(codex_reserve_adapt=True, context_pct=95)
+        self._fold(ctl, 200000, 255000)         # 55k cost
+        expected_reserve = max(64000, int(1.25 * 55000))
+        self.assertEqual(ctl.interrupt_line(), WINDOW - expected_reserve)
+        self.assertEqual(ctl.trigger_limit(), WINDOW - expected_reserve)
+
+    def test_without_the_flag_the_reserve_never_moves(self):
+        ctl = self.ctl()
+        self._fold(ctl, 200000, 255000)         # same heavy fold, no adapt
+        self.assertEqual(ctl.interrupt_line(), WINDOW - 64000)
+
+    def test_a_fresh_session_benefits_from_an_earlier_ones_history(self):
+        # The reserve this instance never folded to earn is still there once a
+        # PREVIOUS session already wrote it to codex_folds_file (T22: "durably").
+        cr._append_fold_record(self.folds_file, "codex", "/some/project", 90000, 1)
+        ctl = self.ctl(codex_reserve_adapt=True)
+        logged_usage(ctl, 1, 1000, cap=WINDOW)  # only to set codex_cap
+        expected_reserve = int(1.25 * 90000)
+        self.assertEqual(ctl.interrupt_line(), WINDOW - expected_reserve)
+
+
 class TestFindingAStallOnScreen(unittest.TestCase):
     def test_the_capacity_line_is_found(self):
         self.assertEqual(cr.find_stall("⚠ " + CAPACITY), "⚠ " + CAPACITY)
