@@ -1285,6 +1285,20 @@ def project_dir(cwd=None, config_dir=None):
 _ASSISTANT_ROW = re.compile(rb'"type"\s*:\s*"assistant"')
 _COMPACT_ROW = re.compile(rb'"subtype"\s*:\s*"compact_boundary"')
 
+# The claude CLI's own `/model` command answers itself, before any turn ever
+# reaches the API: "<command-name>/model</command-name>" is the invocation,
+# "<local-command-stdout>Set model to <display>[ (<slug>)]</local-command-stdout>"
+# is the answer (T21). Only the stdout line is matched -- it already names the
+# switch unambiguously, so tracking the command-name row that precedes it
+# would only add state across rows for no further certainty. A slug in
+# parentheses, if the display carries one, is trusted outright; otherwise the
+# display name is transformed (`_display_to_claude_slug`, defined by
+# MODEL_PROFILES further down but only ever called once a row like this is
+# actually seen).
+_LOCAL_MODEL_ROW = re.compile(
+    r"<local-command-stdout>\s*Set model to\s+(?P<display>[^(<\n]+?)"
+    r"(?:\s*\((?P<slug>[a-z][a-z0-9.-]*)\))?\s*</local-command-stdout>", re.IGNORECASE)
+
 
 def assistant_row(rec):
     """What an assistant row says beyond "the session answered".
@@ -1383,11 +1397,12 @@ def transcript_limit_records(path, offset=0, echo=None):
     for raw in rows:
         limitish = b"rate_limit" in raw or b"isApiErrorMessage" in raw
         echoish = b'"user"' in raw and any(k in raw for k in echo_keys)
-        # Prefilters only — all three can match on a tool result that merely
+        modelish = b"local-command-stdout" in raw and b"Set model to" in raw
+        # Prefilters only — all four can match on a tool result that merely
         # quotes the words, so the row's own "type" decides below.
         aliveish = bool(_ASSISTANT_ROW.search(raw))
         compactish = bool(_COMPACT_ROW.search(raw))
-        if not limitish and not echoish and not aliveish and not compactish:
+        if not limitish and not echoish and not aliveish and not compactish and not modelish:
             continue
         try:
             rec = json.loads(raw.decode("utf-8", "replace"))
@@ -1400,9 +1415,19 @@ def transcript_limit_records(path, offset=0, echo=None):
                             pre_tokens=int(pre) if isinstance(pre, (int, float)) else None))
             continue
         if not rec.get("isApiErrorMessage"):
-            text = record_text(rec) if echoish and rec.get("type") == "user" else None
-            if text is not None and text in echoes:
+            text = (record_text(rec)
+                    if (echoish or modelish) and rec.get("type") == "user" else None)
+            if text is not None and echoish and text in echoes:
                 out.append(dict(kind="echo", text=text, ts=rec.get("timestamp")))
+            elif text is not None and modelish:
+                m = _LOCAL_MODEL_ROW.search(text)
+                slug = (m and (m.group("slug") or _display_to_claude_slug(m.group("display"))))
+                if slug:
+                    # An early hint only (T21): the next real assistant row's
+                    # "model" field is the one `on_model` trusts as confirmed,
+                    # and overrides this the moment it disagrees.
+                    out.append(dict(kind="alive", ts=rec.get("timestamp"), quiet=True,
+                                    sidechain=False, model_hint=slug))
             elif rec.get("type") == "assistant":
                 row = assistant_row(rec)
                 prev = out[-1] if out else None
@@ -2381,6 +2406,20 @@ def model_slug(model):
     slug = (model or "").strip().lower()
     slug = re.sub(r"\[[^\]]*\]$", "", slug)      # "claude-opus-5[1m]"
     return re.sub(r"-\d{8}$", "", slug)          # "claude-haiku-4-5-20251001"
+
+
+def _display_to_claude_slug(display):
+    """"Opus 5" -> "claude-opus-5", "Haiku 4.5" -> "claude-haiku-4-5" (T21).
+
+    What claude's own `/model` command names a model by, in the shape every
+    entry in `_BIG_CLAUDE`/`_SMALL_CLAUDE` already takes once its dots and
+    spaces become hyphens — so this stands in for a display-name table rather
+    than one more list to keep in sync with MODEL_PROFILES by hand. Read only
+    off `<local-command-stdout>Set model to <display></local-command-stdout>`,
+    an early hint the next real assistant row's own slug always overrides.
+    """
+    slug = re.sub(r"[^a-z0-9]+", "-", display.strip().lower()).strip("-")
+    return "claude-%s" % slug if slug else ""
 
 
 def model_env_slug(slug):
@@ -3846,16 +3885,24 @@ class Controller:
             self._recheck_handoff_latch(now)
         window = rec.get("window")
         model = rec.get("model")
+        hint = rec.get("model_hint")
         moved = False
-        if model and model != self.context_model:
-            self.context_model = model
-            moved = True
         if window and window != self.context_window_hint:
             # codex writes the window it is actually using into every row of
             # accounting. Nothing we could work out from a model name beats
-            # being told.
+            # being told. Done before `on_model` below so a row that somehow
+            # carried both would have the model resolve against the fresh
+            # window rather than the stale one.
             self.context_window_hint = int(window)
             moved = True
+        if hint and not model:
+            # claude's own "Set model to <display>" line (T21): earlier than
+            # any real turn, and only ever a hint -- `model` below, from an
+            # actual assistant row, is what confirms or overrides it.
+            self.on_model(hint, "local command", now)
+        if model and self.on_model(
+                model, "codex log" if self.codex else "assistant line", now):
+            moved = False        # on_model already resolved against the live window
         if moved:
             self._resolve_window()
         tokens = rec.get("tokens")
@@ -3874,6 +3921,57 @@ class Controller:
         elif (self.context_estimated and self.context_window
               and tokens >= self.context_window * self.ESTIMATE_CONFIRM_FRAC):
             self._confirm_estimate(tokens)
+
+    def on_model(self, model, source, now):
+        """The one place a model change is recognized, from whichever of three
+        sources noticed first (T21):
+
+          - claude's own `<local-command-stdout>Set model to <display>` line
+            (`"local command"`, via `transcript_limit_records`'s `model_hint`)
+            — earlier than any turn, and only ever a hint: it can be undone
+            before a single real answer comes back.
+          - an assistant row's own `message.model` (`"assistant line"`) — the
+            confirmed answer, and the one that always wins if it disagrees
+            with an earlier hint, since it is what the account actually ran.
+          - codex's `turn_context`/`thread_settings_applied` (`"codex log"`)
+            — stated on every turn, the way codex states everything about
+            itself.
+
+        A no-op unless the slug actually changes (`model_slug`, not the raw
+        string — a snapshot date or a "[1m]" suffix is not a different
+        model). Logs the switch once, by name, distinct from `_resolve_window`'s
+        own "restarting at" line: the OLD model's numbers are whatever this
+        session already had resolved for it a moment ago (`context_window`/
+        `context_limit`), not recomputed from scratch, so they reflect
+        whatever forced window, learned answer, or override was actually in
+        effect. Resets what a new model invalidates — codex's cached
+        compaction cap, stale until a fresh usage line names the new one — and
+        leaves the rest to `_resolve_window` (which already clears
+        `_window_bumped` and recomputes the limit).
+
+        Nothing here enacts a restart. The next `tick()` — whenever it next
+        runs, not gated on a further transcript row — already re-checks the
+        threshold against the freshly resolved limit, so a downward switch
+        already past it folds without waiting on anything more to arrive.
+        Returns whether a switch actually happened, so a caller who already
+        has its own window-hint bookkeeping to do (`on_context`) knows not to
+        also re-resolve.
+        """
+        slug = model_slug(model)
+        old_slug = model_slug(self.context_model)
+        if not slug or slug == old_slug:
+            return False
+        old_window, old_limit = self.context_window, self.context_limit
+        self.context_model = model
+        if self.codex:
+            self.codex_cap = None
+        self._resolve_window()
+        if old_slug:
+            self.log("model switched: %s (%s, restart at %s) → %s (%s, restart at %s) [%s]"
+                     % (old_slug, human_tokens(old_window), human_tokens(old_limit),
+                        slug, human_tokens(self.context_window), human_tokens(self.context_limit),
+                        source))
+        return True
 
     def _bump_window(self, tokens):
         """Escalate the assumed window past what usage just proved it to be

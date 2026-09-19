@@ -1903,6 +1903,124 @@ class TestAPerModelTokenOverride(RestartTestCase):
         self.assertEqual(cr.model_env_slug("claude-opus-5"), "CLAUDE_OPUS_5")
 
 
+class TestModelSwitchRealtime(RestartTestCase):
+    """T21: switching models mid-session, in real time -- before an assistant
+    row ever confirms the new one, and folding immediately when a downward
+    switch is already past its (smaller) threshold."""
+
+    def _armed(self, **over):
+        return restart_controller(context_pct=0, context_tokens=0,
+                                  context_restart_on=True, context_window="auto",
+                                  **over)
+
+    def test_downward_switch_folds_on_the_very_next_tick(self):
+        ctl = self._armed()
+        usage(ctl, 0, 150000, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 1000000)
+        self.assertEqual(ctl.context_limit, 510000)
+        self.assertIsNone(self.tick(ctl, 30))      # nowhere near opus's own threshold
+        logged_before = len(ctl.log_lines)
+        self.assertTrue(ctl.on_model("claude-haiku-4-5", "assistant line", 31))
+        self.assertEqual(ctl.context_window, 200000)
+        self.assertEqual(ctl.context_limit, 102000)
+        switched = ctl.log_lines[logged_before:]
+        self.assertTrue(any("model switched: claude-opus-5" in l
+                            and "claude-haiku-4-5" in l and "[assistant line]" in l
+                            for l in switched), switched)
+        # 150000 tokens is already well past haiku's 102k threshold -- the
+        # fold has to go out on the very next check, not the next transcript row.
+        action = self.tick(ctl, 32)
+        self.assertEqual(action[0], "inject")
+
+    def test_there_and_back_restores_the_limit_and_the_bump_flag(self):
+        ctl = self._armed()
+        usage(ctl, 0, 10, model="claude-opus-5")
+        ctl.learned["claude-some-other-model"] = 700000   # unrelated to either side
+        ctl.on_model("claude-haiku-4-5", "assistant line", 1)
+        self.assertEqual(ctl.context_window, 200000)
+        self.assertEqual(ctl.context_limit, 102000)
+        ctl._window_bumped = True      # simulate a bump that happened under haiku
+        ctl.on_model("claude-opus-5", "assistant line", 2)
+        self.assertEqual(ctl.context_window, 1000000)
+        self.assertEqual(ctl.context_limit, 510000)
+        self.assertFalse(ctl._window_bumped)
+        self.assertEqual(ctl.learned["claude-some-other-model"], 700000)
+
+    def test_a_per_model_override_reaches_the_model_switched_to(self):
+        env = "CR_CLAUDE_TOKENS_CLAUDE_HAIKU_4_5"
+        os.environ[env] = "90000"
+        self.addCleanup(os.environ.pop, env, None)
+        ctl = self._armed()
+        usage(ctl, 0, 10, model="claude-opus-5")
+        ctl.on_model("claude-haiku-4-5", "assistant line", 1)
+        self.assertEqual(ctl.context_limit, 90000)
+
+    def test_no_op_when_the_slug_has_not_actually_changed(self):
+        ctl = self._armed()
+        usage(ctl, 0, 10, model="claude-opus-5")
+        logged_before = len(ctl.log_lines)
+        self.assertFalse(ctl.on_model("claude-opus-5-20260101", "assistant line", 1))
+        self.assertEqual(len(ctl.log_lines), logged_before)
+
+    def _local_command_hint(self, display):
+        """A "Set model to <display>" row the way `transcript_limit_records`
+        reports it. A preceding <command-name>/model</command-name> row is
+        included for realism but never inspected: the stdout line already
+        names the switch unambiguously."""
+        tmpdir = tempfile.mkdtemp(prefix="cr-t21-")
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        path = os.path.join(tmpdir, "s.jsonl")
+        rows = [
+            {"type": "user", "isSidechain": False,
+             "message": {"role": "user",
+                        "content": "<command-name>/model</command-name>\n"
+                                   "<command-message>model</command-message>\n"
+                                   "<command-args></command-args>"}},
+            {"type": "user", "isSidechain": False,
+             "message": {"role": "user", "content": [
+                 {"type": "text",
+                  "text": "<local-command-stdout>Set model to %s</local-command-stdout>"
+                          % display}]}},
+        ]
+        with open(path, "w") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+        _, recs = cr.transcript_limit_records(path, 0)
+        return recs
+
+    def test_the_local_command_line_is_parsed_into_a_hint(self):
+        recs = self._local_command_hint("Haiku 4.5")
+        hints = [r["model_hint"] for r in recs if r.get("model_hint")]
+        self.assertEqual(hints, ["claude-haiku-4-5"])
+
+    def test_a_slug_named_outright_in_parens_is_trusted_over_the_display(self):
+        recs = self._local_command_hint("Some New Thing (claude-opus-5)")
+        hints = [r["model_hint"] for r in recs if r.get("model_hint")]
+        self.assertEqual(hints, ["claude-opus-5"])
+
+    def test_local_command_hint_switches_early_but_the_assistant_line_wins(self):
+        ctl = self._armed()
+        usage(ctl, 0, 50000, model="claude-opus-5")
+        self.assertEqual(ctl.context_window, 1000000)
+        for rec in self._local_command_hint("Haiku 4.5"):
+            ctl.on_context(dict(rec, path=MINE), 1)
+        self.assertEqual(ctl.context_window, 200000)
+        self.assertEqual(ctl.context_limit, 102000)
+        self.assertTrue(any("model switched: claude-opus-5" in l
+                            and "claude-haiku-4-5" in l and "[local command]" in l
+                            for l in ctl.log_lines))
+        self.assertIsNone(self.tick(ctl, 30))      # 50000 tokens folds nothing yet
+        logged_before = len(ctl.log_lines)
+        usage(ctl, 31, 60000, model="claude-opus-5")    # the user changed their mind
+        self.assertEqual(ctl.context_window, 1000000)
+        self.assertEqual(ctl.context_limit, 510000)
+        switched = ctl.log_lines[logged_before:]
+        self.assertTrue(any("model switched: claude-haiku-4-5" in l
+                            and "claude-opus-5" in l and "[assistant line]" in l
+                            for l in switched), switched)
+        self.assertIsNone(self.tick(ctl, 32))      # never folded on the transient hint
+
+
 class TestSettingsAsPeopleWriteThem(unittest.TestCase):
     """The thresholds are typed by hand into a shell, and a value that fails to
     parse falls back on the default — which for this feature is "off". Silently
