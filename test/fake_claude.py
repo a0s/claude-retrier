@@ -153,7 +153,7 @@ def write_transcript(text, limited=True, tokens=None, stop_reason=None, model=No
     if limited:
         rec.update({"error": "rate_limit", "isApiErrorMessage": True, "apiErrorStatus": 429})
     with open(transcript_path(), "a") as fh:
-        fh.write(json.dumps(rec) + "\n")
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -172,7 +172,7 @@ def write_user_message(text):
            "isSidechain": False,
            "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
     with open(transcript_path(), "a") as fh:
-        fh.write(json.dumps(rec) + "\n")
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -260,7 +260,7 @@ def write_subagent(agent_id, description, model):
         json.dump(meta, fh)
     rec = {"type": "assistant", "isSidechain": False, "message": {"model": model, "content": []}}
     with open(os.path.join(d, "agent-%s.jsonl" % agent_id), "w") as fh:
-        fh.write(json.dumps(rec) + "\n")
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
 def draw_agent_tree(out, suffix="0 tool uses"):

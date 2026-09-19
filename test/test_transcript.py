@@ -682,6 +682,20 @@ class TestSeveralEchoes(unittest.TestCase):
         self.append("s.jsonl", user_row(msg))
         self.assertEqual([r["kind"] for r in w.poll_now()], ["echo"])
 
+    def test_a_non_ascii_character_written_as_raw_utf8_still_matches(self):
+        # Real Claude Code and codex write a non-ASCII character (an em dash
+        # in the default handoff phrase, Cyrillic in a custom one) as its raw
+        # UTF-8 bytes, never as a \uXXXX escape -- unlike json.dumps's own
+        # default. The prefilter's needle has to be built the same way, or
+        # the echo (and everything gated on it: /clear, the whole restart)
+        # waits forever. This is exactly the encoding a live recording
+        # against real Claude Code hit (docs/demo/record.py).
+        msg = "continue — русский текст"
+        w = cr.TranscriptWatcher(self.dir, poll=0, echo=[msg])
+        with open(os.path.join(self.dir, "s.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(user_row(msg), ensure_ascii=False) + "\n")
+        self.assertEqual([r["kind"] for r in w.poll_now()], ["echo"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -592,7 +592,7 @@ class TestWaitScale(unittest.TestCase):
 # Settings for a controller with the feature on, small enough to drive by hand:
 # a 1M window, a threshold at half of it, and a handoff of a couple of lines.
 CTX = dict(
-    context_pct=50, context_tokens=0, context_window="1M",
+    context_tokens=500000, context_window="1M",
     context_env_max=0, context_no_1m=False,
     handoff_file="H.md", handoff_marker="HANDOFF", handoff_min_bytes=20,
     handoff_attempts=2,
@@ -801,7 +801,7 @@ class TestPostRestartHeadroom(RestartTestCase):
     def test_a_baseline_that_eats_the_threshold_raises_it(self):
         # 200k window, 51% threshold (102k), 57k left after the restart: only
         # 45k of headroom, under the 80k floor, so the threshold is raised.
-        ctl = restart_controller(context_pct=51, context_window="200k")
+        ctl = restart_controller(context_tokens=102000, context_window="200k")
         action = self.restarted(ctl, pre_tokens=150000, post_tokens=57000,
                                 model="claude-haiku-4-5")
         self.assertEqual(action[0], "notify")
@@ -816,7 +816,7 @@ class TestPostRestartHeadroom(RestartTestCase):
     def test_plenty_of_headroom_leaves_the_threshold_alone(self):
         # 1M window, 51% threshold (510k), 55k left after the restart: 455k of
         # headroom is nowhere near the 80k floor, so nothing changes.
-        ctl = restart_controller(context_pct=51, context_window="1M")
+        ctl = restart_controller(context_tokens=510000, context_window="1M")
         action = self.restarted(ctl, pre_tokens=700000, post_tokens=55000,
                                 model="claude-opus-5")
         self.assertEqual(action[0], "notify")
@@ -1606,7 +1606,7 @@ class TestWhoIsAllowedToBeInterrupted(RestartTestCase):
 
 class TestWhatCountsAsContext(RestartTestCase):
     def test_the_feature_is_off_unless_it_is_asked_for(self):
-        ctl = restart_controller(context_pct=0, context_tokens=0)
+        ctl = restart_controller(context_tokens=0)
         usage(ctl, 0, 999999)
         self.assertFalse(ctl.context_enabled)
         self.assertIsNone(self.tick(ctl, 100))
@@ -1638,9 +1638,10 @@ class TestWhatCountsAsContext(RestartTestCase):
         self.assertEqual(ctl.context_limit, 500000)
 
     def test_a_short_window_model_triggers_sooner(self):
-        ctl = restart_controller(context_window="auto")
+        ctl = restart_controller(context_window="auto", context_tokens=0,
+                                 context_restart_on=True)
         usage(ctl, 0, 10, model="claude-sonnet-4-5")
-        self.assertEqual(ctl.context_limit, 100000)
+        self.assertEqual(ctl.context_limit, 102000)   # the model's own row: 51% of 200k
 
     def test_an_unfamiliar_model_gets_a_modal_window_estimate(self):
         # The actual bug: assuming the SMALL window put a 1M session on a 200k
@@ -1650,10 +1651,11 @@ class TestWhatCountsAsContext(RestartTestCase):
         # dies of its own context instead. T19: guess large (a new slug is
         # almost always a new model) and keep asking the network for
         # something firmer while that guess stands.
-        ctl = restart_controller(context_window="auto")
+        ctl = restart_controller(context_window="auto", context_tokens=0,
+                                 context_restart_on=True)
         usage(ctl, 0, 10, model="claude-something-9")
         self.assertEqual(ctl.context_window, 1000000)     # the table's modal window
-        self.assertEqual(ctl.context_limit, 500000)
+        self.assertEqual(ctl.context_limit, 510000)   # stage 4: DEFAULT_RESTART_PCT of it
         self.assertTrue(ctl.context_estimated)
         self.assertEqual(ctl.window_unknown, "claude-something-9")   # still worth asking
         # T14: far from the threshold `badge_context()` has nothing to show, so
@@ -1727,7 +1729,8 @@ class TestWhatCountsAsContext(RestartTestCase):
         self.assertIsNone(ctl.badge_warn())
 
     def test_a_confirmed_answer_replaces_the_estimate(self):
-        ctl = restart_controller(context_window="auto")
+        ctl = restart_controller(context_window="auto", context_tokens=0,
+                                 context_restart_on=True)
         usage(ctl, 0, 10, model="claude-something-9")
         self.assertTrue(ctl.context_estimated)
         self.assertEqual(ctl.context_window, 1000000)      # the modal-window guess
@@ -1735,7 +1738,7 @@ class TestWhatCountsAsContext(RestartTestCase):
         self.assertTrue(ctl.on_window_learned("claude-something-9", 2000000,
                                               "the models docs"))
         self.assertEqual(ctl.context_window, 2000000)
-        self.assertEqual(ctl.context_limit, 1000000)
+        self.assertEqual(ctl.context_limit, 1020000)   # stage 4: 51% of the learned window
         self.assertFalse(ctl.context_estimated)
         self.assertIsNone(ctl.window_unknown)
         self.assertIsNone(ctl.badge_warn())
@@ -1751,8 +1754,7 @@ class TestWhatCountsAsContext(RestartTestCase):
         self.assertEqual(ctl.context_window, 300000)
 
     def test_an_absolute_threshold_needs_no_window_at_all(self):
-        ctl = restart_controller(context_window="auto", context_pct=0,
-                                 context_tokens=50000)
+        ctl = restart_controller(context_window="auto", context_tokens=50000)
         usage(ctl, 0, 60000, model="claude-something-9")
         self.assertIsNone(ctl.window_unknown)
         self.assertIsNone(ctl.badge_warn())
@@ -1789,7 +1791,7 @@ class TestWhatCountsAsContext(RestartTestCase):
         self.assertEqual(ctl.context_window, 200000)
 
     def test_an_absolute_threshold_ignores_the_window_entirely(self):
-        ctl = restart_controller(context_pct=0, context_tokens=123456)
+        ctl = restart_controller(context_tokens=123456)
         usage(ctl, 0, 10, model="claude-opus-5")
         self.assertTrue(ctl.context_enabled)
         self.assertEqual(ctl.context_limit, 123456)
@@ -1818,13 +1820,16 @@ class TestSelfCompactionCorrectsTheWindowDownward(RestartTestCase):
     right before folding itself."""
 
     def test_a_compact_boundary_shrinks_an_assumed_1m_window(self):
-        ctl = restart_controller(context_window="auto")
+        ctl = restart_controller(context_window="auto", context_tokens=0,
+                                 context_restart_on=True)
         usage(ctl, 0, 10, model="claude-opus-5")
         self.assertEqual(ctl.context_window, 1000000)
         ctl.on_context(dict(kind="alive", path=MINE, quiet=True, sidechain=False,
                             compacted=True, pre_tokens=190000), 5)
         self.assertEqual(ctl.context_window, 206521)          # 190000 / 0.92
-        self.assertEqual(ctl.context_limit, 103260)            # half of it, recalculated
+        # stage 4: the shrunk window no longer matches claude-opus-5's own row
+        # (1M), so DEFAULT_RESTART_PCT applies to the corrected window instead.
+        self.assertEqual(ctl.context_limit, 105325)
         self.assertFalse(ctl.context_estimated)                # observed, not guessed
         self.assertTrue(any("the effective window is" in l for l in ctl.log_lines))
 
@@ -1838,7 +1843,7 @@ class TestSelfCompactionCorrectsTheWindowDownward(RestartTestCase):
     def test_codexs_own_compaction_still_uses_the_last_known_count(self):
         # codex's own `compacted` row carries no preTokens of its own; the
         # count this session last reported stands in, same as before T19.
-        ctl = restart_controller(agent="codex", context_window="auto", context_pct=50)
+        ctl = restart_controller(agent="codex", context_window="auto", context_restart_on=True)
         ctl.on_context(dict(kind="alive", path=MINE, sidechain=False,
                             window=258400, tokens=200000), 0)
         ctl.on_context(dict(kind="alive", path=MINE, quiet=True, sidechain=False,
@@ -1867,7 +1872,7 @@ class TestAPerModelTokenOverride(RestartTestCase):
 
     def test_it_wins_over_an_absolute_threshold_too(self):
         os.environ[self.ENV] = "300000"
-        ctl = restart_controller(context_pct=0, context_tokens=999999)
+        ctl = restart_controller(context_tokens=999999)
         usage(ctl, 0, 10, model="claude-opus-5")
         self.assertEqual(ctl.context_limit, 300000)
 
@@ -1909,7 +1914,7 @@ class TestModelSwitchRealtime(RestartTestCase):
     switch is already past its (smaller) threshold."""
 
     def _armed(self, **over):
-        return restart_controller(context_pct=0, context_tokens=0,
+        return restart_controller(context_tokens=0,
                                   context_restart_on=True, context_window="auto",
                                   **over)
 
@@ -2033,10 +2038,11 @@ class TestClaudesOwnStatusLine(RestartTestCase):
         # claude-sonnet-5 is a _BIG_CLAUDE (1M) model in the profile table;
         # the statusline is the one thing that can prove THIS session did not
         # actually get that window.
-        ctl = restart_controller(context_window="auto", context_pct=51)
+        ctl = restart_controller(context_window="auto", context_tokens=0,
+                                 context_restart_on=True)
         ctl.on_status(dict(context_window_size=200000, model_id="claude-sonnet-5"), 0)
         self.assertEqual(ctl.context_window, 200000)
-        self.assertEqual(ctl.context_limit, 102000)
+        self.assertEqual(ctl.context_limit, 102000)   # stage 4: 51% of this session's actual window
         self.assertTrue(any("claude's status line" in l for l in ctl.log_lines),
                         ctl.log_lines)
 
@@ -2049,7 +2055,8 @@ class TestClaudesOwnStatusLine(RestartTestCase):
         self.assertEqual(ctl.context_window, 1000000)   # the profile table, by the new model
 
     def test_a_repeated_report_does_not_re_resolve(self):
-        ctl = restart_controller(context_window="auto", context_pct=51)
+        ctl = restart_controller(context_window="auto", context_tokens=0,
+                                 context_restart_on=True)
         ctl.on_status(dict(context_window_size=200000, model_id="claude-sonnet-5"), 0)
         before = len(ctl.log_lines)
         ctl.on_status(dict(context_window_size=200000, model_id="claude-sonnet-5"), 5)
@@ -2058,7 +2065,7 @@ class TestClaudesOwnStatusLine(RestartTestCase):
     def test_codexs_own_rollout_label_is_unaffected(self):
         # This is a claude-only signal; codex's own accounting must keep
         # saying "the transcript", never relabelled by anything on_status does.
-        ctl = restart_controller(agent="codex", context_window="auto", context_pct=50)
+        ctl = restart_controller(agent="codex", context_window="auto", context_restart_on=True)
         ctl.on_context(dict(kind="alive", path=MINE, sidechain=False,
                             tokens=10, model="gpt-5", window=400000), 0)
         self.assertTrue(any("(the transcript)" in l for l in ctl.log_lines), ctl.log_lines)
@@ -2095,7 +2102,7 @@ class TestSettingsAsPeopleWriteThem(unittest.TestCase):
 
     def test_context_restart_is_off_by_default(self):
         from helper import load as reload_impl
-        self.assertEqual(reload_impl().CFG["context_pct"], 0.0)
+        self.assertIs(reload_impl().CFG["context_restart_on"], False)
 
     def test_context_restart_flag_arms_the_profile_not_a_percentage(self):
         # T18: the flag used to default CFG["context_pct"] to DEFAULT_RESTART_PCT
@@ -2104,19 +2111,14 @@ class TestSettingsAsPeopleWriteThem(unittest.TestCase):
         # see test_models.py's TestTheThresholdResolutionOrder for that.
         from helper import load as reload_impl
         mod = reload_impl(CR_CONTEXT_RESTART="1")
-        self.assertEqual(mod.CFG["context_pct"], 0.0)
         self.assertTrue(mod.CFG["context_restart_on"])
         self.assertEqual(mod.DEFAULT_RESTART_PCT, 51.0)   # still the number the table bakes in
 
-    def test_an_explicit_percentage_still_wins_over_the_flag(self):
+    def test_an_explicit_token_threshold_still_wins_over_the_flag(self):
         from helper import load as reload_impl
-        mod = reload_impl(CR_CONTEXT_RESTART="1", CR_CONTEXT_PCT="30")
-        self.assertEqual(mod.CFG["context_pct"], 30.0)
-
-    def test_an_explicit_zero_still_turns_it_off_with_the_flag_set(self):
-        from helper import load as reload_impl
-        mod = reload_impl(CR_CONTEXT_RESTART="1", CR_CONTEXT_PCT="0")
-        self.assertEqual(mod.CFG["context_pct"], 0.0)
+        mod = reload_impl(CR_CONTEXT_RESTART="1", CR_CONTEXT_TOKENS="300000")
+        self.assertEqual(mod.CFG["context_tokens"], 300000)
+        self.assertTrue(mod.CFG["context_restart_on"])
 
 
 class TestWhatTheCornerSays(RestartTestCase):
@@ -2131,7 +2133,7 @@ class TestWhatTheCornerSays(RestartTestCase):
         self.assertAlmostEqual(ctl.badge_context(), 45.0, delta=0.1)
 
     def test_nothing_at_all_when_the_feature_is_off(self):
-        ctl = restart_controller(context_pct=0, context_tokens=0)
+        ctl = restart_controller(context_tokens=0)
         usage(ctl, 0, 999999)
         self.assertIsNone(ctl.badge_context())
 

@@ -142,7 +142,7 @@ class TestTwoWrappers(TwoWrappersTestCase):
         base = {
             "agent": "claude",
             "CR_SCRAPE": "never",
-            "CR_CONTEXT_PCT": "51",
+            "CR_CONTEXT_TOKENS": "510000",
             "CR_HANDOFF_FILE": "handoff.md",
             "CR_ROOT_IDLE_SEC": "1",
             "CR_HANDOFF_TIMEOUT_SEC": "45",
@@ -186,7 +186,7 @@ class TestTwoWrappers(TwoWrappersTestCase):
             "CODEX_HOME": os.path.join(shared, "codex-home"),
             "agent": "claude",
             "CR_SCRAPE": "never",
-            "CR_CONTEXT_PCT": "51",
+            "CR_CONTEXT_TOKENS": "510000",
             "CR_HANDOFF_FILE": "handoff.md",
             "CR_HANDOFF_REGISTRY_DIR": os.path.join(shared, "handoff-registry"),
             "CR_ROOT_IDLE_SEC": "1",

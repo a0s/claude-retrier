@@ -84,7 +84,7 @@ def write_record(rtype, payload, ts=None):
     rec = {"timestamp": ts or now_iso(), "ordinal": ORDINAL[0], "type": rtype, "payload": payload}
     ORDINAL[0] += 1
     with open(SESSION[0], "a") as fh:
-        fh.write(json.dumps(rec) + "\n")
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         fh.flush()
         os.fsync(fh.fileno())
 

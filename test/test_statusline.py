@@ -191,7 +191,7 @@ class TestClaudeLaunchArgsAddTheStatuslineProxy(unittest.TestCase):
         self.addCleanup(os.environ.pop, "CR_SELF", None)
 
     def cfg(self, **over):
-        base = dict(context_pct=50, context_tokens=0, context_restart_on=False,
+        base = dict(context_tokens=135200, context_restart_on=False,
                    statusline_proxy=True, status_dir="/tmp/cr-status-test")
         base.update(over)
         return base
@@ -209,11 +209,11 @@ class TestClaudeLaunchArgsAddTheStatuslineProxy(unittest.TestCase):
 
     def test_not_without_a_restart_to_inform(self):
         self.assertEqual(
-            cr.claude_launch_args(self.cfg(context_pct=0, context_tokens=0), "claude", []), [])
+            cr.claude_launch_args(self.cfg(context_tokens=0), "claude", []), [])
 
     def test_the_bare_flag_is_enough_too(self):
         args = cr.claude_launch_args(
-            self.cfg(context_pct=0, context_tokens=0, context_restart_on=True), "claude", [])
+            self.cfg(context_tokens=0, context_restart_on=True), "claude", [])
         self.assertEqual(args[0], "--settings")
 
     def test_the_off_switch(self):

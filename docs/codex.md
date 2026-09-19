@@ -6,7 +6,7 @@ subcommands are wrapped, and the codex context-restart threshold.
 [← back to README](../README.md)
 
 - [Running it](#running-it)
-- [Which agent: `--agent`](#which-agent---agent)
+- [Which agent: `--agent`](#which-agent-agent)
 - [Rollouts: what the wrapper reads](#rollouts-what-the-wrapper-reads)
 - [Subcommands](#subcommands)
 - [Skills and file mentions in codex](#skills-and-file-mentions-in-codex)
@@ -141,46 +141,43 @@ The [context restart](context-restart.md) works on codex the same way it does
 on claude, with a threshold of its own:
 
 ```sh
-CR_CODEX_CONTEXT_PCT=60 claude-retrier --cmd codex
+CR_CONTEXT_RESTART=1 claude-retrier --cmd codex
 ```
 
-`CR_CODEX_CONTEXT_PCT` defaults to `CR_CONTEXT_PCT`: type an explicit
-percentage and it covers both agents, exactly as if you had set
-`CR_CODEX_CONTEXT_PCT` to the same number yourself — a fraction of a window
-means the same thing whatever the window is. `CR_CODEX_CONTEXT_PCT=0` turns it
-off for codex alone.
-
-`CR_CONTEXT_RESTART=1` does **not** hand codex that same borrowed percentage,
-though. Codex restarts against a hard cap under `CR_CODEX_RESERVE_TOKENS` — a
-number already tuned for exactly that cap — not against a fraction of its own
-window the way claude does, so a flat percentage would mean something
-different, and arguably worse, for codex than it does for claude. Under the
-flag, with no percentage set by hand, codex reads its own row out of
-`MODEL_PROFILES` (T18; `--cr-models` prints the table): for the 5.6-class
-models that row is `258,400 / 194,400 / 258,400` (window / restart_at /
-compact_at), i.e. the cap minus the same 64k `CR_CODEX_RESERVE_TOKENS`
-default — reclamped against whatever you actually set that to, not the frozen
-number. That row only answers at all when the rollout's window matches the
-one it was written for; a `model_context_window` raised in `config.toml`
-reports a different window, the row sits out, and an explicit
-`CR_CODEX_CONTEXT_PCT` is what decides at that point (see
+Codex restarts against a hard cap under `CR_CODEX_RESERVE_TOKENS` — a number
+already tuned for exactly that cap — not against a fraction of its own window
+the way claude does, so a shared percentage would have meant something
+different, and arguably worse, for codex than it does for claude; that is why
+codex has never shared claude's `CR_CONTEXT_TOKENS` and why the old
+`CR_CONTEXT_PCT`/`CR_CODEX_CONTEXT_PCT` pair was removed in 2.0. Under the
+flag, codex reads its own row out of `MODEL_PROFILES` (T18; `--cr-models`
+prints the table): for the 5.6-class models that row is `258,400 / 194,400 /
+258,400` (window / restart_at / compact_at), i.e. the cap minus the same 64k
+`CR_CODEX_RESERVE_TOKENS` default — reclamped against whatever you actually
+set that to, not the frozen number. That row only answers at all when the
+rollout's window matches the one it was written for; a `model_context_window`
+raised in `config.toml` reports a different window, the row sits out, and the
+same flag falls back to the window minus `CR_CODEX_RESERVE_TOKENS` applied to
+whatever window the rollout actually reports, rather than leaving codex
+unprotected (see
 [context-restart.md](context-restart.md#the-context-window)).
 
 `CR_CODEX_CONTEXT_TOKENS` has no default and never borrows `CR_CONTEXT_TOKENS`.
 An absolute count is tied to a window — 500k picked for a 1M claude session is
-past the end of a 258k codex one — and it would overrule codex's percentage.
+past the end of a 258k codex one — and it would overrule codex's own row.
 `CR_CODEX_TOKENS_<SLUG>` sits above both: an absolute threshold for one codex
 model by name (`gpt-5.6-sol` → `CR_CODEX_TOKENS_GPT_5_6_SOL`), useful once more
 than one codex model is in play and they do not compact at the same point.
 
-### The percentage matches codex's status line
+### The badge percentage matches codex's status line
 
-The percentage is the one codex's status line shows — `Context 19% used`. codex
-leaves a fixed 12,000 tokens (the prompt a session carries before anyone speaks)
-out of both sides of that fraction, and the wrapper does the same, so 60% fires
-when the status line says 60%, not a few points earlier. Nothing is read off the
-screen: the window comes from the rollout, and the count from codex's own log
-(see [below](#staying-ahead-of-codexs-own-compaction)).
+Whatever the threshold is, the corner badge shows how full the session is as a
+percentage the same way codex's own status line does — `Context 19% used`.
+codex leaves a fixed 12,000 tokens (the prompt a session carries before anyone
+speaks) out of both sides of that fraction, and the wrapper does the same, so
+`cr 60%` matches the status line's own 60%, not a few points earlier. Nothing
+is read off the screen: the window comes from the rollout, and the count from
+codex's own log (see [below](#staying-ahead-of-codexs-own-compaction)).
 
 ## How it differs from claude underneath
 
@@ -273,7 +270,7 @@ restart is dropped and the session falls back on codex's own compaction. If it
 had — the file already passes every check `/clear` would have waited for — the
 wrapper skips straight to sending the resume phrase instead of aborting, since
 codex already did the clearing for it. A larger `CR_CODEX_RESERVE_TOKENS` or a
-lower `CR_CODEX_CONTEXT_PCT` gives the next one more room either way.
+lower `CR_CODEX_CONTEXT_TOKENS` gives the next one more room either way.
 
 ### Judging the reserve against real folds
 

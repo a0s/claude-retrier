@@ -34,13 +34,24 @@ should get that by accident. One variable. It is off until you set it, and
 nothing below happens without it:
 
 ```sh
-CR_CONTEXT_PCT=51 claude-retrier          # restart at 51% of the context window
+CR_CONTEXT_RESTART=1 claude-retrier       # restart where this model's own row says
+CR_CONTEXT_RESTART=1 codex-retrier        # ... which is a different point on codex
+CR_CONTEXT_TOKENS=500k claude-retrier     # or: restart at this many tokens, exactly
 ```
+
+Which of the two to reach for: `CR_CONTEXT_RESTART=1` if you run both agents,
+or do not want to think about a number — it is the only setting that means the
+right thing on claude *and* codex at once, because each one reads its own row
+rather than sharing one number. `CR_CONTEXT_TOKENS` if you have watched the
+badge for a day and want a specific number on claude. Copy-paste versions of
+both are in [minimal configs](configuration.md#minimal-configs), and
+[how to read a setting](configuration.md#how-to-read-this-page) explains which
+variables are shared between the agents and which are not.
 
 `CR_CONTEXT_RESTART=1` is the same thing without having to pick a number: it
 arms the model's own row in the [profile table](#the-context-window) instead —
 `--cr-models` prints exactly what that resolves to for your environment — unless
-`CR_CONTEXT_PCT` or `CR_CONTEXT_TOKENS` says otherwise. For the claude models
+`CR_CONTEXT_TOKENS` (or a per-model override) says otherwise. For the claude models
 this project has always shipped 1M/200k windows for, that row's `restart_at` is
 the same 51% (`DEFAULT_RESTART_PCT`) it has always used, just baked in per
 model now instead of applied blind to whatever window a session happens to
@@ -52,7 +63,7 @@ threshold under this flag.
 Two more make it fit a project you actually work in:
 
 ```sh
-export CR_CONTEXT_PCT=51
+export CR_CONTEXT_RESTART=1
 export CR_HANDOFF_FILE=scratchpad/RESUME.md      # relative to cwd, .gitignore it
 export CR_RESUME_MSG='Read `{file}` and carry on from it.'
 ```
@@ -279,16 +290,16 @@ struggling for space; much below 30% and you restart more often than you get
 work done. Watch the badge for a day and move it.
 
 `CR_CONTEXT_TOKENS` sets an absolute threshold instead (`500k` is fine), and it
-beats the percentage.
+beats the model's own row.
 
 One model behaving differently from the rest of its own fleet does not need a
 whole new threshold for everyone: `CR_CLAUDE_TOKENS_<SLUG>` and
 `CR_CODEX_TOKENS_<SLUG>` set an absolute threshold for one model by name —
 `<SLUG>` is that model's slug, uppercased, with anything that is not a letter
 or digit turned into `_` (`claude-opus-5` → `CLAUDE_OPUS_5`, `gpt-5.6-sol` →
-`GPT_5_6_SOL`). It outranks the percentage and `CR_CONTEXT_TOKENS` both, but
-only for that one model — every other model still reads off whichever of those
-two is set.
+`GPT_5_6_SOL`). It outranks `CR_CONTEXT_TOKENS` and the model's own row both,
+but only for that one model — every other model still reads off whichever of
+those two is set.
 
 ```sh
 export CR_CLAUDE_TOKENS_CLAUDE_HAIKU_4_5=90000   # this one model folds sooner
@@ -300,16 +311,21 @@ top to bottom, is:
 1. `CR_CLAUDE_TOKENS_<SLUG>` / `CR_CODEX_TOKENS_<SLUG>` — one exact model.
 2. `CR_CONTEXT_TOKENS` / `CR_CODEX_CONTEXT_TOKENS` — an absolute number, never
    shared between agents (codex never inherits claude's).
-3. `CR_CONTEXT_PCT` / `CR_CODEX_CONTEXT_PCT` × the window.
-4. the model's own row in the [profile table](#the-context-window), armed by
+3. the model's own row in the [profile table](#the-context-window), armed by
    `CR_CONTEXT_RESTART=1`, and only when the window matches what that row was
    written for.
-5. nothing — a model this build has never heard of, with no explicit number
-   from you, stays disarmed rather than guessing.
+4. the same `CR_CONTEXT_RESTART=1` flag, applied to a window no row
+   describes instead — a model this build has never heard of, or one whose
+   window was raised past what its row assumes: `DEFAULT_RESTART_PCT` (51%)
+   of whatever window the session actually has for claude, the usable window
+   minus `CR_CODEX_RESERVE_TOKENS` for codex. This is what keeps a brand-new
+   model protected the day it ships, before this build has ever heard of it.
+5. nothing — only when there is no window at all yet (codex before its first
+   turn) does the trigger stay disarmed rather than guessing.
 
-Whatever (4) answers is always capped under that row's `compact_at` minus
-`CR_CODEX_RESERVE_TOKENS` (0 for claude), read live rather than trusted frozen
-into the table.
+Whatever (3) or (4) answers is always capped under that row's `compact_at`
+minus `CR_CODEX_RESERVE_TOKENS` (0 for claude), read live rather than trusted
+frozen into the table.
 
 A threshold is a fraction of the window, but the session it protects never
 starts at zero: the system prompt, `CLAUDE.md`, MCP tool definitions and the
@@ -322,13 +338,13 @@ at 57k has only 45k left to work with before it folds again, sometimes inside
 left: if `threshold − baseline` falls under `CR_CONTEXT_MIN_HEADROOM` (default
 `80k`), it raises the threshold for the rest of the session — `baseline +
 CR_CONTEXT_MIN_HEADROOM`, but never past the model's own `compact_at` minus
-its reserve, the same ceiling stage (4) above is held to — and says so in the
-log. Against a window at or under 200k, the check itself uses whichever is
+its reserve, the same ceiling stage (3)/(4) above is held to — and says so in
+the log. Against a window at or under 200k, the check itself uses whichever is
 smaller of `CR_CONTEXT_MIN_HEADROOM` and 30% of the window, so a window too
 small to ever spare 80k is not nagged over headroom it never had; the raise
 that follows still reaches for the full `CR_CONTEXT_MIN_HEADROOM` where the
 model's `compact_at` leaves room for it. When there is nowhere to raise it to,
-the wrapper says so out loud instead of guessing — widening `CR_CONTEXT_PCT`
+the wrapper says so out loud instead of guessing — widening `CR_CONTEXT_TOKENS`
 or moving to a bigger window is then a decision for a person, not the wrapper.
 
 A threshold that still cannot hold is a different problem: more than
@@ -341,7 +357,7 @@ failed unfold leaves behind, visible the same way (badge, notify).
 
 Every model this build knows about is one row in a profile table — window,
 where the wrapper restarts by default, and where the agent folds the context
-on its own (`compact_at`, used only for the capping in stage 4 above).
+on its own (`compact_at`, used only for the capping in stages 3/4 above).
 `--cr-models` prints it resolved against your actual environment:
 
 ```
@@ -445,7 +461,7 @@ point Claude Code compacts the context on its own — the exact "invisible"
 failure this whole feature exists to prevent.
 
 Claude Code's own statusline is asked, instead of guessed at: once a restart
-is armed (`CR_CONTEXT_PCT`/`CR_CONTEXT_TOKENS`/`CR_CONTEXT_RESTART`), the
+is armed (`CR_CONTEXT_TOKENS`/`CR_CONTEXT_RESTART`), the
 wrapper passes claude a `--settings` naming
 `<this file> --cr-statusline <path>` as its `statusLine` command. Claude Code
 invokes that command with a JSON payload including
@@ -465,7 +481,7 @@ model-name update.
 
 `CR_STATUSLINE_PROXY=0` turns the whole mechanism off: no `--settings` is
 added at all, and the wrapper is back to guessing purely from the model
-profile table (stage 4).
+profile table (stages 3/4).
 
 **Verified vs assumed** (2026-09-19, no live Claude Code session was
 available while building this): the documented statusline payload shape
@@ -528,9 +544,9 @@ of them (whichever one happens to match the prefix you picked by hand). See
 
 Look in `~/.claude-retrier/log`. In order of likelihood:
 
-- No `context restart armed` line at all: `CR_CONTEXT_PCT` never reached the
-  wrapper. Check that it is exported, and that your `--cmd` wrapper is not
-  starting claude in a scrubbed environment.
+- No `context restart armed` line at all: neither `CR_CONTEXT_RESTART` nor
+  `CR_CONTEXT_TOKENS` reached the wrapper. Check that it is exported, and that
+  your `--cmd` wrapper is not starting claude in a scrubbed environment.
 - `restart step held: ...` is working as intended. It will not type over you
   mid-sentence, and it will not interrupt a turn that is still running. On
   codex, `a turn is still running` can last as long as the turn does, however
@@ -577,11 +593,11 @@ Look in `~/.claude-retrier/log`. In order of likelihood:
 
 ## Settings
 
-Every context-restart setting — `CR_CONTEXT_PCT`, `CR_CONTEXT_TOKENS`,
+Every context-restart setting — `CR_CONTEXT_RESTART`, `CR_CONTEXT_TOKENS`,
 `CR_CONTEXT_WINDOW`, the codex thresholds, the model lookup, the handoff file
 and phrases, the timeouts and `CR_SLASH_ENTER` — is in
 [configuration.md](configuration.md#context-restart), and all of them do nothing
-until `CR_CONTEXT_PCT` is set.
+until `CR_CONTEXT_RESTART` or `CR_CONTEXT_TOKENS` is set.
 
 See also: [codex](codex.md), [usage limits](usage-limits.md),
 [troubleshooting](troubleshooting.md).

@@ -5,142 +5,257 @@ variables.
 
 [← back to README](../README.md)
 
+- [How to read this page](#how-to-read-this-page)
+- [Minimal configs](#minimal-configs)
 - [Commands and agents](#commands-and-agents)
 - [Usage limits and typing](#usage-limits-and-typing)
 - [Stalls](#stalls)
 - [Context restart](#context-restart)
 - [Codex](#codex)
-- [The badge](#the-badge)
+- [The badge and the subagent overlay](#the-badge-and-the-subagent-overlay)
 - [Updates](#updates)
 - [Logging and switching it off](#logging-and-switching-it-off)
+- [Rarely touched](#rarely-touched)
 - [Detection patterns](#detection-patterns)
 
 Wrapper flags: `--cmd` (same as `CR_CLAUDE_CMD`), `--agent` / `--cr-agent`
-(same as `CR_AGENT`), `--cr-dump-argv` (print what will be executed),
+(same as `CR_AGENT`), `--cr-models` (print the model profile table resolved
+against your environment), `--cr-dump-argv` (print what will be executed),
 `--cr-help` (includes the default `CR_HANDOFF_MSG`). Every other argument goes
 to claude or codex.
+
+## How to read this page
+
+The wrapper drives **two** agents — Claude Code and codex — and a setting is
+always one of four kinds. The `applies to` column in every table below says
+which:
+
+| shape | meaning | example |
+|---|---|---|
+| `CR_FOO` — **both** | one value, used by whichever agent is running | `CR_MESSAGE`, `CR_HANDOFF_FILE` |
+| `CR_CLAUDE_FOO` / `CR_CODEX_FOO` — **override** | narrows `CR_FOO` to one agent; unset means "use `CR_FOO`" | `CR_CODEX_RESUME_MSG` |
+| `CR_CLAUDE_FOO` / `CR_CODEX_FOO` — **agent-only** | exists for one agent alone; there is no shared `CR_FOO` behind it | `CR_CODEX_RESERVE_TOKENS`, `CR_STATUSLINE_PROXY` |
+| `CR_CLAUDE_TOKENS_<SLUG>` / `CR_CODEX_TOKENS_<SLUG>` — **one model** | a value for a single model, by name | `CR_CLAUDE_TOKENS_CLAUDE_HAIKU_4_5` |
+
+Three rules cover every case:
+
+1. **The more specific setting wins.** one model → one agent → both. Nothing
+   is merged; the most specific value that is set is simply the one used.
+2. **A per-agent override with no value falls back to the shared one.** So
+   `CR_HANDOFF_MSG` alone covers claude and codex, and adding
+   `CR_CODEX_HANDOFF_MSG` peels codex off it without touching claude.
+3. **One exception, deliberate, about absolute token counts.**
+   `CR_CODEX_CONTEXT_TOKENS` never inherits `CR_CONTEXT_TOKENS` — a count
+   picked for a 1M claude window is nonsense against a 258k codex one. Under
+   `CR_CONTEXT_RESTART=1` each agent reaches for its own row in the
+   [profile table](context-restart.md#the-context-window) instead, so there
+   is nothing to inherit either way.
+
+`<SLUG>` is the model's slug, uppercased, with every non-alphanumeric
+character turned into `_`: `claude-opus-5` → `CLAUDE_OPUS_5`, `gpt-5.6-sol` →
+`GPT_5_6_SOL`. `--cr-models` prints the slugs your environment actually
+resolves, so you never have to guess one.
+
+## Minimal configs
+
+**Nothing at all** is a working config: `claude-retrier` and `codex-retrier`
+wait out usage limits and nudge refused turns out of the box. The context
+restart is the one feature that is off until you ask for it, because it clears
+a session's history.
+
+**The whole context restart, both agents, one repo** — this is the config to
+copy:
+
+```sh
+export CR_CONTEXT_RESTART=1
+export CR_HANDOFF_FILE='.claude-retrier/handoff-{id}.md'
+```
+
+`CR_CONTEXT_RESTART=1` arms the restart without making you pick a number: each
+agent uses its own row in the [model profile table](context-restart.md#the-context-window)
+— 51% of the window for claude, the hard cap minus the 64k reserve for codex
+— which is exactly the point, because the right number is not the same one on
+both. `{id}` gives every session its own handoff path, so a claude and a codex
+session running side by side in the same directory can never write over each
+other. Add `.claude-retrier/` to `.gitignore` and that is the setup.
+
+**Pick the numbers yourself** instead:
+
+```sh
+export CR_CONTEXT_TOKENS=500k         # claude: this many tokens, exactly
+export CR_CODEX_CONTEXT_TOKENS=190k   # codex: its own number — never inherited from claude's
+export CR_HANDOFF_FILE='.claude-retrier/handoff-{id}.md'
+```
+
+**One phrase, both agents**, when the handoff should go through a skill of
+yours — `{skill:NAME}` expands to `/NAME` on claude and `$NAME` on codex:
+
+```sh
+export CR_RESUME_MSG='{skill:catch-up} read `{file}` and continue from it'
+```
+
+Everything else on this page is tuning. [context-restart.md](context-restart.md)
+explains what the restart actually does; [codex.md](codex.md) explains where
+codex differs.
 
 ## Commands and agents
 
 More in [custom-command.md](custom-command.md) and [codex.md](codex.md).
 
-| variable | default | |
-|---|---|---|
-| `CR_CLAUDE_CMD` | | your claude command (same as `--cmd`) |
-| `CR_AGENT` | `auto` | `auto` \| `claude` \| `codex` — which one you are running (same as `--agent`) |
-| `CR_CODEX_CMD` | `codex` | the command `codex-retrier` runs |
-| `CR_SHELL` | `$SHELL` | shell that knows your aliases |
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_CLAUDE_CMD` | | claude | your claude command (same as `--cmd`) |
+| `CR_CODEX_CMD` | `codex` | codex | the command `codex-retrier` runs; never borrowed from `CR_CLAUDE_CMD` |
+| `CR_AGENT` | `auto` | both | `auto` \| `claude` \| `codex` — which one you are running (same as `--agent`) |
+| `CR_SHELL` | `$SHELL` | both | shell that knows your aliases |
+| `CR_CLAUDE_BIN` | | claude | skip resolution and run exactly this executable |
+| `CR_CLAUDE_FALLBACKS` | `~/.claude/local/claude:~/.local/bin/claude:/opt/homebrew/bin/claude:/usr/local/bin/claude` | claude | where to look when `claude` is not on `PATH` |
 
 ## Usage limits and typing
 
-More in [usage-limits.md](usage-limits.md).
+More in [usage-limits.md](usage-limits.md). None of this differs between the
+two agents: a limit is a limit.
 
-| variable | default | |
-|---|---|---|
-| `CR_MESSAGE` | `continue` | what to type when the limit lifts |
-| `CR_MARGIN_SEC` | `45` | extra wait past the stated reset time |
-| `CR_MAX_ATTEMPTS` | `3` | sends per incident before giving up |
-| `CR_USER_IDLE_SEC` | `20` | don't type while you are typing |
-| `CR_TYPING_MAX_SEC` | `900` | but not past this, with an empty input box |
-| `CR_RESUME_SEC` | `15` | claude working this long during a wait ends it |
-| `CR_DRAFT_GRACE_SEC` | `600` | an untouched draft this old stops blocking |
-| `CR_SCRAPE` | `auto` | `auto` \| `always` \| `never` |
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_MESSAGE` | `continue` | both | what to type when the limit lifts |
+| `CR_MARGIN_SEC` | `45` | both | extra wait past the stated reset time |
+| `CR_MAX_ATTEMPTS` | `3` | both | sends per incident before giving up |
+| `CR_USER_IDLE_SEC` | `20` | both | don't type while you are typing |
+| `CR_TYPING_MAX_SEC` | `900` | both | but not past this, with an empty input box |
+| `CR_RESUME_SEC` | `15` | both | the agent working this long during a wait ends it |
+| `CR_DRAFT_GRACE_SEC` | `600` | both | an untouched draft this old stops blocking |
+| `CR_FALLBACK_WAIT_SEC` | `18000` | both | how long to wait when the notice names no reset time (5 h) |
+| `CR_MAX_WAIT_SEC` | `691200` | both | ceiling on any single wait (8 days) |
+| `CR_SCRAPE` | `auto` | both | `auto` \| `always` \| `never` — read the limit off the screen as well as the transcript |
 
 ## Stalls
 
 More in [stalls.md](stalls.md).
 
-| variable | default | |
-|---|---|---|
-| `CR_STALL_WAIT_SEC` | `60` | first wait after a stall; `0` switches stalls off |
-| `CR_STALL_BACKOFF` | `2` | multiply the wait by this for each repeat |
-| `CR_STALL_MAX_WAIT_SEC` | `600` | the longest a stall wait gets |
-| `CR_STALL_MAX_ATTEMPTS` | `8` | consecutive stalls before it stops nudging |
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_STALL_WAIT_SEC` | `60` | both | first wait after a stall; `0` switches stalls off |
+| `CR_STALL_BACKOFF` | `2` | both | multiply the wait by this for each repeat |
+| `CR_STALL_MAX_WAIT_SEC` | `600` | both | the longest a stall wait gets |
+| `CR_STALL_MAX_ATTEMPTS` | `8` | both | consecutive stalls before it stops nudging |
 
 ## Context restart
 
-More in [context-restart.md](context-restart.md). All of these do nothing until
-`CR_CONTEXT_PCT`, `CR_CONTEXT_TOKENS` or `CR_CONTEXT_RESTART` is set.
+More in [context-restart.md](context-restart.md). Everything here does nothing
+until one of `CR_CONTEXT_RESTART`, `CR_CONTEXT_TOKENS` or a per-model
+`CR_CLAUDE_TOKENS_<SLUG>`/`CR_CODEX_TOKENS_<SLUG>` is set.
 
-| variable | default | |
-|---|---|---|
-| `CR_CONTEXT_RESTART` | `0` | `1` turns the restart on without making you pick a number: the model's own row in the profile table (`--cr-models`, [context-restart.md](context-restart.md#the-context-window)) answers instead; an explicit `CR_CONTEXT_PCT`/`CR_CONTEXT_TOKENS`/`CR_CODEX_CONTEXT_PCT` — `0` included — still wins outright |
-| `CR_CONTEXT_PCT` | `0` | restart at this % of the window; `0` is off |
-| `CR_CONTEXT_TOKENS` | `0` | absolute threshold (`500k` is fine); beats the % |
-| `CR_CONTEXT_WINDOW` | `auto` | `auto` \| `200k` \| `1M` \| a number |
-| `CR_STATUSLINE_PROXY` | `1` | `0` disables the statusline proxy entirely — no `--settings` is added to claude's launch, and `[1m]` vs 200k falls back to the profile table alone; see [context-restart.md](context-restart.md#1m-vs-200k-the-statusline-proxy) |
-| `CR_STATUS_DIR` | `~/.claude-retrier/status` | where `--cr-statusline` writes what claude's own statusline reports, one file per wrapper pid |
-| `CR_CLAUDE_TOKENS_<SLUG>`, `CR_CODEX_TOKENS_<SLUG>` | unset | absolute threshold for one model by name, e.g. `CR_CLAUDE_TOKENS_CLAUDE_OPUS_5=510000` or `CR_CODEX_TOKENS_GPT_5_6_SOL=140000` (`<SLUG>` = the model slug, uppercased, non-alphanumerics turned to `_`) — outranks everything above, for that model only |
-| `CR_MODEL_LOOKUP` | `1` | look an unfamiliar model up; `0` never touches the network |
-| `CR_MODEL_CACHE` | `~/.claude-retrier/windows.json` | what the lookup learned |
-| `CR_MODEL_CACHE_TTL_SEC` | `604800` | a week |
-| `CR_HANDOFF_FILE` | `.claude-retrier/handoff.md` | where the fold is written; `{id}` makes it unique per session |
-| `CR_HANDOFF_REGISTRY_DIR` | `~/.claude-retrier/sessions` | where wrapper instances claim their handoff path, so two sharing an `{id}`-free `CR_HANDOFF_FILE` do not overwrite each other (T05) |
-| `CR_HANDOFF_MSG` | (see `--cr-help`) | the folding phrase; `{file}`, `{marker}` |
-| `CR_RESUME_MSG` | ``Read `{file}` and continue from it.`` | the unfolding phrase |
-| `CR_CLEAR_CMD` | `/clear` | |
-| `CR_CANCEL_MSG` | (see `--cr-help`) | said instead of a plain "restart aborted" notice when the abort comes after the fold already reached the session (T09); `{file}` |
-| `CR_CLAUDE_HANDOFF_MSG`, `CR_CODEX_HANDOFF_MSG` | unset = `CR_HANDOFF_MSG` | override for one agent only — a phrase that names a command (a skill, a custom prompt) cannot be shared, because claude and codex do not recognize the same ones |
-| `CR_CLAUDE_RESUME_MSG`, `CR_CODEX_RESUME_MSG` | unset = `CR_RESUME_MSG` | same, for the unfolding phrase |
-| `CR_CLAUDE_CLEAR_CMD`, `CR_CODEX_CLEAR_CMD` | unset = `CR_CLEAR_CMD` | same, for the clear command |
-| `CR_CLAUDE_CANCEL_MSG`, `CR_CODEX_CANCEL_MSG` | unset = `CR_CANCEL_MSG` | same, for the cancel phrase |
-| `{skill:NAME}` | — | not a variable — a placeholder usable inside `CR_HANDOFF_MSG`/`CR_RESUME_MSG`/`CR_CANCEL_MSG` (and their per-agent overrides above), expanded per agent to the syntax it actually sends: `/NAME` for claude, `$NAME` for codex (T17); see [context-restart.md](context-restart.md#writing-your-own-phrases) |
-| `CR_HANDOFF_MARKER` | `HANDOFF` | prefix; a nonce is appended to it |
-| `CR_HANDOFF_MIN_BYTES` | `200` | a shorter file is not a handoff |
-| `CR_HANDOFF_ATTEMPTS` | `2` | folds attempted before giving up |
-| `CR_ROOT_IDLE_SEC` | `20` | transcript quiet this long means the turn is over |
-| `CR_HANDOFF_TIMEOUT_SEC` | `900` | per step, and frozen while a limit runs |
-| `CR_CLEAR_SETTLE_SEC` | `5` | screen quiet this long after `/clear` counts as confirmation on its own |
-| `CR_STEP_GAP_SEC` | `3` | between `/clear` and the resume phrase |
-| `CR_RESUME_ATTEMPTS` | `5` | unfold retries, each wait doubling, before the debt becomes visible instead of retried |
-| `CR_CONTEXT_COOLDOWN_SEC` | `600` | silence after any restart |
-| `CR_CONTEXT_MAX_CYCLES` | `0` | `0` = no cap; a fuse against a loop |
-| `CR_CONTEXT_MIN_HEADROOM` | `80k` | floor the threshold is raised to protect once a restart lands, if the baseline it comes back to leaves less than this (capped to 30% of a window ≤ 200k); see [context-restart.md](context-restart.md#choosing-a-threshold) |
-| `CR_CONTEXT_MAX_PER_HOUR` | `3` | more restarts than this in a rolling hour switches the trigger off for the rest of the session; `0` = no cap |
-| `CR_NOTIFY_REPEAT_SEC` | `300` | how often an `unfold failed` or `restart off` debt is said again, until a key is pressed; see [how-it-works.md](how-it-works.md#a-sign-of-life) |
-| `CR_SLASH_ENTER` | `2` | Enters sent for a `/command` |
+### Arming it, and where the threshold comes from
+
+Resolved most specific first — the full order is in
+[choosing a threshold](context-restart.md#choosing-a-threshold).
+
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_CLAUDE_TOKENS_<SLUG>` | unset | one claude model | absolute threshold for that model alone, e.g. `CR_CLAUDE_TOKENS_CLAUDE_OPUS_5=510000`; outranks everything below |
+| `CR_CODEX_TOKENS_<SLUG>` | unset | one codex model | the same, e.g. `CR_CODEX_TOKENS_GPT_5_6_SOL=140000` |
+| `CR_CONTEXT_TOKENS` | `0` | both | absolute threshold (`500k` is fine); beats the model's own row |
+| `CR_CODEX_CONTEXT_TOKENS` | `0` — **never** `CR_CONTEXT_TOKENS` | codex | absolute threshold for codex; a count picked for a 1M window would be past the end of codex's 258k one |
+| `CR_CONTEXT_RESTART` | `0` | both | `1` arms the restart without a number: each agent uses its own row in the profile table (`--cr-models`), or — for a model that row does not describe — `DEFAULT_RESTART_PCT` (51%) applied to whatever window the session actually has. An explicit `CR_CONTEXT_TOKENS` — `0` included — still wins outright |
+| `CR_CONTEXT_WINDOW` | `auto` | both | `auto` \| `200k` \| `1M` \| a number. Rarely needed on codex, which states its window in every rollout |
+
+### Knowing the window
+
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_STATUSLINE_PROXY` | `1` | claude | `0` disables the statusline proxy — no `--settings` is added to claude's launch, and `[1m]` vs 200k falls back to the profile table; see [the statusline proxy](context-restart.md#1m-vs-200k-the-statusline-proxy) |
+| `CR_STATUS_DIR` | `~/.claude-retrier/status` | claude | where `--cr-statusline` writes what claude's own statusline reports, one file per wrapper pid |
+| `CR_MODEL_LOOKUP` | `1` | both | look an unfamiliar model up; `0` never touches the network |
+| `CR_MODEL_CACHE` | `~/.claude-retrier/windows.json` | both | what the lookup learned |
+| `CR_MODEL_CACHE_TTL_SEC` | `604800` | both | a week |
+
+### The handoff file and the phrases
+
+Every phrase variable here is a **shared** setting with a per-agent override
+next to it. Set the shared one and both agents use it; set
+`CR_CLAUDE_*`/`CR_CODEX_*` to peel one off.
+
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_HANDOFF_FILE` | `.claude-retrier/handoff.md` | both | where the fold is written; `{id}` makes it unique per session |
+| `CR_HANDOFF_REGISTRY_DIR` | `~/.claude-retrier/sessions` | both | where wrapper instances claim their handoff path, so two sharing an `{id}`-free `CR_HANDOFF_FILE` do not overwrite each other (T05) |
+| `CR_HANDOFF_MSG` | (see `--cr-help`) | both | the folding phrase; `{file}`, `{marker}` |
+| `CR_RESUME_MSG` | ``Read `{file}` and continue from it.`` | both | the unfolding phrase; `{file}` |
+| `CR_CANCEL_MSG` | (see `--cr-help`) | both | said instead of a plain "restart aborted" notice when the abort comes after the fold already reached the session (T09); `{file}` |
+| `CR_CLEAR_CMD` | `/clear` | both | the command that starts a fresh session in place |
+| `CR_CLAUDE_HANDOFF_MSG` / `CR_CODEX_HANDOFF_MSG` | = `CR_HANDOFF_MSG` | override | a phrase naming a command cannot always be shared — claude and codex do not recognize the same ones |
+| `CR_CLAUDE_RESUME_MSG` / `CR_CODEX_RESUME_MSG` | = `CR_RESUME_MSG` | override | same, for the unfolding phrase |
+| `CR_CLAUDE_CANCEL_MSG` / `CR_CODEX_CANCEL_MSG` | = `CR_CANCEL_MSG` | override | same, for the cancel phrase |
+| `CR_CLAUDE_CLEAR_CMD` / `CR_CODEX_CLEAR_CMD` | = `CR_CLEAR_CMD` | override | same, for the clear command (`/clear` itself works on both — verified live, codex-cli 0.155.1) |
+| `{skill:NAME}` | — | both | not a variable — a placeholder inside any of the phrases above, expanded per agent to the syntax that agent actually understands: `/NAME` for claude, `$NAME` for codex (T17); see [writing your own phrases](context-restart.md#writing-your-own-phrases) |
+| `CR_HANDOFF_MARKER` | `HANDOFF` | both | prefix; a nonce is appended to it |
+| `CR_HANDOFF_MIN_BYTES` | `200` | both | a shorter file is not a handoff |
+
+### Timing and safety rails
+
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_HANDOFF_ATTEMPTS` | `2` | both | folds attempted before giving up |
+| `CR_ROOT_IDLE_SEC` | `20` | claude | transcript quiet this long means the turn is over (codex reads its rollout's own turn rows instead) |
+| `CR_HANDOFF_TIMEOUT_SEC` | `900` | both | per step, and frozen while a limit runs |
+| `CR_CLEAR_SETTLE_SEC` | `5` | both | screen quiet this long after `/clear` counts as confirmation on its own |
+| `CR_STEP_GAP_SEC` | `3` | both | between `/clear` and the resume phrase |
+| `CR_RESUME_ATTEMPTS` | `5` | both | unfold retries, each wait doubling, before the debt becomes visible instead of retried |
+| `CR_CONTEXT_COOLDOWN_SEC` | `600` | both | silence after any restart |
+| `CR_CONTEXT_MAX_CYCLES` | `0` | both | `0` = no cap; a fuse against a loop |
+| `CR_CONTEXT_MIN_HEADROOM` | `80k` | both | floor the threshold is raised to protect once a restart lands, if the baseline it comes back to leaves less than this (capped to 30% of a window ≤ 200k); see [choosing a threshold](context-restart.md#choosing-a-threshold) |
+| `CR_CONTEXT_MAX_PER_HOUR` | `3` | both | more restarts than this in a rolling hour switches the trigger off for the rest of the session; `0` = no cap |
+| `CR_NOTIFY_REPEAT_SEC` | `300` | both | how often an `unfold failed` or `restart off` debt is said again, until a key is pressed; see [how-it-works.md](how-it-works.md#a-sign-of-life) |
+| `CR_SLASH_ENTER` | `2` | both | Enters sent for a `/command`; `1` turns the insurance Enter off |
+| `CR_SLASH_GAP_SEC` | `0.9` | both | pause after a `/command` before the first Enter, letting the command list settle on the exact match |
+| `CR_SLASH_ENTER_GAP_SEC` | `0.6` | both | gap between those two Enters |
 
 ## Codex
 
-More in [codex.md](codex.md#context-restart-on-codex). The rest of the
-context-restart settings above apply to codex too.
+More in [codex.md](codex.md#context-restart-on-codex). Codex's thresholds are
+in the [context restart](#context-restart) tables above; what follows exists
+only for codex, with no shared setting behind it, and only matters while the
+context restart is on.
 
-| variable | default | |
-|---|---|---|
-| `CR_CODEX_CONTEXT_PCT` | `CR_CONTEXT_PCT` | the same, for codex, as its status line counts it |
-| `CR_CODEX_CONTEXT_TOKENS` | `0` | absolute threshold for codex; never taken from claude |
-| `CR_CODEX_HOLD_COMPACT` | `1` | start codex with its own compaction threshold moved out of the restart's way; `0` leaves it alone |
-| `CR_CODEX_RESERVE_TOKENS` | `64k` | room kept under codex's compaction cap for the fold; the threshold never goes past it |
-| `CR_CODEX_INTERRUPT` | `1` | press Esc on a running turn that crosses that line; `0` = only restart between turns |
-| `CR_CODEX_LOGS_DB` | newest `$CODEX_HOME/logs_*.sqlite` | where codex logs the count its compaction is decided on |
-
-The last four only matter while the context restart is on for codex — see
-[staying ahead of codex's own compaction](codex.md#staying-ahead-of-codexs-own-compaction).
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_CODEX_HOLD_COMPACT` | `1` | codex | start codex with its own compaction threshold moved out of the restart's way; `0` leaves it alone |
+| `CR_CODEX_RESERVE_TOKENS` | `64k` | codex | room kept under codex's compaction cap for the fold; the threshold never goes past it |
+| `CR_CODEX_RESERVE_ADAPT` | `0` | codex | `1` raises the effective reserve to 1.25× the largest fold ever recorded, instead of only recommending it |
+| `CR_CODEX_FOLDS_FILE` | `~/.claude-retrier/folds.json` | codex | where the cost of each fold is recorded, so the reserve can be judged against real ones |
+| `CR_CODEX_INTERRUPT` | `1` | codex | press Esc on a running turn that crosses the line; `0` = only restart between turns |
+| `CR_CODEX_INTERRUPT_AFTER_SEC` | `0` | codex | `0` = only interrupt at the cap-minus-reserve line; a number interrupts a turn that has sat past the ordinary threshold this many seconds |
+| `CR_CODEX_LOGS_DB` | newest `$CODEX_HOME/logs_*.sqlite` | codex | where codex logs the count its compaction is decided on |
 
 `CR_CODEX_CMD` is under [Commands and agents](#commands-and-agents).
 
-## The badge
+## The badge and the subagent overlay
 
 More in [how-it-works.md](how-it-works.md#a-sign-of-life).
 
-| variable | default | |
-|---|---|---|
-| `CR_BADGE` | `1` | `0` hides the corner mark |
-| `CR_BADGE_POS` | `bottom-right` | also `bottom-left`, `top-right`, `top-left` |
-| `CR_BADGE_LABEL` | `cr` | the word next to the mark |
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_BADGE` | `1` | both | `0` hides the corner mark |
+| `CR_BADGE_POS` | `bottom-right` | both | also `bottom-left`, `top-right`, `top-left` |
+| `CR_BADGE_LABEL` | `cr` | both | the word next to the mark |
+| `CR_NOTIFY` | `1` | both | `0` stops the dim `[claude-retrier] …` lines being printed into the session |
+| `CR_AGENTS_OVERLAY` | `0` | claude | `1` annotates Claude Code's subagent tree with each agent's model and effort (T27) |
+| `CR_AGENTS_POS` | `right` | claude | `right` \| `label` — where that annotation is drawn |
+| `CR_AGENTS_POLL_SEC` | `1.0` | claude | how often the subagent transcripts are re-read for it |
 
 ## Updates
 
 More in [how-it-works.md](how-it-works.md#updates).
 
-| variable | default | |
-|---|---|---|
-| `CR_UPDATE_CHECK` | `1` | `0` never checks for a newer release and never mentions it |
-| `CR_UPDATE_NOTICE_SEC` | `2` | how long the notice stays before claude starts |
-| `CR_UPDATE_TTL_SEC` | `86400` | between checks |
-| `CR_UPDATE_CACHE` | `~/.claude-retrier/update.json` | |
-| `CR_UPDATE_REPO` | `a0s/claude-retrier` | whose releases to read |
-| `CR_UPDATE_BREW_FORMULA` | `a0s/claude-retrier/claude-retrier` | named in the brew command |
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_UPDATE_CHECK` | `1` | both | `0` never checks for a newer release and never mentions it |
+| `CR_UPDATE_NOTICE_SEC` | `2` | both | how long the notice stays before the agent starts |
+| `CR_UPDATE_TTL_SEC` | `86400` | both | between checks |
+| `CR_UPDATE_CACHE` | `~/.claude-retrier/update.json` | both | |
+| `CR_UPDATE_REPO` | `a0s/claude-retrier` | both | whose releases to read |
+| `CR_UPDATE_BREW_FORMULA` | `a0s/claude-retrier/claude-retrier` | both | named in the brew command |
 
 ## Logging and switching it off
 
@@ -155,12 +270,31 @@ copies, dropping whatever would spill past that. A process that already had
 the old file open for writing keeps writing into what is now `log.1` — its
 lines stay readable via the same per-line tag, so this is harmless.
 
-| variable | default | |
-|---|---|---|
-| `CR_LOG` | `~/.claude-retrier/log` | |
-| `CR_LOG_MAX_BYTES` | `5M` | rotate once the log passes this size; accepts `5M`/`500k`-style sizes |
-| `CR_LOG_KEEP` | `2` | how many rotated copies (`log.1`, `log.2`, ...) to keep |
-| `CR_DISABLE` | | `1` runs plain claude |
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_LOG` | `~/.claude-retrier/log` | both | |
+| `CR_LOG_MAX_BYTES` | `5M` | both | rotate once the log passes this size; accepts `5M`/`500k`-style sizes |
+| `CR_LOG_KEEP` | `2` | both | how many rotated copies (`log.1`, `log.2`, ...) to keep |
+| `CR_DISABLE` | | both | `1` runs plain claude or codex |
+
+## Rarely touched
+
+Real settings, listed for completeness. The defaults are right in every setup
+these were written for; reach for them when something specific is wrong.
+
+| variable | default | applies to | |
+|---|---|---|---|
+| `CR_POLL_SEC` | `2` | both | how often the transcript (and claude's statusline file) is re-read |
+| `CR_BUSY_IDLE_SEC` | `6` | both | no "working" footer for this long means the session is idle |
+| `CR_VERIFY_SEC` | `60` | both | how long to watch that a typed retry actually took hold |
+| `CR_SCRAPE_CONFIRM_SEC` | `3` | both | a limit banner read off the screen must persist this long to count |
+| `CR_PROBE_TIMEOUT_SEC` | `5` | both | timeout when probing the resolved command or shell at startup |
+| `CR_MODEL_LOOKUP_TIMEOUT_SEC` | `10` | both | per-request timeout for the model-window lookup |
+| `CR_MODELS_API_URL` | `https://api.anthropic.com/v1/models` | both | where a model window is looked up when `ANTHROPIC_API_KEY` is set |
+| `CR_MODELS_DOC_URL` | `https://platform.claude.com/docs/en/models/overview.md` | both | and where it is looked up otherwise |
+| `CR_UPDATE_URL` | derived from `CR_UPDATE_REPO` | both | override the releases feed outright |
+| `CR_UPDATE_TIMEOUT_SEC` | `10` | both | request timeout for the update check |
+| `CR_WAIT_SCALE` | `1` | both | divide every wait by this; the test suite runs at `3600`, which is what it is for |
 
 ## Detection patterns
 
@@ -168,3 +302,8 @@ Detection patterns live in one array at the top of `claude-retrier.sh`. Add a
 wording and nothing else changes. Patterns for a refused turn live in
 `CR_STALL_PATTERNS`, next to the other pattern arrays — see
 [stalls.md](stalls.md#detection-patterns).
+
+They are arrays in the script, not environment variables: the `CR_PAT_*`
+variables the script exports are how the bash half hands those arrays to the
+Python half, and they are overwritten on every start, so exporting one has no
+effect. Edit the array.

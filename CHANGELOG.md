@@ -7,6 +7,49 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [2.0.0] - 2026-09-19
+
+**Breaking:** `CR_CONTEXT_PCT` and `CR_CODEX_CONTEXT_PCT` are removed. A
+session that still has either set in its environment now refuses to start,
+with a message naming the replacement — this is deliberate: silently
+ignoring the variable would leave a session that used to be protected
+running with no restart armed at all. A percentage of a window meant a
+different thing on each agent, and nothing at all until you knew the window;
+now that every model has its own row in the profile table (`--cr-models`),
+the percentage was a redundant, misleading layer on top of it. Replace it
+with one of:
+- `CR_CONTEXT_RESTART=1` — arms the restart at each model's own row (or, for
+  a model the table does not describe, `DEFAULT_RESTART_PCT` of whatever
+  window that session actually has — no model is left unprotected just
+  because this build predates it).
+- `CR_CONTEXT_TOKENS=510k` — one absolute number, same as before.
+- `CR_CLAUDE_TOKENS_<SLUG>=510k` / `CR_CODEX_TOKENS_<SLUG>=510k` — one model
+  only.
+
+See `docs/context-restart.md#choosing-a-threshold`.
+
+### Removed
+- `CR_CONTEXT_PCT`, `CR_CODEX_CONTEXT_PCT`, and the `context_pct`/
+  `codex_context_pct` config keys built from them. The threshold is now
+  purely token-based: explicit, from the model's own profile row, or
+  computed from that row's own percentage applied to the session's actual
+  window.
+
+### Fixed
+- The echo check that gates `/clear` (T06) built its search key with
+  `json.dumps(text)`, which ASCII-escapes any non-ASCII character into a
+  `\uXXXX` sequence — but real Claude Code and codex-cli write that same
+  character as its raw UTF-8 bytes, never escaped. The default
+  `CR_HANDOFF_MSG` contains an em dash, so this silently broke the echo
+  check for every restart using the shipped default: the file was written
+  correctly, the turn closed with `end_turn`, and the wrapper still sat
+  waiting for an echo that could never match, forever. Found recording the
+  `docs/demo/` GIFs against real Claude Code — `fake_claude.py`/
+  `fake_codex.py` used the same (wrong) encoding as the code they were
+  testing, so the mismatch never showed up against the test suite's own
+  fakes. Any custom phrase with a non-ASCII character (Cyrillic, an
+  accented letter, an em dash) was equally affected.
+
 ## [1.12.0] - 2026-09-19
 
 Two sessions in one project used to be indistinguishable — the wrapper would

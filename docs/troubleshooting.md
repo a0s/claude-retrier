@@ -55,7 +55,7 @@ for the full unfold sequence and why giving up looks the way it does.
   [When nothing happens](context-restart.md#when-nothing-happens) — the log
   lines listed there, in order of likelihood.
 - **The badge says `unfold failed`.** See
-  [Unfold failed — what to do](#unfold-failed--what-to-do).
+  [Unfold failed — what to do](#unfold-failed-what-to-do).
 - **The wrong command runs, or an alias is not found.**
   `claude-retrier --cmd X --cr-dump-argv` prints exactly what will be executed.
   See [custom-command.md](custom-command.md).
@@ -64,7 +64,7 @@ for the full unfold sequence and why giving up looks the way it does.
   `codex resume`, `codex fork`) are wrapped. See [codex.md](codex.md#subcommands).
 - **codex compacted before the restart.** The log says `codex compacted the
   thread on its own before the restart could`. Give the fold more room with
-  `CR_CODEX_RESERVE_TOKENS` or a lower `CR_CODEX_CONTEXT_PCT`; see
+  `CR_CODEX_RESERVE_TOKENS` or a lower `CR_CODEX_CONTEXT_TOKENS`; see
   [codex](codex.md#staying-ahead-of-codexs-own-compaction).
 - **The wrapper seems to do nothing at all.** Without `python3`, with `claude
   -p`, or with `CR_DISABLE=1`, it execs plain claude unchanged. See

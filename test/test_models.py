@@ -255,6 +255,19 @@ class TestTheModelProfileTable(unittest.TestCase):
         for slug, prof in cr.MODEL_PROFILES["claude"].items():
             self.assertEqual(cr.model_window(slug), prof.window, slug)
 
+    def test_cr_models_output_has_no_percentage_and_nothing_disarmed(self):
+        # 2.0: every row in the table has a profile, so CR_CONTEXT_RESTART=1
+        # alone is enough to arm every one of them — none should print
+        # "disarmed", and the removed percentage vocabulary should not appear
+        # anywhere in the table at all.
+        import io
+        mod = load(CR_CONTEXT_RESTART="1")
+        out = io.StringIO()
+        mod.print_models_table(out=out)
+        text = out.getvalue()
+        self.assertNotIn("disarmed", text)
+        self.assertNotIn("PCT", text)
+
 
 class TestTheWindowEstimate(unittest.TestCase):
     """T19: a slug neither the profile table, the cache, nor a live lookup has
@@ -306,44 +319,55 @@ class TestTheWindowEstimate(unittest.TestCase):
 
 class TestTheThresholdResolutionOrder(unittest.TestCase):
     """`_recompute_limit`'s whole order, one stage at a time — the same order
-    documented on `model_restart_at`, which is only the last of the five."""
+    documented on `model_restart_at`, which is only the last of the four."""
 
     def test_stage_1_the_per_model_override_wins_over_everything(self):
         env = "CR_CLAUDE_TOKENS_CLAUDE_OPUS_5"
         os.environ[env] = "300000"
         self.addCleanup(os.environ.pop, env, None)
-        ctl = restart_controller(context_pct=50, context_restart_on=True)
+        ctl = restart_controller(context_restart_on=True)
         usage(ctl, 0, 10, model="claude-opus-5")
         self.assertEqual(ctl.context_limit, 300000)
 
-    def test_stage_2_an_absolute_threshold_wins_over_the_percentage(self):
-        ctl = restart_controller(context_pct=50, context_tokens=400000,
-                                 context_restart_on=True)
+    def test_stage_2_an_absolute_threshold_wins_over_the_profile(self):
+        ctl = restart_controller(context_tokens=400000, context_restart_on=True)
         usage(ctl, 0, 10, model="claude-opus-5")
         self.assertEqual(ctl.context_limit, 400000)
 
-    def test_stage_3_an_explicit_percentage_wins_over_the_profile(self):
-        ctl = restart_controller(context_pct=30, context_restart_on=True)
-        usage(ctl, 0, 10, model="claude-opus-5")
-        self.assertEqual(ctl.context_limit, 300000)   # 30% of 1M, not the profile's 510k
-
-    def test_stage_4_the_bare_flag_arms_the_models_own_profile(self):
-        ctl = restart_controller(context_pct=0, context_tokens=0, context_restart_on=True)
+    def test_stage_3_the_bare_flag_arms_the_models_own_profile(self):
+        ctl = restart_controller(context_tokens=0, context_restart_on=True)
         usage(ctl, 0, 10, model="claude-opus-5")
         self.assertEqual(ctl.context_limit, 510000)
 
-    def test_stage_5_an_unmatched_model_stays_disarmed(self):
-        ctl = restart_controller(context_pct=0, context_tokens=0, context_restart_on=True,
-                                 context_window="auto")
-        usage(ctl, 0, 10, model="claude-something-new")
-        self.assertIsNone(ctl.context_limit)
+    def test_stage_4_an_unmatched_model_falls_back_to_the_default_rule(self):
+        # A window no profile row describes — either a model this build has
+        # never heard of, or one whose window was raised past what its row
+        # was written for — falls to DEFAULT_RESTART_PCT of the ACTUAL window
+        # instead of staying disarmed.
+        ctl = restart_controller(context_tokens=0, context_restart_on=True,
+                                 context_window="1M")
+        usage(ctl, 0, 10, model="claude-something-new")   # not in MODEL_PROFILES at all
+        self.assertEqual(ctl.context_limit, 510000)        # 51% of the forced 1M window
 
-    def test_the_flag_alone_does_nothing_for_a_model_with_no_profile(self):
-        # Same as stage 5, spelled out for codex: the flag arms the trigger,
-        # but a model this table has never heard of gets nothing to restart
-        # against — not a guess.
-        ctl = codex_controller(context_pct=0, context_tokens=0, context_restart_on=True)
-        feed(ctl, 1, model="gpt-9-nonexistent", window=999999)
+        codex = codex_controller(context_tokens=0, context_restart_on=True)
+        feed(codex, 1, model="gpt-5.6-sol", window=872000)  # past that row's own window
+        self.assertEqual(codex.context_limit, 872000 - 64000)  # window - the default reserve
+
+    def test_stage_4_uses_the_estimated_window(self):
+        # A slug nothing in the table (or the network) has ever heard of still
+        # gets a window from T19's estimate machinery, and stage 4 applies
+        # DEFAULT_RESTART_PCT to THAT rather than leaving nothing armed.
+        ctl = restart_controller(context_tokens=0, context_restart_on=True,
+                                 context_window="auto")
+        usage(ctl, 0, 10, model="claude-something-9")
+        self.assertTrue(ctl.context_estimated)
+        self.assertEqual(ctl.context_window, 1000000)      # the table's modal window
+        self.assertEqual(ctl.context_limit, 510000)         # 51% of the estimate
+
+    def test_stage_5_no_window_at_all_stays_disarmed(self):
+        # codex before its first turn: nothing has stated a window yet, so
+        # there is nothing for even the estimate fallback to work from.
+        ctl = codex_controller(context_tokens=0, context_restart_on=True)
         self.assertIsNone(ctl.context_limit)
 
     def test_the_profile_is_reclamped_under_compact_minus_the_live_reserve(self):
@@ -352,7 +376,7 @@ class TestTheThresholdResolutionOrder(unittest.TestCase):
         # number even though the frozen one in the table does not change.
         os.environ["CR_CODEX_RESERVE_TOKENS"] = "200000"
         self.addCleanup(os.environ.pop, "CR_CODEX_RESERVE_TOKENS", None)
-        ctl = codex_controller(context_pct=0, context_tokens=0, context_restart_on=True)
+        ctl = codex_controller(context_tokens=0, context_restart_on=True)
         feed(ctl, 1, model="gpt-5.6-sol", window=258400)
         self.assertEqual(ctl.context_limit, 58400)   # 258400 - 200000, not the baked 194400
 

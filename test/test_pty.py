@@ -802,7 +802,7 @@ class TestContextRestart(PtyTestCase):
             "CLAUDE_CONFIG_DIR": self.cfg,
             "CR_LOG": self.log,
             "CR_SCRAPE": "never",
-            "CR_CONTEXT_PCT": "51",              # 510k of a 1M window
+            "CR_CONTEXT_TOKENS": "510000",        # 510k of a 1M window
             "CR_HANDOFF_FILE": "handoff.md",
             "CR_ROOT_IDLE_SEC": "1",
             "CR_HANDOFF_TIMEOUT_SEC": "45",
@@ -935,25 +935,25 @@ class TestContextRestart(PtyTestCase):
     def test_the_feature_stays_off_until_it_is_switched_on(self):
         # The whole point of the default: nobody upgrading this package should
         # find their session being cleared for them.
-        s = self.session(env=self.env(CR_CONTEXT_PCT="0"), cwd=self.work)
+        s = self.session(env=self.env(CR_CONTEXT_TOKENS="0"), cwd=self.work)
         self.assertTrue(s.read_until("ready"))
         s.drain(6)
         self.assertNotIn("GOT:handoff", s.buf)
         self.assertNotIn("context restart armed", self.logged())
 
     def test_the_restart_flag_turns_it_on_at_the_default_percentage(self):
-        # No CR_CONTEXT_PCT of its own — CR_CONTEXT_RESTART alone has to be
+        # No CR_CONTEXT_TOKENS of its own — CR_CONTEXT_RESTART alone has to be
         # enough, and has to survive the round trip through bash's own `:=`
         # defaults (which is where an implementation reading only the Python
         # side would quietly do nothing).
-        s = self.session(env=self.env(CR_CONTEXT_PCT="", CR_CONTEXT_RESTART="1"),
+        s = self.session(env=self.env(CR_CONTEXT_TOKENS="", CR_CONTEXT_RESTART="1"),
                          cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertIn("restarting at 510k", self.logged())   # 51% of a 1M window
         self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
 
     def test_a_per_model_override_is_read_straight_from_the_environment(self):
-        s = self.session(env=self.env(CR_CONTEXT_PCT="", CR_CONTEXT_RESTART="1",
+        s = self.session(env=self.env(CR_CONTEXT_TOKENS="", CR_CONTEXT_RESTART="1",
                                       CR_CLAUDE_TOKENS_CLAUDE_OPUS_5="300000"),
                          cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
@@ -1009,7 +1009,7 @@ class TestClaudesStatusLineProxy(PtyTestCase):
             "CLAUDE_CONFIG_DIR": self.cfg,
             "CR_LOG": self.log,
             "CR_SCRAPE": "never",
-            "CR_CONTEXT_PCT": "51",              # 102k of a 200k window
+            "CR_CONTEXT_TOKENS": "102000",        # 102k of a 200k window
             "CR_POLL_SEC": "0.2",
             "CR_USER_IDLE_SEC": "0",
             "FAKE_USAGE": "10",
@@ -1055,7 +1055,7 @@ class TestClaudesStatusLineProxy(PtyTestCase):
         self.assertIn("--cr-statusline", s.buf)
 
     def test_without_a_restart_armed_nothing_is_added(self):
-        s = self.session(env=self.env(CR_CONTEXT_PCT="0"), cwd=self.work)
+        s = self.session(env=self.env(CR_CONTEXT_TOKENS="0"), cwd=self.work)
         self.assertTrue(s.read_until("ready"))
         s.drain(1)
         self.assertNotIn("--settings", s.buf)
@@ -1110,7 +1110,7 @@ class TestUniqueHandoffFile(PtyTestCase):
             "CLAUDE_CONFIG_DIR": self.cfg,
             "CR_LOG": self.log,
             "CR_SCRAPE": "never",
-            "CR_CONTEXT_PCT": "51",
+            "CR_CONTEXT_TOKENS": "510000",
             "CR_HANDOFF_FILE": "handoff.md",
             "CR_ROOT_IDLE_SEC": "1",
             "CR_HANDOFF_TIMEOUT_SEC": "45",

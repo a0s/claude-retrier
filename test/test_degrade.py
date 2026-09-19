@@ -83,6 +83,29 @@ class TestCli(unittest.TestCase):
         self.assertEqual(version, newest)
 
 
+class TestTheRemovedPercentSettingsRefuseToStart(unittest.TestCase):
+    """2.0: CR_CONTEXT_PCT/CR_CODEX_CONTEXT_PCT are gone. A session that still
+    has one set in its environment gets told so and refused, rather than
+    silently running with no restart armed at all."""
+
+    def test_claude_pct_is_refused(self):
+        r = run(["--cr-version"], env={"CR_CONTEXT_PCT": "51"})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("was removed in 2.0", r.stderr)
+        self.assertIn("CR_CONTEXT_RESTART", r.stderr)
+
+    def test_codex_pct_is_refused(self):
+        r = run(["--cr-version"], env={"CR_CODEX_CONTEXT_PCT": "60"})
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("was removed in 2.0", r.stderr)
+        self.assertIn("CR_CONTEXT_RESTART", r.stderr)
+
+    def test_an_empty_value_is_not_considered_set(self):
+        r = run(["--cr-version"], env={"CR_CONTEXT_PCT": ""})
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("claude-retrier", r.stdout)
+
+
 class TestDegradation(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="cr-deg-")

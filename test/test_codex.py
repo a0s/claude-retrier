@@ -473,7 +473,7 @@ class TestStalling(unittest.TestCase):
 
 
 RESTART = dict(
-    context_pct=0, context_tokens=0, context_window="auto",
+    context_tokens=0, context_window="auto",
     context_env_max=0, context_no_1m=False,
     handoff_file="H.md", handoff_marker="HANDOFF", handoff_min_bytes=20,
     handoff_attempts=2,
@@ -535,7 +535,7 @@ class TestCandidateModeHoldsTheFoldBack(unittest.TestCase):
         # root_idle/user_idle=0: nothing here is about whether a person or the
         # session is busy, and the defaults would hold every tick back on
         # that alone.
-        return codex_controller(context_pct=50, root_idle=0, user_idle=0, **over)
+        return codex_controller(codex_context_tokens=135200, root_idle=0, user_idle=0, **over)
 
     def test_an_ambiguous_reading_is_never_folded(self):
         ctl = self.ctl()
@@ -578,47 +578,22 @@ class TestTheCodexThreshold(unittest.TestCase):
     def test_the_percentage_is_the_one_the_status_line_shows(self):
         # Measured on codex-cli 0.154: 13,711 of a 258,400 window reads
         # "Context 1% used". Without the baseline it would be 5%.
-        ctl = codex_controller(context_pct=50)
+        ctl = codex_controller(codex_context_tokens=135200)   # armed; 50% of WINDOW
         feed(ctl, 1, window=WINDOW, tokens=13711)
         self.assertEqual(round(ctl.context_pct()), 1)
-        claude = codex_controller(agent="claude", context_pct=50, context_window="258400")
+        claude = codex_controller(agent="claude", context_tokens=129200,
+                                  context_window="258400")
         claude.on_context(dict(kind="alive", path=ROLL, tokens=13711,
                                model="claude-opus-5"), 1)
         self.assertEqual(round(claude.context_pct()), 5)
 
     def test_the_corner_rounds_the_way_the_status_line_does(self):
         # 23,440 of 258,400 is 4.64%: codex says "Context 5% used".
-        ctl = codex_controller(context_pct=5)
+        ctl = codex_controller(codex_context_tokens=24320)   # armed; 5% of WINDOW
         feed(ctl, 1, window=WINDOW, tokens=23440)
         badge = cr.Badge(dict(badge=1, badge_pos="bottom-right", badge_label="cr"))
         text, _ = badge.frame(cr.IDLE, 0, 0, 3, now=0, context=ctl.badge_context())
         self.assertIn("5%", text)
-
-    def test_the_threshold_is_read_the_same_way(self):
-        ctl = codex_controller(context_pct=60)
-        feed(ctl, 1, window=WINDOW)
-        self.assertEqual(ctl.context_limit, 12000 + int((WINDOW - 12000) * 0.6))
-
-    def test_unset_it_is_claudes(self):
-        ctl = codex_controller(context_pct=60, codex_context_pct=None,
-                               codex_context_tokens=None)
-        self.assertEqual(ctl.cfg["context_pct"], 60)
-
-    def test_set_it_is_its_own(self):
-        ctl = codex_controller(context_pct=60, codex_context_pct=40)
-        self.assertEqual(ctl.cfg["context_pct"], 40)
-        # ...and claude's is untouched by it.
-        claude = codex_controller(agent="claude", context_pct=60, codex_context_pct=40)
-        self.assertEqual(claude.cfg["context_pct"], 60)
-
-    def test_claudes_absolute_count_is_never_codexs(self):
-        # 500k chosen for a 1M claude window is past the end of a 258k codex
-        # one, and an absolute count would beat the percentage besides.
-        ctl = codex_controller(context_tokens=500000, context_pct=60)
-        self.assertEqual(ctl.cfg["context_tokens"], 0)
-        self.assertEqual(ctl.cfg["context_pct"], 60)
-        feed(ctl, 1, window=WINDOW)
-        self.assertEqual(ctl.context_limit, 12000 + int((WINDOW - 12000) * 0.6))
 
     def test_claudes_absolute_count_alone_leaves_codex_off(self):
         ctl = codex_controller(context_tokens=500000)
@@ -629,30 +604,15 @@ class TestTheCodexThreshold(unittest.TestCase):
         feed(ctl, 1, window=WINDOW)
         self.assertEqual(ctl.context_limit, 200000)
 
-    def test_zero_switches_codex_off_alone(self):
-        ctl = codex_controller(context_pct=60, codex_context_pct=0)
-        self.assertFalse(ctl.context_enabled)
-
-    def test_the_environment_spells_it(self):
-        from helper import load as reload_impl
-        mod = reload_impl(CR_CODEX_CONTEXT_PCT="45", CR_CODEX_CONTEXT_TOKENS="300k")
-        self.assertEqual(mod.CFG["codex_context_pct"], 45.0)
-        self.assertEqual(mod.CFG["codex_context_tokens"], 300000)
-        mod = reload_impl(CR_CODEX_CONTEXT_TOKENS="0")
-        self.assertEqual(mod.CFG["codex_context_tokens"], 0)   # set, and off
-        mod = reload_impl()
-        self.assertIsNone(mod.CFG["codex_context_pct"])
-        self.assertIsNone(mod.CFG["codex_context_tokens"])
-
     def test_claude_codes_switches_are_not_codexs(self):
-        ctl = codex_controller(context_pct=50, context_env_max=100000)
+        ctl = codex_controller(codex_context_tokens=135200, context_env_max=100000)
         feed(ctl, 1, window=WINDOW, model="gpt-5.6-sol")
         self.assertEqual(ctl.context_window, WINDOW)
 
     def test_a_codex_model_is_never_looked_up(self):
         # The model can be named before any turn has stated its window. The
         # lookup reads Anthropic's models table, which has no GPT in it.
-        ctl = codex_controller(context_pct=50)
+        ctl = codex_controller(codex_context_tokens=135200)
         feed(ctl, 1, model="gpt-5.6-sol")
         self.assertIsNone(ctl.window_unknown)
         feed(ctl, 2, window=WINDOW)
@@ -662,7 +622,7 @@ class TestTheCodexThreshold(unittest.TestCase):
         env = "CR_CODEX_TOKENS_GPT_5_6_SOL"
         os.environ[env] = "140000"
         self.addCleanup(os.environ.pop, env, None)
-        ctl = codex_controller(context_pct=50)
+        ctl = codex_controller(codex_context_tokens=135200)
         feed(ctl, 1, model="gpt-5.6-sol", window=WINDOW)
         self.assertEqual(ctl.context_limit, 140000)
 
@@ -670,55 +630,41 @@ class TestTheCodexThreshold(unittest.TestCase):
         env = "CR_CLAUDE_TOKENS_GPT_5_6_SOL"
         os.environ[env] = "140000"
         self.addCleanup(os.environ.pop, env, None)
-        ctl = codex_controller(context_pct=50)
+        ctl = codex_controller(codex_context_tokens=135200)
         feed(ctl, 1, model="gpt-5.6-sol", window=WINDOW)
         self.assertNotEqual(ctl.context_limit, 140000)
 
-    def test_the_bare_flag_no_longer_hands_cfg_a_percentage(self):
-        # T18: the flag alone used to default codex's context_pct to
-        # DEFAULT_CODEX_RESTART_PCT (90%). That number is gone from cfg
-        # entirely now — the flag just arms context_restart_on, and
-        # model_restart_at answers with the model's own profile instead (see
+    def test_the_bare_flag_arms_both_agents_without_a_number(self):
+        # The flag alone hands neither agent a percentage anymore — it just
+        # arms context_restart_on, and model_restart_at answers with each
+        # agent's own profile instead (see
         # test_the_bare_flag_reaches_the_profile_threshold below).
         from helper import load as reload_impl
         mod = reload_impl(CR_CONTEXT_RESTART="1")
         claude_cfg = mod.agent_cfg(mod.CFG, "claude")
         codex_cfg = mod.agent_cfg(mod.CFG, "codex")
-        self.assertEqual(claude_cfg["context_pct"], 0.0)
-        self.assertEqual(codex_cfg["context_pct"], 0.0)
+        self.assertEqual(claude_cfg["context_tokens"], 0)
+        self.assertEqual(codex_cfg["context_tokens"], 0)
+        self.assertTrue(claude_cfg["context_restart_on"])
         self.assertTrue(codex_cfg["context_restart_on"])
 
     def test_the_bare_flag_reaches_the_profile_threshold(self):
-        # AC: no CR_CONTEXT_PCT/CR_CONTEXT_TOKENS of any kind, just the flag —
-        # the rollout reporting the profile's own window (258,400) is what
-        # arms gpt-5.6-sol's 194,400 (= cap - the default 64k reserve).
-        ctl = codex_controller(context_pct=0, context_tokens=0, context_restart_on=True)
+        # AC: no CR_CONTEXT_TOKENS of any kind, just the flag — the rollout
+        # reporting the profile's own window (258,400) is what arms
+        # gpt-5.6-sol's 194,400 (= cap - the default 64k reserve).
+        ctl = codex_controller(context_tokens=0, context_restart_on=True)
         feed(ctl, 1, model="gpt-5.6-sol", window=258400)
         self.assertEqual(ctl.context_limit, 194400)
         self.assertEqual(ctl.trigger_limit(), 194400)
 
     def test_a_raised_window_leaves_the_profile_sitting_out(self):
         # AC: model_context_window=872000 in the rollout is not the window the
-        # profile was written for, so the profile does not answer at all — an
-        # explicit CR_CODEX_CONTEXT_PCT is what decides, at the REPORTED window.
-        ctl = codex_controller(context_pct=0, context_tokens=0, context_restart_on=True,
-                               codex_context_pct=50)
+        # profile was written for, so the profile does not answer at all —
+        # stage 4's default_restart_at decides instead, at the REPORTED window
+        # (the usable window minus the reserve the fold needs).
+        ctl = codex_controller(context_tokens=0, context_restart_on=True)
         feed(ctl, 1, model="gpt-5.6-sol", window=872000)
-        self.assertEqual(ctl.context_limit, 12000 + int((872000 - 12000) * 0.5))
-
-    def test_an_explicit_shared_percentage_still_covers_both_agents(self):
-        # CR_CONTEXT_RESTART only gets a say when nobody picked a number. Type
-        # one yourself and "one export covers both agents" still holds.
-        from helper import load as reload_impl
-        mod = reload_impl(CR_CONTEXT_RESTART="1", CR_CONTEXT_PCT="51")
-        codex_cfg = mod.agent_cfg(mod.CFG, "codex")
-        self.assertEqual(codex_cfg["context_pct"], 51.0)
-
-    def test_an_explicit_codex_percentage_still_wins(self):
-        from helper import load as reload_impl
-        mod = reload_impl(CR_CONTEXT_RESTART="1", CR_CODEX_CONTEXT_PCT="60")
-        codex_cfg = mod.agent_cfg(mod.CFG, "codex")
-        self.assertEqual(codex_cfg["context_pct"], 60.0)
+        self.assertEqual(ctl.context_limit, 872000 - 64000)
 
 
 class TestPerAgentMessages(unittest.TestCase):
@@ -832,7 +778,7 @@ class TestACodexRestart(unittest.TestCase):
         feed(ctl, at, turn="closed", stop_reason="end_turn")
 
     def test_a_clean_task_complete_lets_the_clear_go_out(self):
-        ctl = codex_controller(context_pct=50)
+        ctl = codex_controller(codex_context_tokens=135200)
         self.full(ctl)
         action = ctl.tick(30)
         self.assertEqual(action[0], "inject")
@@ -863,7 +809,7 @@ class TestACodexRestart(unittest.TestCase):
         # No rollout ever appears here, so the only signal available is the
         # screen going quiet -- exactly the case codex hits until "a new
         # rollout" (T08's other confirmation path) is wired up for it too.
-        ctl = codex_controller(context_pct=50)
+        ctl = codex_controller(codex_context_tokens=135200)
         self.full(ctl)
         ctl.tick(30)
         feed(ctl, 31, turn="open", window=WINDOW)
@@ -888,7 +834,7 @@ class TestACodexRestart(unittest.TestCase):
     def test_an_open_turn_holds_the_fold_back_however_quiet_it_is(self):
         # A root waiting on its agents writes nothing for minutes. The byte
         # count would call that idle and type into a running turn.
-        ctl = codex_controller(context_pct=50)
+        ctl = codex_controller(codex_context_tokens=135200)
         feed(ctl, 1, turn="open", window=WINDOW)
         feed(ctl, 1, tokens=200000)
         self.assertIsNone(ctl.tick(600))
@@ -897,7 +843,7 @@ class TestACodexRestart(unittest.TestCase):
         self.assertEqual(ctl.tick(630)[0], "inject")
 
     def test_an_open_folding_turn_is_not_cleared_under(self):
-        ctl = codex_controller(context_pct=50)
+        ctl = codex_controller(codex_context_tokens=135200)
         self.full(ctl)
         ctl.tick(30)
         feed(ctl, 31, turn="open", window=WINDOW)
@@ -906,7 +852,7 @@ class TestACodexRestart(unittest.TestCase):
         self.assertEqual(ctl.rstate, cr.HANDOFF_SENT)
 
     def test_an_aborted_folding_turn_is_not_a_handoff(self):
-        ctl = codex_controller(context_pct=50, handoff_attempts=1)
+        ctl = codex_controller(codex_context_tokens=135200, handoff_attempts=1)
         self.full(ctl)
         ctl.tick(30)
         feed(ctl, 31, turn="open", window=WINDOW)
@@ -918,7 +864,7 @@ class TestACodexRestart(unittest.TestCase):
         self.assertIsNone(ctl.rstate)
 
     def test_a_new_rollout_forgets_the_old_turn(self):
-        ctl = codex_controller(context_pct=50)
+        ctl = codex_controller(codex_context_tokens=135200)
         feed(ctl, 1, turn="open", window=WINDOW)
         moved(ctl, "/codex/sessions/rollout-new.jsonl", 2)
         feed(ctl, 2, path="/codex/sessions/rollout-new.jsonl", tokens=1000)
@@ -987,29 +933,29 @@ class TestCodexsOwnCount(unittest.TestCase):
 
 class TestHoldingCodexsCompactionBack(unittest.TestCase):
     def test_codex_is_started_with_its_threshold_moved(self):
-        args = cr.codex_launch_args(dict(agent="codex", context_pct=60, context_tokens=0,
+        args = cr.codex_launch_args(dict(agent="codex", context_tokens=159840,
                                          codex_hold_compact=True))
         self.assertIn('model_auto_compact_token_limit_scope="body_after_prefix"', args)
         self.assertEqual(args[0], "-c")
 
     def test_not_without_a_restart_to_make_room_for(self):
-        self.assertEqual(cr.codex_launch_args(dict(agent="codex", context_pct=0,
+        self.assertEqual(cr.codex_launch_args(dict(agent="codex",
                                                    context_tokens=0)), [])
 
     def test_the_bare_flag_makes_room_too(self):
         # T18: CR_CONTEXT_RESTART=1 alone arms the model's profile, not a
         # percentage — codex's own compaction still has to be moved out of the
         # way for that threshold to mean anything.
-        args = cr.codex_launch_args(dict(agent="codex", context_pct=0, context_tokens=0,
+        args = cr.codex_launch_args(dict(agent="codex", context_tokens=0,
                                          context_restart_on=True))
         self.assertIn('model_auto_compact_token_limit_scope="body_after_prefix"', args)
 
     def test_not_when_told_not_to(self):
-        self.assertEqual(cr.codex_launch_args(dict(agent="codex", context_pct=60,
+        self.assertEqual(cr.codex_launch_args(dict(agent="codex", context_tokens=159840,
                                                    codex_hold_compact=False)), [])
 
     def test_never_for_claude(self):
-        self.assertEqual(cr.codex_launch_args(dict(agent="claude", context_pct=60)), [])
+        self.assertEqual(cr.codex_launch_args(dict(agent="claude", context_tokens=159840)), [])
 
 
 def logged_usage(ctl, at, tokens, cap=258400, path=ROLL):
@@ -1019,7 +965,7 @@ def logged_usage(ctl, at, tokens, cap=258400, path=ROLL):
 
 class TestStayingAheadOfCodex(unittest.TestCase):
     def ctl(self, **over):
-        cfg = dict(context_pct=60, codex_reserve=32000, codex_interrupt=True)
+        cfg = dict(codex_context_tokens=159840, codex_reserve=32000, codex_interrupt=True)
         cfg.update(over)
         ctl = codex_controller(**cfg)
         feed(ctl, 0, window=WINDOW, model="gpt-5.6-sol")
@@ -1032,7 +978,7 @@ class TestStayingAheadOfCodex(unittest.TestCase):
         self.assertEqual(ctl.context_tokens, 150000)
 
     def test_the_threshold_never_sits_past_the_interrupt_line(self):
-        ctl = self.ctl(context_pct=95)
+        ctl = self.ctl(codex_context_tokens=246080)
         logged_usage(ctl, 1, 1000)
         self.assertEqual(ctl.interrupt_line(), 258400 - 32000)
         self.assertEqual(ctl.trigger_limit(), 258400 - 32000)
@@ -1142,7 +1088,7 @@ class TestInterruptingAStuckTurnByTime(unittest.TestCase):
     that harder line."""
 
     def ctl(self, **over):
-        cfg = dict(context_pct=60, codex_reserve=32000, codex_interrupt=True)
+        cfg = dict(codex_context_tokens=159840, codex_reserve=32000, codex_interrupt=True)
         cfg.update(over)
         ctl = codex_controller(**cfg)
         feed(ctl, 0, window=WINDOW, model="gpt-5.6-sol")
@@ -1151,7 +1097,7 @@ class TestInterruptingAStuckTurnByTime(unittest.TestCase):
     def test_a_turn_stuck_over_the_threshold_is_interrupted_after_the_timeout(self):
         ctl = self.ctl(codex_interrupt_after_sec=600)
         feed(ctl, 1, turn="open")
-        logged_usage(ctl, 2, 200000)            # past 60% (155040), short of 226400
+        logged_usage(ctl, 2, 200000)            # past the 159840 threshold, short of 226400
         self.assertIsNone(ctl.tick(2))          # just crossed; nowhere near 600s yet
         self.assertIsNone(ctl.tick(500))        # under 600s since crossing
         action = ctl.tick(2 + 700)
@@ -1190,7 +1136,7 @@ class TestFoldCostAndReserve(unittest.TestCase):
         self.folds_file = os.path.join(self.dir, "folds.json")
 
     def ctl(self, **over):
-        cfg = dict(context_pct=50, codex_reserve=64000, codex_folds_file=self.folds_file)
+        cfg = dict(codex_context_tokens=135200, codex_reserve=64000, codex_folds_file=self.folds_file)
         cfg.update(over)
         ctl = codex_controller(**cfg)
         feed(ctl, 0, window=WINDOW, model="gpt-5.6-sol")
@@ -1249,9 +1195,9 @@ class TestFoldCostAndReserve(unittest.TestCase):
         self.assertFalse(any("could stand to be raised" in l for l in ctl.log_lines))
 
     def test_reserve_adapt_raises_the_effective_reserve(self):
-        # context_pct=95: high enough that trigger_limit is pinned to the
-        # interrupt line itself, so both reflect the adapted reserve.
-        ctl = self.ctl(codex_reserve_adapt=True, context_pct=95)
+        # 246080 (95% of WINDOW): high enough that trigger_limit is pinned to
+        # the interrupt line itself, so both reflect the adapted reserve.
+        ctl = self.ctl(codex_reserve_adapt=True, codex_context_tokens=246080)
         self._fold(ctl, 200000, 255000)         # 55k cost
         expected_reserve = max(64000, int(1.25 * 55000))
         self.assertEqual(ctl.interrupt_line(), WINDOW - expected_reserve)
@@ -1281,7 +1227,7 @@ class TestModelSwitchResetsTheCodexCap(unittest.TestCase):
     running."""
 
     def ctl(self, **over):
-        cfg = dict(context_pct=60, codex_reserve=32000)
+        cfg = dict(codex_context_tokens=159840, codex_reserve=32000)
         cfg.update(over)
         ctl = codex_controller(**cfg)
         feed(ctl, 0, window=WINDOW, model="gpt-5.6-sol")
@@ -1554,7 +1500,11 @@ class TestCodexEndToEnd(PtyTestCase):
         self.assertNotIn("GOT:continue", s.buf)
 
     def restart_env(self, **over):
-        e = {"CR_CONTEXT_PCT": "50",
+        # Codex never inherits CR_CONTEXT_TOKENS, so its own knob is what
+        # actually arms every test in this class (they all run codex, never
+        # claude) — 135200 is 50% of the 258,400 default FAKE_WINDOW, by the
+        # same base+(window-base)*pct/100 formula the old percentage used.
+        e = {"CR_CODEX_CONTEXT_TOKENS": "135200",
              "CR_HANDOFF_FILE": "handoff.md",
              "CR_ROOT_IDLE_SEC": "1",
              "CR_HANDOFF_TIMEOUT_SEC": "45",
@@ -1578,12 +1528,12 @@ class TestCodexEndToEnd(PtyTestCase):
             self.assertTrue(fh.read().rstrip().split("\n")[-1].startswith("HANDOFF-"))
 
     def test_codex_has_a_threshold_of_its_own(self):
-        # claude's is off; codex's alone arms it.
-        s = self.session(env=self.restart_env(CR_CONTEXT_PCT="0", CR_CODEX_CONTEXT_PCT="50"),
-                         cwd=self.work)
+        # claude's is off (CR_CONTEXT_TOKENS unset); codex's own knob alone
+        # arms it — CR_CONTEXT_TOKENS is never carried over to codex anyway.
+        s = self.session(env=self.restart_env(), cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
         self.assertIn("context restart armed", self.logged())
-        self.assertIn("50% of the window", self.logged())
+        self.assertIn("135200 tokens", self.logged())
         # Read it through to the end. Torn down mid-restart, the wrapper is
         # killed holding output nobody read, and on macOS the kernel keeps a
         # process that exits that way until the terminal drains (see
@@ -1631,7 +1581,8 @@ class TestCodexEndToEnd(PtyTestCase):
         # `_note_cap`'s "using X instead" only logs when something ABOVE it
         # needed clamping — nothing does here, so it is silent, which is
         # itself confirmation nothing is racing past the reserve line.
-        s = self.session(env=self.restart_env(CR_CONTEXT_PCT="", CR_CONTEXT_RESTART="1",
+        s = self.session(env=self.restart_env(CR_CODEX_CONTEXT_TOKENS="",
+                                              CR_CONTEXT_RESTART="1",
                                               FAKE_LOG="1"),
                          cwd=self.work)
         self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
@@ -1650,7 +1601,14 @@ class TestCodexEndToEnd(PtyTestCase):
     # slug).
 
     def test_and_it_can_be_off_while_claudes_is_on(self):
-        s = self.session(env=self.restart_env(CR_CODEX_CONTEXT_PCT="0"), cwd=self.work)
+        # CR_CONTEXT_TOKENS never carries over to codex on its own (by
+        # design), so setting it alongside an empty CR_CODEX_CONTEXT_TOKENS is
+        # what "on for claude, off for codex" looks like now that there is no
+        # shared percentage to inherit — this session runs codex, and codex
+        # alone is what must stay off.
+        s = self.session(env=self.restart_env(CR_CONTEXT_TOKENS="135200",
+                                              CR_CODEX_CONTEXT_TOKENS=""),
+                         cwd=self.work)
         s.read_until("ready", timeout=10)
         s.drain(6)
         self.assertNotIn("GOT:handoff", s.buf)
@@ -1695,7 +1653,8 @@ class TestCodexEndToEnd(PtyTestCase):
 
     def test_the_context_window_comes_from_the_rollout(self):
         s = self.session(
-            env=self.env(CR_CONTEXT_PCT="50", FAKE_USAGE="1000", FAKE_WINDOW="400000"),
+            env=self.env(CR_CODEX_CONTEXT_TOKENS="135200", FAKE_USAGE="1000",
+                        FAKE_WINDOW="400000"),
             cwd=self.work)
         s.read_until("ready", timeout=10)
         s.drain(4)

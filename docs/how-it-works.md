@@ -158,6 +158,7 @@ Windows is not supported (no pty).
                            # dir (the "wrong session's numbers" bug class)
 ./test/run.sh --docker     # the same suite on Linux, from anywhere with docker
 ./test/run.sh test_time.py # just one file
+./test/run.sh --live-codex # the T15 checklist against real codex — asks first
 ```
 
 Two wrappers over one project dir — the shape a "chose the wrong session's
@@ -175,6 +176,29 @@ running. `fake_claude.py`'s `FAKE_SCRIPT` directives (`grow`, `dropfirstfold`,
 that keeps climbing, a lost handoff reply, a `<synthetic>` row, a slow
 `/clear` ack, a mid-stream row with no `stop_reason` yet, a `$`/`/` popup that
 eats the first Enter, and an old rollout `codex resume` should still see.
+
+Everything above runs against fakes. One thing cannot: whether real codex
+still accepts the keystrokes the wrapper sends. `./test/run.sh --live-codex`
+(`test/live_codex.py`) re-runs the
+[T15](backlog/T15-codex-unfold-live-investigation.md) checklist as assertions
+against the real thing — `/clear` accepted by the Enters the shipped recipe
+sends and creating no rollout of its own, the phrase after it getting
+through, `$skill …`/`@file …`/Cyrillic delivered verbatim, and an
+unrecognized `/name` dropped inline and never sent. It drives codex *under*
+the wrapper and types with the shipped `typing_plan()` itself, so it cannot
+pass against a recipe the wrapper no longer sends.
+
+It spends real quota — two sessions, a handful of three-word turns on the
+cheapest model — so it is never part of the default run and never starts
+unasked: an interactive `y/N` naming what it will spend, or `CR_LIVE_CONFIRM=1`
+for a non-interactive one; anything else is refused (exit 2). No codex on
+`PATH` is a skip, not a failure (exit 0); a codex that is installed but logged
+out exits 3. `CR_LIVE_MODEL`, `CR_LIVE_CODEX_BIN` and `CR_LIVE_PROJ` override
+the model, the binary and the throwaway project dir. Every session is torn
+down process-group by process-group from a `finally` and from `SIGINT`/`SIGTERM`
+— a killed pty driver otherwise leaves the supervisor behind, still writing to
+the same log — and the run ends by calling `check-orphans.py` whatever else
+happened.
 
 `./test/run.sh` ends with an orphan check (`test/check-orphans.py`): any
 process still carrying `CR_CLAUDE_ARGV` in its environment after the suite
