@@ -6425,6 +6425,35 @@ if cr_looks_like_codex; then
   done
 fi
 
+# The same judgement, made about claude: most of its subcommands are not a
+# session either. `attach` opens one, and `agents` is the roster of OTHER
+# sessions (handled inside the supervisor itself, not exec'd) — so neither is
+# on this list.
+cr_looks_like_claude() {
+  case "$CR_AGENT" in
+    claude) return 0 ;;
+    codex) return 1 ;;
+  esac
+  case " $CR_CMD_SPEC ${CR_ARGV[*]} " in
+    *[/\ ]claude\ *) return 0 ;;
+  esac
+  return 1
+}
+
+if cr_looks_like_claude; then
+  # Same reasoning as the codex loop above: every argument is checked, so a
+  # subcommand behind a flag that took a value (`claude --model opus stop abc`
+  # — hypothetically) is still judged correctly, and a prompt that merely
+  # mentions one of these words (`claude "fix the stop command"`) stays wrapped
+  # because it is a single argument that matches none of them exactly.
+  for arg in "$@"; do
+    case "$arg" in
+      auth|login|logout|setup-token|update|upgrade|install|doctor|mcp|plugin|plugins|project|logs|stop|kill|rm|respawn|gateway|import|ultrareview|--version|-v|--help|-h)
+        exec "${CR_ARGV[@]}" "$@" ;;
+    esac
+  done
+fi
+
 # \037 (unit separator) rather than a newline: it cannot occur in a path, a
 # command name, or anything a shell would accept as one.
 CR_CLAUDE_ARGV=$(printf '%s\037' "${CR_ARGV[@]}")
