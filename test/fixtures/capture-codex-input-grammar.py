@@ -26,6 +26,7 @@ import glob
 import json
 import os
 import pty
+import re
 import select
 import signal
 import struct
@@ -39,6 +40,20 @@ MODEL = "gpt-5.6-luna"
 PROJ = os.environ.get("CR_T15_PROJ") or "/tmp/codex-t15-proj"
 SYSTEM_NUDGE = ("For this whole session, reply to every message in 3 words "
                 "or fewer and never run a shell command or tool call.")
+
+_SCREEN = []      # the emulator class, loaded once
+
+
+def screen_cls():
+    """claude-retrier.sh's own Screen, so what this driver reads back is what
+    the supervisor would see. Cached: `helper.load` shells out to
+    `--cr-dump-python` and rewrites os.environ, which is far too expensive to
+    repeat on a half-second startup poll."""
+    if not _SCREEN:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+        from helper import load
+        _SCREEN.append(load().Screen)
+    return _SCREEN[0]
 
 
 def spawn(cwd, extra_args=()):
@@ -75,22 +90,45 @@ class Session(object):
         self.cwd = cwd
         self.proc, self.master = spawn(cwd)
         self.buf = bytearray()
-        self._accept_trust_prompt()
+        self._wait_for_composer()
 
-    def _accept_trust_prompt(self):
-        """A scratch project dir outside the trusted-projects list gets a
-        one-time 'Do you trust the contents of this directory?' gate before
-        the composer appears. Option 1 ('Yes, continue') is already
-        highlighted, so plain Enter accepts it."""
-        for _ in range(3):
-            self.drain(2)
-            tail = bytes(self.buf[-4000:])
-            if b"trust the contents" in tail:
-                self.write(b"\r")
-                self.drain(1)
-                del self.buf[:]
-            else:
-                break
+    def _wait_for_composer(self, timeout=40):
+        """Block until the input box is actually accepting text.
+
+        Two traps make a fixed startup sleep lethal here, and both cost a
+        killed session (the keystrokes land on a menu, it picks "No, quit",
+        and the next write() dies with EIO):
+
+        1. A project dir outside the trusted-projects list gets a one-time
+           "Do you trust the contents of this directory?" gate -- and it does
+           NOT come first. The model catalog loads before it, so the gate can
+           be three or four seconds in.
+        2. The boot splash already draws "Ask Codex to do anything" while the
+           header still says "model: loading". Treating that string as "ready"
+           returns BEFORE the gate has even appeared.
+
+        So this renders the CURRENT screen each poll (a substring search over
+        the raw byte buffer matches anything ever drawn, including screens
+        long since replaced) and waits for the status line codex only paints
+        once the session is live -- "… · Context N% used", absent from the
+        splash -- accepting the trust gate if it shows up on the way.
+        """
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            self.drain(0.5)
+            if self.proc.poll() is not None:
+                raise RuntimeError("codex exited during startup (rc=%s); "
+                                   "last screen:\n%s"
+                                   % (self.proc.poll(), self.screen_text()))
+            screen = self.screen_text()
+            if "trust the contents" in screen:
+                self.write(b"\r")          # option 1, "Yes, continue", preselected
+                self.drain(1.5)
+                continue
+            if re.search(r"Context \d+% used", screen):
+                return True
+        raise RuntimeError("composer never became ready within %ss; last screen:\n%s"
+                           % (timeout, self.screen_text()))
 
     def drain(self, seconds):
         deadline = time.time() + seconds
@@ -110,10 +148,7 @@ class Session(object):
         os.write(self.master, data if isinstance(data, bytes) else data.encode())
 
     def screen_text(self):
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-        from helper import load
-        Screen = load().Screen
-        scr = Screen(ROWS, COLS)
+        scr = screen_cls()(ROWS, COLS)
         scr.feed(bytes(self.buf).decode("utf-8", "replace"))
         return scr.text()
 

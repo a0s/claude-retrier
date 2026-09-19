@@ -1603,6 +1603,23 @@ class TestCodexEndToEnd(PtyTestCase):
         self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
         self.assertIn("@supervisor continue from", s.buf)
 
+    def test_a_skill_placeholder_reaches_codex_as_a_dollar_prefix(self):
+        # T17 end to end, through bash's `:=` defaults and agent_cfg both: one
+        # SHARED CR_RESUME_MSG (no per-agent override at all) has to arrive at
+        # codex as "$supervisor", the only prefix it actually delivers -- an
+        # unrecognized "/supervisor" would be dropped inline and never sent
+        # (T15, live codex-cli 0.155.1). Braces in the value must also survive
+        # the round trip untouched.
+        s = self.session(env=self.restart_env(
+            CR_RESUME_MSG="{skill:supervisor} continue from `{file}`",
+            FAKE_RESUME_MATCH="continue from `"),
+            cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+        self.assertIn("$supervisor continue from", s.buf)
+        self.assertNotIn("{skill:supervisor}", s.buf)
+
     def test_the_restart_flag_reaches_codex_through_bash_too(self):
         # Same round trip as the claude version: CR_CONTEXT_RESTART has to
         # survive bash's own `:=` defaults, not just agent_cfg()'s in-process

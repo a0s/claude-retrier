@@ -977,6 +977,18 @@ class TestContextRestart(PtyTestCase):
         sc.feed(s.buf)
         self.assertIn("restart off", sc.line(40))
 
+    def test_an_at_file_mention_resume_phrase_is_delivered_whole(self):
+        # T16: "@file" is plain text on claude too (no popup handling needed,
+        # T15's finding for codex) -- the whole phrase, mention included, must
+        # reach the transcript on the first attempt, same as any other phrase.
+        s = self.session(env=self.env(
+            CR_RESUME_MSG="@README.md summarize this and continue from `{file}`",
+            FAKE_RESUME_MATCH="continue from `"), cwd=self.work)
+        self.assertTrue(s.read_until("GOT:handoff", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:/clear", timeout=30), s.buf[-500:])
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+        self.assertIn("@README.md summarize this and continue from", s.buf)
+
 
 class TestClaudesStatusLineProxy(PtyTestCase):
     """T20, end to end: claude's own statusline JSON, relayed through
