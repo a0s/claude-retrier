@@ -93,7 +93,7 @@ Purpose: one source-of-truth table for T13 headroom and T21 real-time model chan
 |------|------|-----|---------|--------|
 | T18 | `[lane:gate]` `[tdd:required]` `MODEL_PROFILES` (window/restart_at/compact_at), `model_restart_at()`, `--cr-models` | Profile consistency, threshold precedence, and table tests pass | T01 | cc:done [0f90975] |
 | T19 | `[lane:gate]` `[tdd:required]` Unknown-slug window fallback with correction (`resolve_window()`, `estimated=True`) | Family/modal fallback, boundary correction, and `~` badge tests pass | T18 | cc:done [76e3d05] |
-| T21 | `[lane:gate]` `[tdd:required]` Real-time model changes via `Controller.on_model()` and `local-command-stdout` hint | Round-trip, shrinking-window, override, and `codex_cap` tests pass | T04, T18, T19 | cc:in-progress (`task/t21-model-switch-realtime`) |
+| T21 | `[lane:gate]` `[tdd:required]` Real-time model changes via `Controller.on_model()` and `local-command-stdout` hint | Round-trip, shrinking-window, override, and `codex_cap` tests pass | T04, T18, T19 | cc:done [f19c35c] |
 | T20 | `[lane:gate]` `[tdd:required]` Claude effective window through `--cr-statusline` proxy; cheap signals first | Settings behavior, call frequency, pty statusline, and disable switch tests pass | T18, T19 | cc:in-progress (`task/t20-claude-effective-window`, started in parallel with T21 — see Next step) |
 
 ## Phase 6: Restart stability and failure visibility (Epic B, remainder)
@@ -121,7 +121,7 @@ Purpose: close technical debt (unrotated log, 4 unreleased commits) and update d
 | Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
 | T23 | `[lane:gate]` `[tdd:required]` Concurrent-safe log rotation (`CR_LOG_MAX_BYTES`/`CR_LOG_KEEP`) | Startup rotation and below-limit tests pass | - | cc:done [2b5201c] |
-| T25 | `[lane:fast]` `[tdd:skip:docs-only]` Update four docs without stale Caveats | Grep is empty; links and anchors valid | T02, T04, T05, T08, T09 | cc:in-progress (`task/t25-docs-after-binding`) |
+| T25 | `[lane:fast]` `[tdd:skip:docs-only]` Update four docs without stale Caveats | Grep is empty; links and anchors valid | T02, T04, T05, T08, T09 | cc:done [4ed1c1d] |
 | T24 | `[lane:release]` `[tdd:skip:release-prep]` CHANGELOG, `CR_VERSION`, tag, GitHub release, and Homebrew formula | Every commit/task recorded; version tests, tag, release, and formula pass (no user-machine brew install/upgrade) | completed P0 tasks | cc:TODO |
 | T26-live | `[lane:fast]` `[tdd:skip:optional-manual]` Optional `test/run.sh --live-codex` checklist with confirmation and orphan cleanup | Explicit confirmation required; quota deliberate; process groups killed afterward | T15, T26 | cc:TODO |
 
@@ -129,10 +129,11 @@ Purpose: close technical debt (unrotated log, 4 unreleased commits) and update d
 
 ## Next step
 
-Phases 1, 2, and 4 are complete, and Phase 5/6 are now complete except T20/T21
-(in progress) — done: T01, T02, T03, T04, T05, T06, T08, T09, T10, T11, T12,
-T13, T14, T18, T19, T26, T27, T28. T07 and T23 (Phase 7/8) are also done. In
-progress right now: T20, T21, T22, T25 (see the 2026-09-19 batch entry below).
+Phases 1, 2, 4, 5, and 6 are complete: T01, T02, T03, T04, T05, T06, T08, T09,
+T10, T11, T12, T13, T14, T18, T19, T21, T26, T27, T28 are all done. T07, T22,
+T23, T25 (Phase 7/8) are also done. Only **T20** (Phase 5) is still in
+progress right now (`task/t20-claude-effective-window`, started in parallel
+with T21 rather than waiting for it — see the 2026-09-19 batch entry below).
 
 Still open after this batch lands:
 - **T15** (Phase 3) is still blocked on a live, manual codex 0.154 TUI
@@ -189,6 +190,38 @@ worktree) `on_model()` and instead do the minimal inline equivalent (set
 already does), with a comment flagging it as a candidate for later
 consolidation once T21 lands. Both launched in `task/t25-docs-after-binding`
 and `task/t20-claude-effective-window`, branched from post-T23 `main`.
+
+T22 merged next as a merge commit (`git merge` auto-resolved the one
+overlapping hunk in `claude-retrier.sh`); `./test/run.sh` green (`test_pty.py`
+alone took ~238s under contention from the T20/T21/T25 worktrees still
+running their own suites, `test_codex.py` re-run in isolation afterward to
+confirm — 147 tests OK). T21 merged next: a real conflict this time, both
+branches had inserted a new `unittest.TestCase` class at the same point in
+`test/test_codex.py` (T22's `TestFoldCostAndReserve` and T21's
+`TestModelSwitchResetsTheCodexCap`) — trivial to resolve, kept both classes
+back to back, no logic conflict. T25 merged last and hit an unrelated
+conflict: `docs/bugs/codex-self-compaction-orphans-handoff.md` had a
+pre-existing *uncommitted* Russian→English translation sitting in `main`'s
+working tree (not part of this batch, already there before this session
+started) that T25's branch — checked out before that translation existed —
+also touched (a small 3-link paragraph added near the top, in Russian, to the
+still-untranslated file). Resolved by stashing the translation, merging T25
+cleanly, then popping the stash and manually re-translating T25's added
+paragraph into English to match the surrounding file rather than discarding
+either side; the rest of the pre-existing uncommitted translation (this file
+plus `.gitignore`, `docs/backlog/T29-agents-panel-render.md`,
+`test/fixtures/README.md`) was deliberately left uncommitted and unstaged
+exactly as found — it is not part of this batch and not this session's to
+commit. `./test/run.sh` green after both merges.
+
+Of the 6 tasks in this batch (T07, T20, T21, T22, T23, T25), 5 are merged;
+**T20** is the only one still running as of this note, deliberately started
+in parallel with T21 rather than sequenced after it (see above) — once it
+reports, its inline model-id handling may be worth consolidating with T21's
+now-merged `Controller.on_model()` (source labels: `"local command"`,
+`"assistant line"`, `"codex log"`; signature `on_model(self, model, source,
+now)`, returns `True` iff the slug actually changed), though that is a
+polish item, not a correctness requirement for either task's own AC.
 
 2026-09-18/09-19 (Phase 2, T08/T09/T12, then T03/T18): code-region check via
 CodeGraph on the current (post-T01–T28) line numbers — not the stale ones in
