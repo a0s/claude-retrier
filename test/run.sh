@@ -4,12 +4,21 @@
 #   ./test/run.sh                 # everything
 #   ./test/run.sh test_time.py    # just these
 #   ./test/run.sh --docker        # the same suite inside a Linux container
+#   ./test/run.sh --live-codex    # the T15 checklist against real codex (asks first)
 set -u
 cd "$(dirname "$0")" || exit 1
 
 if [ "${1:-}" = "--docker" ]; then
   shift
   exec ./run-docker.sh "$@"
+fi
+
+# Never part of the default run: it spends real quota, so it is its own flag
+# and asks before it starts. live_codex.py does its own orphan check at the
+# end, whatever happens in between.
+if [ "${1:-}" = "--live-codex" ]; then
+  shift
+  exec "${PYTHON:-python3}" live_codex.py "$@"
 fi
 
 PY=${PYTHON:-python3}
@@ -25,7 +34,7 @@ if [ "${#files[@]}" -eq 0 ]; then
          test_degrade.py test_input_grammar.py
          test_custom_command.py test_screen.py test_agents.py test_pty.py
          test_codex.py test_fake_agents.py test_two_wrappers.py
-         test_check_orphans.py)
+         test_check_orphans.py test_live_codex.py)
 fi
 
 out=$(mktemp)
