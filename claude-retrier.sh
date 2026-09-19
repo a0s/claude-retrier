@@ -4216,25 +4216,25 @@ class Controller:
         `context_window_hint` codex's own rollout accounting already uses, so
         the priority order in `_resolve_window` falls out unchanged.
 
-        `model.id` is handled inline here, mirroring the model-change branch
-        `on_context` already has, rather than through a dedicated
-        `on_model()` — T21 is adding exactly that; once it merges, this is a
-        candidate to route through it instead.
+        `model.id` is routed through `on_model()`, the same single place
+        `on_context`'s own model-change branch uses — a no-op unless the
+        slug actually changed, and already re-resolving the window itself.
 
         `session_id` is filed away as a corroborating signal only: T02's own
         `ClaudeSessionRegistry` binding is still the one thing that decides
         which transcript is ours, and nothing here competes with it.
         """
         moved = False
-        model = rec.get("model_id")
-        if model and model != self.context_model:
-            self.context_model = model
-            moved = True
         window = rec.get("context_window_size")
         if window and window != self.context_window_hint:
+            # Done before `on_model` below so a switch that arrives on the
+            # same report resolves against the fresh window, not the stale one.
             self.context_window_hint = int(window)
             self.context_window_hint_source = "claude's status line"
             moved = True
+        model = rec.get("model_id")
+        if model and self.on_model(model, "claude's status line", now):
+            moved = False        # on_model already resolved against the live window
         if moved:
             self._resolve_window()
         session_id = rec.get("session_id")
