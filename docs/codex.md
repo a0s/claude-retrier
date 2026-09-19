@@ -109,19 +109,31 @@ already does; `codex resume` and `codex fork` are sessions, and are wrapped.
 Typing `/` at the start of a codex prompt opens its command list, the same as
 Claude Code — `CR_SLASH_ENTER`'s longer pause and extra Enter exist for
 exactly that hazard (see
-[context-restart.md](context-restart.md#slash-commands-and-cr_slash_enter)).
-codex opens a popup of the same kind for two more leading characters this
-wrapper does not yet give the same treatment to: `$` lists codex's own
-skills, and `@` opens a file mention, both closed the way `/`'s list is —
-by a following space.
+[context-restart.md](context-restart.md#commands-skills-and-mentions)). One
+real hazard sits behind that list, though: an **unrecognized** `/word` is
+rejected inline ("Unrecognized command…") and never sent, not even as plain
+text (T15, live codex-cli 0.155.1) — a bare `/command` is only safe as a
+resume or handoff phrase if `command` is one codex itself defines.
 
-`schedule_injection`, the routine that types a phrase safely, only checks for
-a leading `/`; a phrase starting with `$` or `@` is typed as plain text, with
-no extra pause for the popup to settle and no second Enter as insurance. Its
-Enter can land on a highlighted popup entry instead of submitting the phrase,
-the same class of hazard `CR_SLASH_ENTER` exists to prevent for `/`. Until
-that is fixed, a resume or handoff phrase on codex is most reliable as plain
-text or a bare `/command` — hold off on a `$skill` phrase there.
+`$` and `@`, by contrast, turned out **not** to open any popup at all (T15
+live-drove all of this on codex-cli 0.155.1, correcting an earlier guess
+recorded here): `$name` is codex's own "invoke a skill" convention, but it is
+a *model-level* instruction, not a composer feature, and `@file` (file
+mention) is likewise plain text once the whole phrase arrives in one write —
+which is how `schedule_injection`/`typing_plan` always send it (T16). Both
+are delivered exactly like any other phrase, with the ordinary single Enter,
+no popup-settling pause needed.
+
+This is why a resume or handoff phrase that needs to name a codex skill
+should use `{skill:NAME}` rather than writing `$NAME` or `/NAME` by hand — it
+expands to `$NAME` for codex and `/NAME` for claude (T17):
+
+```sh
+export CR_RESUME_MSG='{skill:supervisor} continue from `{file}`'
+```
+
+See [T15's results table](backlog/T15-codex-unfold-live-investigation.md#results)
+for the full input-by-input findings.
 
 ## Context restart on codex
 

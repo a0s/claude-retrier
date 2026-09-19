@@ -46,6 +46,16 @@
 # "The context restart was cancelled — the handoff is not needed now. Continue
 # with what you were doing before it was requested."
 #
+# CR_HANDOFF_MSG/CR_RESUME_MSG/CR_CANCEL_MSG (and their per-agent
+# CR_CLAUDE_*/CR_CODEX_* overrides) may contain {skill:NAME}, expanded to
+# whichever syntax that agent actually sends: /NAME for claude, $NAME for
+# codex — e.g. CR_RESUME_MSG='{skill:supervisor} continue from `{file}`'
+# unfolds both agents into a "supervisor" skill/subagent instead of only one
+# of them. CR_CLEAR_CMD (default /clear, same on both agents — codex-cli
+# 0.155.1 runs it identically to claude's) is the built-in that starts a new
+# session in place; CR_CLAUDE_CLEAR_CMD/CR_CODEX_CLEAR_CMD override it for one
+# agent only.
+#
 # While it runs there is a dim `◆ cr` in a corner of the screen — the wrapper's
 # only visible output. CR_BADGE=0 removes it.
 #
@@ -502,7 +512,7 @@ CR_CANCEL_MSG_DEFAULT='The context restart was cancelled — the handoff is not 
 case "${1:-}" in
   --cr-version) echo "claude-retrier $CR_VERSION"; exit 0 ;;
   --cr-help|-h|--help-retrier)
-    sed -n '2,63p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '2,73p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
 esac
 
@@ -2383,6 +2393,65 @@ AGENT_MESSAGE_KEYS = (("handoff_msg", "HANDOFF_MSG"),
                       ("cancel_msg", "CANCEL_MSG"))
 
 
+# Which leading character opens something the composer itself resolves and
+# accepts with Enter, per agent (T16). Live driving of both TUIs (T15,
+# codex-cli 0.155.1; the claude side already shipped and tested) found only
+# one such character: a leading "/" that names exactly one known command,
+# shown as a description hint the instant the whole token is typed. "$name"
+# (codex's own "invoke a skill" convention — a system-prompt instruction to
+# the model, not a composer feature) and "@file" (both agents' file-mention
+# convention) are delivered as plain text with no popup at all, as long as
+# the whole phrase arrives in one write() the way schedule_injection sends
+# it — a real human typing character-by-character might trigger a live
+# autocomplete list, but the wrapper never does that. Kept as a per-agent
+# table, not a bare constant, so a future release that reintroduces popup
+# handling for another prefix has somewhere to go without touching
+# schedule_injection again.
+AGENT_INPUT = {
+    "claude": dict(popup_prefixes="/"),
+    "codex": dict(popup_prefixes="/"),
+}
+
+
+def typing_plan(agent, text, cfg):
+    """The writes schedule_injection turns into pty input, as (delay, bytes)
+    pairs measured from the moment `text` itself is typed (delay 0).
+
+    A pure function so the T15 recipes are unit-testable without a running
+    Controller or pty: given (agent, text, cfg), the sequence is fixed.
+    Unrecognized "/word" is not handled here and cannot be from here — codex
+    rejects it inline and never sends it (T15), so a caller must never pass a
+    bare "/name" that is not one of the agent's own commands (see
+    agent_cfg's {skill:NAME} expansion, T17).
+    """
+    prefixes = AGENT_INPUT.get(agent, AGENT_INPUT["claude"])["popup_prefixes"]
+    plan = [(0.0, text.encode())]
+    if text and text[0] in prefixes:
+        t = cfg["slash_gap"]
+        for _ in range(max(1, cfg["slash_enter"])):
+            plan.append((t, b"\r"))
+            t += cfg["slash_enter_gap"]
+    else:
+        plan.append((0.6, b"\r"))
+    return plan
+
+
+SKILL_PLACEHOLDER = re.compile(r"\{skill:([^{}]+)\}")
+
+
+def expand_skill(text, agent):
+    """{skill:NAME} -> the syntax this agent actually sends: "/NAME" for
+    claude, "$NAME" for codex (T17). Never the other way around: codex
+    silently drops an unrecognized "/NAME" — never sends it as text at all —
+    while "$NAME" is always delivered as plain text (T15). So one shared
+    CR_HANDOFF_MSG/CR_RESUME_MSG/CR_CANCEL_MSG with {skill:...} in it now
+    unfolds on both agents instead of quietly failing on whichever one got
+    the wrong prefix.
+    """
+    prefix = "$" if agent == "codex" else "/"
+    return SKILL_PLACEHOLDER.sub(lambda m: prefix + m.group(1), text)
+
+
 def agent_cfg(cfg, agent):
     """The config a controller for this agent runs with.
 
@@ -2396,6 +2465,9 @@ def agent_cfg(cfg, agent):
         override = os.environ.get("CR_%s_%s" % (agent.upper(), env_suffix))
         if override:
             cfg[key] = override
+    for key in ("handoff_msg", "resume_msg", "cancel_msg"):
+        if cfg.get(key):
+            cfg[key] = expand_skill(cfg[key], agent)
     if agent != "codex":
         return cfg
     pct, tokens = cfg.get("codex_context_pct"), cfg.get("codex_context_tokens")
@@ -6468,29 +6540,16 @@ def main(argv):
         CR into a newline, so the message piles up in the box unsent (upstream
         issues #7/#19). Text and Enter therefore go out as separate writes,
         several hundred ms apart, with an optional Escape first to dismiss the
-        /rate-limit-options selector.
-
-        A message that begins with "/" is one of Claude Code's own commands, and
-        typing the slash opens its command list, where Enter can pick the
-        highlighted entry rather than submitting what was typed. Those get a
-        longer pause — time for the list to settle on the exact match — and two
-        Enters. Driving a live TUI shows one Enter is enough (2.1.222: /clear
-        runs, with no confirmation step) and that the second lands in an empty
-        input box, where nothing is submitted. Either way the command runs
-        exactly once, which is the only property worth relying on.
+        /rate-limit-options selector. The exact write sequence after that is
+        `typing_plan`'s (T16) — per agent, because "/" opens a command list on
+        both, but codex has no popup at all for "$" or "@" (T15).
         """
         t = now
         if dismiss_menu:
             pending.append((t, b"\x1b"))
             t += 0.35
-        pending.append((t, text.encode()))
-        if text.startswith("/"):
-            t += CFG["slash_gap"]
-            for _ in range(max(1, CFG["slash_enter"])):
-                pending.append((t, b"\r"))
-                t += CFG["slash_enter_gap"]
-        else:
-            pending.append((t + 0.6, b"\r"))
+        for delay, data in typing_plan(agent_name, text, CFG):
+            pending.append((t + delay, data))
 
     try:
         while True:

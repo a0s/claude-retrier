@@ -769,6 +769,57 @@ class TestPerAgentMessages(unittest.TestCase):
         self.assertEqual(mod.agent_cfg(mod.CFG, "codex")["resume_msg"],
                          "Read `{file}` and continue.")
 
+    def test_codex_clear_cmd_default_matches_claudes(self):
+        # T15 (live codex-cli 0.155.1): /clear behaves identically on both
+        # agents -- same banner, same single-Enter recipe -- so there is no
+        # reason for the defaults to diverge.
+        mod = load()
+        self.assertEqual(mod.agent_cfg(mod.CFG, "codex")["clear_cmd"], "/clear")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "claude")["clear_cmd"], "/clear")
+
+
+class TestSkillPlaceholder(unittest.TestCase):
+    """{skill:NAME} -> the syntax this agent actually sends (T17): "/NAME" for
+    claude, "$NAME" for codex. Never the other way around -- codex silently
+    drops an unrecognized "/NAME" and never sends it as text at all, while
+    "$NAME" is always delivered as plain text (T15)."""
+
+    def test_skill_placeholder_expands_per_agent(self):
+        mod = load(CR_RESUME_MSG="{skill:supervisor} continue from `{file}`")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "claude")["resume_msg"],
+                         "/supervisor continue from `{file}`")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "codex")["resume_msg"],
+                         "$supervisor continue from `{file}`")
+
+    def test_skill_placeholder_in_handoff_and_cancel_too(self):
+        mod = load(CR_HANDOFF_MSG="Use {skill:wrapup} to fold: {file}/{marker}",
+                  CR_CANCEL_MSG="Never mind -- {skill:supervisor} keep going")
+        codex_cfg = mod.agent_cfg(mod.CFG, "codex")
+        claude_cfg = mod.agent_cfg(mod.CFG, "claude")
+        self.assertEqual(codex_cfg["handoff_msg"], "Use $wrapup to fold: {file}/{marker}")
+        self.assertEqual(claude_cfg["handoff_msg"], "Use /wrapup to fold: {file}/{marker}")
+        self.assertEqual(codex_cfg["cancel_msg"], "Never mind -- $supervisor keep going")
+        self.assertEqual(claude_cfg["cancel_msg"], "Never mind -- /supervisor keep going")
+
+    def test_skill_placeholder_does_not_touch_clear_cmd(self):
+        # clear_cmd is a literal built-in command, not a phrase template.
+        mod = load(CR_CLEAR_CMD="{skill:not-a-thing}")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "codex")["clear_cmd"],
+                         "{skill:not-a-thing}")
+
+    def test_a_per_agent_override_can_use_the_placeholder_too(self):
+        mod = load(CR_RESUME_MSG="Read `{file}` and continue.",
+                  CR_CODEX_RESUME_MSG="{skill:supervisor} continue from `{file}`")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "codex")["resume_msg"],
+                         "$supervisor continue from `{file}`")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "claude")["resume_msg"],
+                         "Read `{file}` and continue.")
+
+    def test_text_without_the_placeholder_is_unchanged(self):
+        mod = load(CR_RESUME_MSG="Read `{file}` and continue.")
+        self.assertEqual(mod.agent_cfg(mod.CFG, "codex")["resume_msg"],
+                         "Read `{file}` and continue.")
+
 
 class TestACodexRestart(unittest.TestCase):
     """The machine itself is shared with claude. What differs is where its facts

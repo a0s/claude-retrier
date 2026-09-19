@@ -84,6 +84,7 @@ More in [context-restart.md](context-restart.md). All of these do nothing until
 | `CR_CLAUDE_RESUME_MSG`, `CR_CODEX_RESUME_MSG` | unset = `CR_RESUME_MSG` | same, for the unfolding phrase |
 | `CR_CLAUDE_CLEAR_CMD`, `CR_CODEX_CLEAR_CMD` | unset = `CR_CLEAR_CMD` | same, for the clear command |
 | `CR_CLAUDE_CANCEL_MSG`, `CR_CODEX_CANCEL_MSG` | unset = `CR_CANCEL_MSG` | same, for the cancel phrase |
+| `{skill:NAME}` | — | not a variable — a placeholder usable inside `CR_HANDOFF_MSG`/`CR_RESUME_MSG`/`CR_CANCEL_MSG` (and their per-agent overrides above), expanded per agent to the syntax it actually sends: `/NAME` for claude, `$NAME` for codex (T17); see [context-restart.md](context-restart.md#writing-your-own-phrases) |
 | `CR_HANDOFF_MARKER` | `HANDOFF` | prefix; a nonce is appended to it |
 | `CR_HANDOFF_MIN_BYTES` | `200` | a shorter file is not a handoff |
 | `CR_HANDOFF_ATTEMPTS` | `2` | folds attempted before giving up |

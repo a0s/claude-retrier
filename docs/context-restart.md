@@ -14,7 +14,7 @@ file, verifies it, runs `/clear` and points the fresh session at the file.
 - [Choosing a threshold](#choosing-a-threshold)
 - [The context window](#the-context-window)
 - [`[1m]` vs 200k: the statusline proxy](#1m-vs-200k-the-statusline-proxy)
-- [Slash commands and `CR_SLASH_ENTER`](#slash-commands-and-cr_slash_enter)
+- [Commands, skills and mentions](#commands-skills-and-mentions)
 - [When nothing happens](#when-nothing-happens)
 - [Caveats](#caveats)
 - [Settings](#settings)
@@ -248,17 +248,27 @@ passed to it` — precisely because it is easy to miss until two sessions in the
 same project collide.
 
 A slash command works as a resume phrase. It goes out with the extra care
-described under [`CR_SLASH_ENTER`](#slash-commands-and-cr_slash_enter) below.
+described under [Commands, skills and mentions](#commands-skills-and-mentions)
+below.
 
 A command is not portable between agents, though — `/my-skill` above is a
-Claude Code skill, and codex has never heard of it. Running both agents in the
-same project with `CR_HANDOFF_FILE` shared (it can be — it is just a path) and
-a command in `CR_HANDOFF_MSG` or `CR_RESUME_MSG` needs
-`CR_CLAUDE_HANDOFF_MSG`/`CR_CODEX_HANDOFF_MSG` and
-`CR_CLAUDE_RESUME_MSG`/`CR_CODEX_RESUME_MSG` instead: set for one agent only,
-each overrides the shared phrase for that agent alone, and the other keeps
-using it unchanged. `CR_CLAUDE_CLEAR_CMD`/`CR_CODEX_CLEAR_CMD` exist for the
-same reason, though `/clear` itself works on both.
+Claude Code skill, and codex names the same convention differently (`$name`,
+not `/name` — see below). Use the `{skill:NAME}` placeholder instead of
+writing the prefix by hand:
+
+```sh
+export CR_RESUME_MSG='{skill:my-skill} continue from `{file}`'
+```
+
+which expands to `/my-skill` for claude and `$my-skill` for codex — one
+phrase, both agents. Writing the prefix yourself and running both agents in
+the same project still works via `CR_CLAUDE_HANDOFF_MSG`/`CR_CODEX_HANDOFF_MSG`
+and `CR_CLAUDE_RESUME_MSG`/`CR_CODEX_RESUME_MSG` (`CR_HANDOFF_FILE` can be
+shared between them — it is just a path): set for one agent only, each
+overrides the shared phrase for that agent alone, and the other keeps using
+it unchanged. `CR_CLAUDE_CLEAR_CMD`/`CR_CODEX_CLEAR_CMD` exist for the same
+reason, though `/clear` itself works identically on both (verified live,
+codex-cli 0.155.1).
 
 ## Choosing a threshold
 
@@ -473,16 +483,46 @@ being frequent enough that `CR_POLL_SEC` (not the statusline's own interval)
 is the bottleneck. Full detail in
 [T20's backlog entry](backlog/T20-claude-effective-window.md#verified).
 
-## Slash commands and `CR_SLASH_ENTER`
+## Commands, skills and mentions
 
-`CR_SLASH_ENTER` exists because typing a `/` opens Claude Code's command list, and in a TUI
-that is a real hazard: Enter into an open list can pick the highlighted entry
-instead of submitting what was typed. Measured against Claude Code 2.1.222, one
-Enter runs `/clear` and there is no confirmation step. So a slash command gets a
-longer pause, letting the list settle on the exact match, and then two Enters,
-the second purely as insurance for a build that behaves differently. That second
-one costs nothing, because an Enter into an empty input box submits nothing,
-which is also measured. `CR_SLASH_ENTER=1` turns it off.
+`CR_SLASH_ENTER` exists because typing a `/` opens a command list on both
+agents, and in a TUI that is a real hazard: Enter into an open list can pick
+the highlighted entry instead of submitting what was typed. Measured against
+Claude Code 2.1.222 and codex-cli 0.155.1, one Enter runs a recognized
+command (`/clear`, `/new`, …) and there is no confirmation step. So a slash
+command gets a longer pause (`CR_SLASH_GAP_SEC`), letting the list settle on
+the exact match, and then two Enters (`CR_SLASH_ENTER`), the second purely as
+insurance for a build that behaves differently. That second one costs
+nothing, because an Enter into an empty input box submits nothing, which is
+also measured. `CR_SLASH_ENTER=1` turns the extra Enter off.
+
+Two other characters that look like they might need the same treatment
+turned out not to (T15, live-driven on codex-cli 0.155.1 — see
+[T15's results table](backlog/T15-codex-unfold-live-investigation.md#results)):
+
+- **`$name`** — codex's own "invoke a skill" convention — is not a composer
+  feature at all; it is a *model-level* instruction ("if the user names a
+  skill with `$SkillName`, use it"). Typed as part of a phrase, it is
+  delivered as plain text, no differently from anything else.
+- **`@file`** (file mention, both agents) is likewise delivered as plain text
+  when the whole phrase arrives in one write, which is how this wrapper
+  always sends it.
+
+The one real hazard found: an **unrecognized** `/word` is silently dropped by
+codex — it prints "Unrecognized command" inline and never sends the text at
+all, not even as a plain message. This is why a custom `CR_HANDOFF_MSG` /
+`CR_RESUME_MSG` / `CR_CANCEL_MSG` that needs to name a skill/subagent should
+use the `{skill:NAME}` placeholder instead of hand-writing a prefix: it
+expands to `/NAME` for claude and `$NAME` for codex, e.g.
+
+```sh
+CR_RESUME_MSG='{skill:supervisor} continue from `{file}`'
+```
+
+unfolds both agents into a "supervisor" skill/subagent, instead of only one
+of them (whichever one happens to match the prefix you picked by hand). See
+[configuration.md](configuration.md#context-restart) for the per-agent
+`CR_CLAUDE_*`/`CR_CODEX_*` overrides this placeholder works inside of.
 
 ## When nothing happens
 
