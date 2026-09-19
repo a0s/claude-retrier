@@ -1,40 +1,44 @@
-# Фикстуры
+# Fixtures
 
 ## `agent-tree-2.1.273.bin`, `agent-tree-2.1.273-collapsed.bin`
 
-Сырые байты с master-конца pty реальной сессии `claude` 2.1.273, снятые
-2026-09-18 при расследовании T27. Сессия запускалась в терминале 120×50 и
-порождала два-три тривиальных Explore-агента («назови первый файл в cwd»).
+Raw bytes from the master end of the pty of a real `claude` 2.1.273 session,
+captured on 2026-09-18 while investigating T27. The session was run in a
+120×50 terminal and spawned two or three trivial Explore agents ("name the
+first file in cwd").
 
-Это единственный источник правды о том, как TUI рисует дерево субагентов:
-рендер дифференциальный и пословный (слова разделены `ESC[<col>G`), поэтому
-grep по байтам в нём ничего не находит — файл надо прогонять через эмулятор
-экрана. См. раздел «Улики» в `docs/backlog/T27-subagent-model-overlay.md`.
+This is the sole source of truth for how the TUI renders the subagent tree:
+the rendering is differential and word-by-word (words are separated by
+`ESC[<col>G`), so grep finds nothing in the bytes — the file must be run
+through a screen emulator. See the "Evidence" section in
+`docs/backlog/T27-subagent-model-overlay.md`.
 
-Проверено на отсутствие учётных данных перед коммитом.
+Checked for credentials before committing.
 
-`capture-agent-tree.py` — драйвер, которым они сняты; им же снимается новый
-захват, когда апстрим сменит рендер.
+`capture-agent-tree.py` — the driver used to capture them; it is also used to
+make a new capture when upstream changes the rendering.
 
 ## `agents-panel-2.1.273.bin`
 
-Сырые байты той же реальной сессии `claude` 2.1.273 (120×50), снятые
-2026-09-18 при расследовании T29, но другого экрана: персистентной панели
-управления субагентами, которая открывается командой `/tasks`, пока хотя бы
-один агент ещё выполняется, и не закрывается сама (закрывается по `Esc`) — в
-отличие от мимолётного инлайн-дерева из `agent-tree-2.1.273.bin`.
+Raw bytes from the same real `claude` 2.1.273 session (120×50), captured on
+2026-09-18 while investigating T29, but from a different screen: the
+persistent subagent control panel, which opens with the `/tasks` command while
+at least one agent is still running and does not close by itself (it closes
+with `Esc`) — unlike the fleeting inline tree in
+`agent-tree-2.1.273.bin`.
 
-Живое расследование установило, что подсказка футера `← for agents`
-(и в обычном, и в `manual` permission-mode) открывает СОВСЕМ ДРУГОЙ экран —
-межсессионный ростер (список чужих, несвязанных сессий на машине) — тот
-самый, что `CR_ROSTER_PATTERNS` в `claude-retrier.sh` сознательно никогда не
-скрейпит. Первая попытка захвата действительно на секунду показала чужой
-контент (письма, страховка и т.п.); эти байты никогда не сохранялись на
-диск и не коммитились. `/tasks` — подтверждённый безопасный способ попасть
-именно в панель текущей сессии.
+Live investigation established that the footer hint `← for agents` (in both
+the normal and `manual` permission modes) opens a COMPLETELY DIFFERENT screen
+— an inter-session roster (a list of other, unrelated sessions on the
+machine) — the very one that `CR_ROSTER_PATTERNS` in `claude-retrier.sh`
+deliberately never scrapes. The first capture attempt did briefly show other
+people's content (emails, insurance, etc.); those bytes were never saved to
+disk or committed. `/tasks` is the confirmed safe way to reach the panel for
+the current session specifically.
 
-Проверено на отсутствие учётных данных и чужого контента перед коммитом.
+Checked for credentials and other people's content before committing.
 
-`capture-agents-panel.py` — драйвер, которым он снят (буферизует вывод в
-памяти и никогда не пишет на диск, пока не убедится, что ростер не
-показался); им же снимается новый захват, когда апстрим сменит рендер.
+`capture-agents-panel.py` — the driver used to capture it (buffers output in
+memory and never writes to disk until it confirms that the roster did not
+appear); it is also used to make a new capture when upstream changes the
+rendering.
