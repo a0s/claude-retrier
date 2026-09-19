@@ -141,9 +141,22 @@ More in [how-it-works.md](how-it-works.md#updates).
 
 ## Logging and switching it off
 
+`CR_LOG` is shared by every wrapper process on the machine — that's what T01's
+per-line `[cr <pid> <agent>]` tag is for — so nothing ever truncates it on its
+own. Left alone it grows without bound; `CR_LOG_MAX_BYTES`/`CR_LOG_KEEP` cap
+that. Rotation is checked only once, when a wrapper starts up and opens the
+log (never mid-run, so it can't rename the file out from under a neighboring
+wrapper in the middle of an incident): past the size limit, `log` becomes
+`log.1`, the previous `log.1` becomes `log.2`, and so on up to `CR_LOG_KEEP`
+copies, dropping whatever would spill past that. A process that already had
+the old file open for writing keeps writing into what is now `log.1` — its
+lines stay readable via the same per-line tag, so this is harmless.
+
 | variable | default | |
 |---|---|---|
 | `CR_LOG` | `~/.claude-retrier/log` | |
+| `CR_LOG_MAX_BYTES` | `5M` | rotate once the log passes this size; accepts `5M`/`500k`-style sizes |
+| `CR_LOG_KEEP` | `2` | how many rotated copies (`log.1`, `log.2`, ...) to keep |
 | `CR_DISABLE` | | `1` runs plain claude |
 
 ## Detection patterns

@@ -293,6 +293,8 @@ CR_AGENTS_PANEL_ROW_PATTERNS=(
 : "${CR_VERIFY_SEC:=60}"               # how long to watch for the retry taking hold
 : "${CR_SCRAPE:=auto}"                 # auto | always | never  (screen-scrape fallback)
 : "${CR_LOG:=$HOME/.claude-retrier/log}"
+: "${CR_LOG_MAX_BYTES:=5M}"            # rotate the shared log once it passes this size
+: "${CR_LOG_KEEP:=2}"                  # how many rotated copies (log.1, log.2, ...) to keep
 : "${CR_NOTIFY:=1}"                    # print a one-line status note into the terminal
 : "${CR_BADGE:=1}"                     # dim marker in a screen corner: "we are here"
 : "${CR_BADGE_POS:=bottom-right}"      # bottom-right | bottom-left | top-right | top-left
@@ -860,6 +862,8 @@ CFG = dict(
     verify=_env("CR_VERIFY_SEC", 60, float),
     scrape=_env("CR_SCRAPE", "auto"),
     log=_env("CR_LOG", os.path.expanduser("~/.claude-retrier/log")),
+    log_max_bytes=parse_tokens(os.environ.get("CR_LOG_MAX_BYTES") or "5M") or 5_000_000,
+    log_keep=_env("CR_LOG_KEEP", 2, int),
     notify=_env("CR_NOTIFY", "1") == "1",
     badge=_env("CR_BADGE", "1") == "1",
     badge_pos=_env("CR_BADGE_POS", "bottom-right"),
@@ -5696,15 +5700,49 @@ class AgentOverlay:
         return write_annotation(fd, row, col, draw, "2")
 
 
+def _rotate_log_if_needed(path, max_bytes, keep):
+    """Rotate `path` to `path.1` (and shift `path.1..path.keep-1` up by one,
+    dropping whatever would spill past `path.keep`) if it is already over
+    `max_bytes`. No-op if the file doesn't exist yet or is under the limit.
+
+    Only ever called from Logger.__init__, i.e. at wrapper startup — never
+    mid-run, so a rotation can't happen underneath a neighboring wrapper
+    process in the middle of an incident. A process that already has `path`
+    open for writing when this runs keeps its file descriptor pointed at
+    the same inode, which after the rename below is `path.1` — it just goes
+    on appending there. That's accepted (T01's per-line tag keeps such lines
+    readable) and not something this function tries to prevent.
+    """
+    try:
+        if os.path.getsize(path) <= max_bytes:
+            return
+    except OSError:
+        return   # nothing on disk to rotate
+    if keep < 1:
+        return
+    try:
+        oldest = "%s.%d" % (path, keep)
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for n in range(keep - 1, 0, -1):
+            src = "%s.%d" % (path, n)
+            if os.path.exists(src):
+                os.rename(src, "%s.%d" % (path, n + 1))
+        os.rename(path, "%s.1" % path)
+    except OSError:
+        pass
+
+
 class Logger:
     """Writes to the one log file every wrapper on the machine shares.
 
     `tag` names which process wrote a line — without it, two sessions in the
     same project interleave into an unreadable log (T01).
     """
-    def __init__(self, path, tag=""):
+    def __init__(self, path, tag="", max_bytes=5_000_000, keep=2):
         self.path = path
         self.tag = tag
+        _rotate_log_if_needed(path, max_bytes, keep)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             self.fh = open(path, "a", buffering=1)
@@ -5773,7 +5811,8 @@ def main(argv):
     launch = launch_vector()
     claude = launch[0]
     agent_name = pick_agent(CFG["agent"], launch)
-    log = Logger(CFG["log"], tag="cr %d %s" % (os.getpid(), agent_name))
+    log = Logger(CFG["log"], tag="cr %d %s" % (os.getpid(), agent_name),
+                 max_bytes=CFG["log_max_bytes"], keep=CFG["log_keep"])
     session_start = time.time()
     log("start: %s %s (agent: %s) cwd=%s"
         % (" ".join(launch), " ".join(argv), agent_name, os.getcwd()))
@@ -6430,7 +6469,7 @@ fi
 CR_CLAUDE_ARGV=$(printf '%s\037' "${CR_ARGV[@]}")
 export CR_CLAUDE_RESOLVED CR_CLAUDE_ARGV CLAUDE_RETRIER_ACTIVE=1
 export CR_MESSAGE CR_MARGIN_SEC CR_MAX_ATTEMPTS CR_FALLBACK_WAIT_SEC CR_MAX_WAIT_SEC
-export CR_USER_IDLE_SEC CR_BUSY_IDLE_SEC CR_VERIFY_SEC CR_SCRAPE CR_LOG CR_NOTIFY
+export CR_USER_IDLE_SEC CR_BUSY_IDLE_SEC CR_VERIFY_SEC CR_SCRAPE CR_LOG CR_LOG_MAX_BYTES CR_LOG_KEEP CR_NOTIFY
 export CR_RESUME_SEC
 export CR_DRAFT_GRACE_SEC CR_TYPING_MAX_SEC
 export CR_BADGE CR_BADGE_POS CR_BADGE_LABEL
