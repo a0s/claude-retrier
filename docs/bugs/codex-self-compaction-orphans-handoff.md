@@ -1,39 +1,39 @@
-# codex: сессия зависает пустой после того, как codex сам сжал контекст во время fold
+# codex: session hangs empty after codex compacts context itself during fold
 
-Задачи из бэклога, закрывающие находки этого разбора:
-[T08 — unfold обязателен после `/clear`](../backlog/T08-unfold-is-owed.md),
-[T09 — cancel-фраза после abort уже доставленного fold](../backlog/T09-cancel-after-abort.md),
-[T22 — семантика порога и резерва codex](../backlog/T22-codex-threshold-semantics.md).
+Backlog tasks that close findings from this investigation:
+[T08 — unfold is mandatory after `/clear`](../backlog/T08-unfold-is-owed.md),
+[T09 — cancel phrase after abort of an already-delivered fold](../backlog/T09-cancel-after-abort.md),
+[T22 — codex threshold and reserve semantics](../backlog/T22-codex-threshold-semantics.md).
 
-Статус: главный кандидат на фикс (Находка 1) реализован в ветке
-`fix/handoff-race-recovery` — см. раздел "Что сделано" в конце файла. Находки 2
-и 3 (резерв/повторные прерывания во время fold) и пункты из "Не проверено" пока
-не тронуты.
+Status: the leading fix candidate (Finding 1) has been implemented in branch
+`fix/handoff-race-recovery` — see “What was done” at the end of this file.
+Findings 2 and 3 (reserve/repeated interruptions during fold), and the items
+under “Not checked”, have not been addressed yet.
 
-## Что наблюдал пользователь
+## What the user observed
 
-Сессия `codex-retrier` в проекте `openhopper.app` (worktree
-`feat/moldshell-extractor-phase-r1`). Скриншоты см. в переписке от 2026-09-15
-~03:2x (по факту сам инцидент случился раньше, см. лог ниже).
+The `codex-retrier` session in project `openhopper.app` (worktree
+`feat/moldshell-extractor-phase-r1`). Screenshots are in the conversation from
+2026-09-15 ~03:2x (the incident itself occurred earlier; see the log below).
 
-Последовательность на экране:
-1. Прилетает `CR_HANDOFF_MSG` ("Wrap up now. Do not start new work. Write a
-   complete handoff to `scratchpad/RESUME.md` ... HANDOFF-4b5a6d39").
-2. Модель честно сворачивает работу: проверяет merge-lock/agent-state,
-   останавливает супервизор, пишет `scratchpad/RESUME.md` (392 строки),
-   заканчивает файл маркером `HANDOFF-4b5a6d39`, сама же проверяет `test -f`,
-   `wc -l`, последнюю строку — всё сходится.
-3. В транскрипте появляется `Context compacted · 29s`.
-4. Модель отчитывается: "Полная передача контекста записана... Работа и
-   управляющий агент остановлены... Worked for 4m 02s".
-5. Дальше — тишина. Строка ввода пустая, контекст `3% used`. Фраза для
-   разворачивания (`CR_RESUME_MSG`) в сессию так и не была напечатана. Если бы
-   пользователь не заметил, сессия так и осталась бы висеть пустой.
+Sequence on screen:
+1. A `CR_HANDOFF_MSG` arrives (“Wrap up now. Do not start new work. Write a
+   complete handoff to `scratchpad/RESUME.md` ... HANDOFF-4b5a6d39”).
+2. The model wraps up: checks merge-lock/agent-state, stops the supervisor,
+   writes `scratchpad/RESUME.md` (392 lines), ends it with marker
+   `HANDOFF-4b5a6d39`, and checks `test -f`, `wc -l`, and the last line; all
+   checks pass.
+3. The transcript shows `Context compacted · 29s`.
+4. The model reports: “Full context handoff written... Work and the
+   controlling agent stopped... Worked for 4m 02s”.
+5. Then silence. The input line is empty and context is `3% used`. The resume
+   phrase (`CR_RESUME_MSG`) was never printed. Without the user noticing, the
+   session would have remained empty and hung.
 
-## Расследование
+## Investigation
 
-Лог `~/.claude-retrier/log` за эту же ночь (проект `openhopper.app`) содержит
-ровно то, что нужно:
+The `~/.claude-retrier/log` log for that night (project `openhopper.app`)
+contains exactly what is needed:
 
 ```
 [2026-09-15 00:26:45] context is 231k of a 258k window (89%, threshold 137k); folding up
@@ -42,74 +42,63 @@
 [2026-09-15 03:24:00] start: /opt/homebrew/bin/claude  (agent: claude)
 ```
 
-Это подтверждает ровно то, что видно на скриншотах, и даёт причину.
+This confirms what the screenshots show and explains the cause.
 
-### Находка 1 (главная): гонка между fold-турном и собственным сжатием codex
+### Finding 1 (main): race between the fold turn and codex’s own compaction
 
-`Controller._lost_the_race()` (claude-retrier.sh) — как только codex сжимает
-тред сам, пока `rstate` (`HANDOFF_SENT` в данном случае) ещё не завершён,
-контроллер сразу вызывает `_abort_restart(...)`. Абортация ничего не проверяет
-постфактум: `context_tokens` обнуляется, `rstate` сбрасывается, и — что важно —
-**дальше фраза для разворачивания (unfold, `CR_RESUME_MSG`) уже никогда не
-отправляется**, даже если сам fold к этому моменту уже успешно дописал файл
-(как здесь: маркер `HANDOFF-4b5a6d39` реально стоит последней строкой, файл
-верифицирован моделью). `_abort_restart` намеренно ничего не трогает
-("Nothing is cleared, nothing is retyped, no state is unwound") — расчёт на
-то, что сессия просто упадёт на собственное сжатие Claude Code/codex и
-продолжит жить сама. Но:
+`Controller._lost_the_race()` (claude-retrier.sh): as soon as codex compacts the
+thread while `rstate` (`HANDOFF_SENT` here) is unfinished, the controller calls
+`_abort_restart(...)`. The abort does not check the result afterward:
+`context_tokens` is reset, `rstate` is reset, and — crucially — **the resume
+phrase (unfold, `CR_RESUME_MSG`) is never sent**, even if the fold has already
+written the file successfully (as here: `HANDOFF-4b5a6d39` is the final line,
+and the model verified the file). `_abort_restart` deliberately does nothing
+(“Nothing is cleared, nothing is retyped, no state is unwound”); it assumes the
+session will fall through Claude Code/codex’s own compaction and continue. But:
 
-- `Context compacted` в транскрипте — это сжатие **самого codex**, а не `/clear`
-  обёртки. Обёртка это не видит как "успешный clear" и не запускает шаг unfold.
-- Хэндофф-файл при этом валиден и мог бы быть использован — но никто не
-  печатает `CR_RESUME_MSG`, потому что restart уже помечен как aborted.
+- `Context compacted` is compaction by **codex itself**, not the wrapper’s
+  `/clear`. The wrapper does not treat it as a successful clear and does not
+  start unfold.
+- The handoff is valid and usable, but nobody prints `CR_RESUME_MSG` because
+  the restart is already marked aborted.
 
-Итог: контекст де-факто обнулился (как и должно было случиться), хэндофф
-де-факто написан правильно, но связывающий шаг ("прочитай файл и продолжай")
-пропущен целиком — ровно то поведение, что видел пользователь.
+Thus the context reset as expected, and the handoff was correctly written, but
+the linking step (“read the file and continue”) was skipped entirely — exactly
+what the user saw.
 
-Отсюда же и ответ на смежный вопрос ("почему в логе нет команды на
-сжатие/очистку контекста"): её там и не могло быть. Собственная команда
-обёртки (`/clear`) логируется только в момент отправки —
+This also explains why the log contains no context-clear command. The wrapper’s
+`/clear` is logged only when sent —
 `"handoff verified; clearing the context with %s" % clear_cmd`
-(claude-retrier.sh:3252) — и печатается лишь при переходе в состояние
-`CLEARED`, то есть после того, как хэндофф прошёл верификацию. Здесь рестарт
-оборвался ещё в `handoff_sent`, до верификации, так что до этой строки дело
-не дошло — это следствие того же бага, а не отдельная аномалия. А
-`Context compacted`, которое видно в транскрипте codex, — это вообще не
-команда обёртки: claude-retrier ничего не отправляет для само-сжатия codex,
-а лишь пассивно детектирует уже случившийся факт, вычитывая из rollout-файла
-запись `"compacted"` (см. `if rec.get("type") == "compacted"` в
-claude-retrier.sh). Строка `codex compacted the thread on its own before the
-restart could` в логе — это и есть вся "команда": по сути просто фиксация
-факта постфактум, а не что-то, что обёртка инициировала или могла бы
-перехватить как исходящее действие.
+(claude-retrier.sh:3252) — and only on transition to `CLEARED`, after handoff
+verification. Here the restart aborted in `handoff_sent`, before verification,
+so that line was never reached. `Context compacted` in the codex transcript is
+not a wrapper command: claude-retrier sends nothing to compact codex; it only
+detects the already completed event by reading the `"compacted"` record from
+the rollout file (see `if rec.get("type") == "compacted"` in
+claude-retrier.sh). The log line `codex compacted the thread on its own before
+the restart could` is only a post-factum record, not an outgoing action.
 
-### Находка 2: порог не сработал вовремя, из-за чего запаса до потолка codex почти не осталось
+### Finding 2: the threshold did not trigger in time, leaving almost no headroom before codex’s cap
 
-`CR_CONTEXT_PCT` (или дефолт 51%) должен был дать команду на fold при пороге
-137k токенов (238k окно * ~53%, судя по логу — `threshold 137k`). Реально fold
-начался только при **231k / 89%** — почти у самого потолка codex (`258k`,
-которые он сам считает "cap" на сжатие, см. `docs/codex.md` про
-"90% of the raw window — 244,800 tokens" при raw-окне 258.4k... тут cap
-записан именно 258k). Разница между 137k и 231k — это ~94k токенов, которые,
-судя по всему, "прилетели" одним скачком между проверками (лог считает счётчик
-только когда транскрипт реально вырос — `note_growth`/чтение по строкам
-транскрипта, а не polling с фиксированным интервалом). Вероятная причина:
-один codex-турн (например, с большим tool-output — чтением большого файла/лога)
-добавил разом десятки тысяч токенов, и порог 137k был "перепрыгнут" за один
-шаг сразу к 231k.
+`CR_CONTEXT_PCT` (or the default 51%) should trigger a fold at 137k tokens
+(238k window * ~53%, according to the log: `threshold 137k`). In reality fold
+started at **231k / 89%**, almost at codex’s `258k` cap (see `docs/codex.md`
+for “90% of the raw window — 244,800 tokens” with a raw window of 258.4k;
+the cap here is recorded as 258k). The ~94k-token difference apparently arrived
+in one jump between checks: the log counts only when the transcript grows,
+through `note_growth`/line reading, rather than fixed-interval polling. One
+codex turn, perhaps with large tool output from a file or log, likely added tens
+of thousands of tokens, skipping the 137k threshold and jumping to 231k.
 
-Следствие: к моменту, когда обёртка вообще узнала, что пора сворачиваться,
-до потолка `258k`, где codex сжимает сам, оставалось всего ~27k токенов — и
-сам fold-турн (чтение merge-lock/agent-state, остановка супервизора, запись
-392-строчного RESUME.md, самопроверка) их благополучно съел за ~4 минуты,
-и codex сжался первым.
+By the time the wrapper learned it should fold, only ~27k tokens remained before
+the `258k` cap where codex compacts itself. The fold turn (reading
+merge-lock/agent-state, stopping the supervisor, writing the 392-line RESUME.md,
+and self-checking) consumed that reserve over ~4 minutes, so codex compacted first.
 
-### Находка 3: прерывание сработало вовремя, но резерва не хватило впритык
+### Finding 3: interruption triggered in time, but the reserve was barely insufficient
 
-Полный лог с вечера того же дня показывает, что интерпретация "порог не
-сработал вовремя" (Находка 2) неточна — механизм прерывания сработал ровно
-как задумано:
+The complete log from that evening shows that Finding 2’s interpretation is
+inaccurate: interruption worked exactly as designed:
 
 ```
 [2026-09-14 21:24:43] codex compacts this thread at 258k by its own count; restarting at 137k, interrupting a running turn past 226k
@@ -120,159 +109,117 @@ restart could` в логе — это и есть вся "команда": по 
 [2026-09-15 00:30:40] codex compacted the thread on its own ... the count stood at 261k of a 258k cap
 ```
 
-Работающий турн был прерван (Esc) ровно в точке `cap - CR_CODEX_RESERVE_TOKENS`
-= `258k - 32k` = `226k`, как и написано в комментарии к `CR_CODEX_INTERRUPT`.
-Но сам fold-турн — который после прерывания уже не прерывают, ему нужно
-дописать хэндофф до конца — набрал ещё **~30k токенов** за 4 минуты (чтение
-`agent-merge-lock`/`agent-state`, остановка супервизора, запись 392-строчного
-`RESUME.md`, собственная самопроверка через shell), и этого хватило, чтобы
-перевалить через жёсткий потолок codex (`261k > 258k`) буквально на несколько
-тысяч токенов раньше, чем модель успела закончить писать маркер и обёртка —
-его проверить.
+The running turn was interrupted (Esc) at `cap - CR_CODEX_RESERVE_TOKENS` =
+`258k - 32k` = `226k`, as stated in the `CR_CODEX_INTERRUPT` comment. The fold
+turn is not interrupted afterward because it must finish the handoff. It used
+another **~30k tokens** in 4 minutes (reading `agent-merge-lock`/`agent-state`,
+stopping the supervisor, writing 392-line `RESUME.md`, and shell self-checking),
+crossing the hard cap (`261k > 258k`) a few thousand tokens before the marker
+was written and verified.
 
-Вывод: `CR_CODEX_RESERVE_TOKENS=32k` — это резерв не "до потолка", а именно
-**на весь fold-турн целиком** (тяжёлые fold'ы с несколькими shell-командами и
-самопроверкой явно съедают сравнимую величину), и дефолт оказался впритык
-недостаточным. Это не гонка "непредсказуемо повезло/не повезло", а
-систематически тонкий запас на конкретный тип тяжёлого fold-сообщения
-(`CR_HANDOFF_MSG` в этом проекте просит модель ещё и проверить
-merge-lock/agent-state перед записью — дополнительные tool-calls сверх самого
-файла).
+Conclusion: `CR_CODEX_RESERVE_TOKENS=32k` is a reserve **for the entire fold
+turn**, not merely “up to the cap”. Heavy folds with several shell commands and
+self-checking consume a comparable amount. The default is systematically too
+thin for this heavy `CR_HANDOFF_MSG`, which also requests merge-lock/agent-state
+checks and therefore adds tool calls.
 
-### Про идею "отключить автосжатие codex совсем"
+### On “disabling codex auto-compaction entirely”
 
-Обсуждали с пользователем: раз это неуправляемая и непредсказуемая штука,
-может, просто выключить её насовсем и полагаться только на restart обёртки?
-Судя по коду, это **не полностью достижимо конфигом**: сам код-комментарий у
-`CR_CODEX_HOLD_COMPACT` прямым текстом говорит, что у codex есть два порога —
-"мягкий" на 90% сырого окна, который *можно* отодвинуть флагами
-(`model_auto_compact_token_limit_scope`/`model_auto_compact_token_limit`, это
-и делает `CR_CODEX_HOLD_COMPACT=1`, включённый по умолчанию), и "жёсткий" на
-95% (258.4k из 272k) — "a cap nothing can move". То есть в некотором смысле
-`CR_CODEX_HOLD_COMPACT` уже и есть "отключить автосжатие, насколько это вообще
-возможно" — и он уже был включён (дефолт) в этом инциденте. Само по себе
-само-сжатие в этом случае произошло не потому что "мягкий" порог не
-подвинули, а потому что дошли до "жёсткого", несдвигаемого потолка.
+We discussed simply disabling this uncontrollable behavior and relying on the
+wrapper restart. The code indicates this is **not fully achievable through
+configuration**. The `CR_CODEX_HOLD_COMPACT` comment describes two thresholds:
+a “soft” 90% raw-window threshold that *can* move via
+`model_auto_compact_token_limit_scope`/`model_auto_compact_token_limit` (which
+`CR_CODEX_HOLD_COMPACT=1`, enabled by default, does), and a “hard” 95% threshold
+(258.4k of 272k) — “a cap nothing can move”. Thus `CR_CODEX_HOLD_COMPACT` is
+already “disable auto-compaction as far as possible”, and was enabled here. The
+compaction occurred on reaching the immovable hard cap, not the soft threshold.
 
-**Принятое решение (2026-09-15):** не тратить время на попытки убрать сам
-жёсткий потолок (пока не найдено, что это вообще возможно) — вместо этого
-работать над тем, чтобы обёртка гарантированно укладывалась в резерв и
-никогда не подходила к потолку вплотную. Пользователь сознательно принимает
-компромисс: увеличенный резерв означает fold стартует чуть раньше и, значит,
-рестарты (а с ними — переписывание истории заново после `/clear`) будут
-происходить чуть чаще при том же объёме реальной работы, что расходует
-чуть больше токенов, чем идеально плотная упаковка контекста впритык к
-потолку. Это предпочтительнее, чем ловить описанный здесь баг.
+**Decision (2026-09-15):** do not pursue removing the hard cap until it is known
+to be possible. Make the wrapper fit reliably within its reserve instead. The
+user accepts that a larger reserve starts folds earlier, causing somewhat more
+restarts (and history rewrites after `/clear`) and slightly higher token use;
+this is preferable to the bug described here.
 
-(Уточнение: жалобы на Reddit про "расход токенов стал быстрее" — это о
-другом, не о нашем случае. Это о людях, которые сами включили codex на
-контекстное окно 800k+ вместо дефолтных ~270k: с бОльшим окном каждый запрос
-физически тяжелее/дороже, и недельная квота выгорает быстрее — это никак не
-связано ни с автосжатием, ни с резервом `CR_CODEX_RESERVE_TOKENS`, ни с этим
-багом. Здесь и далее речь только о поведении при дефолтном окне ~270k.)
+(Clarification: Reddit complaints that “token usage became faster” concern
+people who enabled an 800k+ context instead of the default ~270k. Larger
+windows make every request heavier/more expensive and exhaust the weekly quota
+faster. This is unrelated to auto-compaction, `CR_CODEX_RESERVE_TOKENS`, or
+this bug. The discussion here concerns the default ~270k window.)
 
-Конкретно стоит:
-- поднять `CR_CODEX_RESERVE_TOKENS` с 32k до величины, которая гарантированно
-  перекрывает самый тяжёлый реалистичный fold-турн (или сделать его
-  адаптивным — оценивать по факту, сколько токенов обычно съедает fold с
-  данным `CR_HANDOFF_MSG`);
-- проверить, нельзя ли всё же найти способ поднять/убрать сам жёсткий cap
-  (новый флаг codex-cli, переменная окружения, патч `config.toml`) — если да,
-  это снимет проблему целиком без риска "недооценили резерв ещё раз";
-- если жёсткий cap действительно неубираем — рассмотреть повторные
-  прерывания уже во время самого fold-турна, если он видит, что тоже
-  подбирается к потолку, а не полагаться на то, что резерва хватит на весь
-  fold целиком за один присест.
+Specifically:
+- raise `CR_CODEX_RESERVE_TOKENS` from 32k to a value covering the heaviest
+  realistic fold turn, or make it adaptive based on actual fold consumption;
+- investigate whether a new codex-cli flag, environment variable, or
+  `config.toml` patch can raise/remove the hard cap;
+- if the cap cannot be removed, consider repeated interruptions during fold
+  when it approaches the cap, rather than relying on one reserve for the whole fold.
 
-### Не проверено / дальше копать
+### Not checked / investigate further
 
-- Почему разрыв 137k → 231k случился одним скачком: посмотреть транскрипт
-  того турна (какой конкретно tool-call дал такой прирост) — если это
-  системная особенность (например, чтение большого файла целиком в один
-  проход), можно предсказуемо резервировать больше запаса, а не только
-  реагировать постфактум.
-- `_maybe_interrupt()` создан именно для того, чтобы прерывать турн codex,
-  который вот-вот сожмётся сам — но он актуален для турна ДО начала fold.
-  Нужно проверить, не стоило бы применять ту же логику (Esc) и во время
-  самого fold-турна, если тот начинает разрастаться и подбираться к cap.
-- Главный кандидат на фикс: в `_lost_the_race()` / `_abort_restart()`, прежде
-  чем сдаваться насовсем, стоит попытаться прочитать хэндофф-файл ещё раз —
-  если маркер там уже стоит (как в этом случае), можно (а) не аборить
-  restart, а перейти сразу в `RESUME_SENT` и напечатать `CR_RESUME_MSG` — раз
-  codex и так уже сам всё почистил, второй `/clear` не нужен, нужен только
-  unfold; либо (б) как минимум сделать `notify()` не "прозрачной" строкой,
-  а чем-то более заметным/устойчивым, чтобы пользователь не должен был сам
-  ловить момент, когда лог говорит "restart aborted".
-- Проверить `notify()` (claude-retrier.sh) — сообщение "restart aborted at
-  handoff_sent: ..." по дизайну "transient by design" (одна тусклая строка,
-  которую тут же перерисовывает TUI codex). Это ровно то, что объясняет,
-  почему на скриншотах пользователя нет никакого предупреждения: строка,
-  скорее всего, была напечатана и тут же перекрыта — стоит проверить, не
-  нужно ли для такого рода "permanent-ish" отказов писать что-то более
-  заметное или дублировать в реальный badge/лог, который пользователь
-  проверит без напоминания.
+- Inspect the transcript to learn why 137k → 231k happened in one jump and
+  which tool call caused it; a large-file read may make a larger reserve predictable.
+- `_maybe_interrupt()` interrupts a turn before fold. Check whether the same
+  Esc logic should apply during fold as it approaches the cap.
+- Main fix candidate: in `_lost_the_race()` / `_abort_restart()`, read the
+  handoff again before giving up. If its marker exists, as here, skip abort,
+  transition to `RESUME_SENT`, and print `CR_RESUME_MSG` (codex already cleared
+  context, so only unfold is needed). At minimum make `notify()` more visible
+  than a transient line when the log says “restart aborted”.
+- Check `notify()` in claude-retrier.sh: “restart aborted at handoff_sent: ...”
+  is transient by design and immediately redrawn by the codex TUI. This likely
+  explains the missing screenshot warning; consider a persistent badge or log.
 
-## Где смотреть в коде
+## Where to look in the code
 
 - `claude-retrier.sh`: `Controller._lost_the_race`, `Controller._abort_restart`,
-  `Controller._maybe_interrupt`, `Controller.note_growth`, `notify()` (в блоке
-  запуска pty).
-- `docs/context-restart.md` — описание штатного 4-шагового потока (fold →
-  check → `/clear` → unfold) и раздел "Caveats".
-- `docs/codex.md` — раздел "Staying ahead of codex's own compaction", где
-  описан ровно тот cap (258k / 90% сырого окна), в который здесь упёрлись.
+  `Controller._maybe_interrupt`, `Controller.note_growth`, `notify()` (pty launch block).
+- `docs/context-restart.md` — standard four-step flow (fold → check → `/clear`
+  → unfold) and “Caveats”.
+- `docs/codex.md` — “Staying ahead of codex's own compaction”, describing the
+  cap (258k / 90% of the raw window) reached here.
 
-## Как воспроизвести (гипотеза, не проверено)
+## How to reproduce (hypothesis, not checked)
 
-1. Запустить codex-retrier с `CR_CONTEXT_PCT` около 50% на длинной сессии.
-2. Спровоцировать турн с очень большим tool-output (например, чтение
-   огромного файла или лога) так, чтобы счётчик токенов одним скачком перешёл
-   от значения ниже порога сразу к значению в пределах последних ~10% перед
-   `CR_CODEX_HOLD_COMPACT`-потолком codex.
-3. Дать fold-турну время дописать хэндофф (несколько минут) — если за это
-   время сам codex успеет сжать тред первым, должно повториться: валидный
-   хэндофф-файл, "Context compacted" в транскрипте, но без последующего
-   unfold.
+1. Start codex-retrier with `CR_CONTEXT_PCT` around 50% on a long session.
+2. Trigger very large tool output (for example, reading a huge file or log) so
+   the counter jumps from below threshold into the final ~10% before codex’s
+   `CR_CODEX_HOLD_COMPACT` cap.
+3. Let the fold turn write the handoff for several minutes. If codex compacts
+   first, there should be a valid handoff, “Context compacted” in the transcript,
+   but no subsequent unfold.
 
-## Что сделано (ветка `fix/handoff-race-recovery`)
+## What was done (branch `fix/handoff-race-recovery`)
 
-Реализован ровно "главный кандидат на фикс" из Находки 1: перед тем как
-`_lost_the_race()` вызывает `_abort_restart()`, он теперь ещё раз пробует
-`self.probe(self.handoff_path)` и прогоняет его через тот же
-`_handoff_fault()`, которым обычным ходом проверяет `_check_handoff()`. Если
-все четыре слоя (файл существует, не старше запроса, не короче порога,
-кончается верным маркером, турн закрылся `end_turn`) уже пройдены — а именно
-так и было в инциденте, — рестарт не абортится. Вместо этого `rstate`
-переводится сразу в `CLEARED` (второй `/clear` не шлём — codex его для нас уже
-сделал сам), и на следующем тике обычный `_tick_restart()` сам допишет
-недостающий шаг: дождётся, пока сессия перестанет быть busy, и пошлёт
-`CR_RESUME_MSG` через штатный `_send_resume()`. Работает только для
-`HANDOFF_SENT`/`HANDOFF_OK` — состояния `CLEARED`/`RESUME_SENT` при гонке
-по-прежнему абортятся как раньше (там либо `/clear` уже отправлен, либо
-unfold уже отправлен, восстанавливать нечего).
+The main Finding 1 fix was implemented. Before `_lost_the_race()` calls
+`_abort_restart()`, it now retries `self.probe(self.handoff_path)` and passes it
+through `_handoff_fault()`, the same check used by `_check_handoff()`. If all
+four layers (file exists, is not older than the request, meets the minimum
+length, ends with the correct marker, and the turn closed with `end_turn`) have
+passed — as in this incident — the restart is not aborted. `rstate` moves
+directly to `CLEARED` (no second `/clear`; codex already performed it), and the
+next `_tick_restart()` waits until the session is no longer busy and sends
+`CR_RESUME_MSG` through `_send_resume()`. This applies only to
+`HANDOFF_SENT`/`HANDOFF_OK`; `CLEARED`/`RESUME_SENT` still abort on a race because
+there is then nothing to restore.
 
-Если хэндофф на момент гонки НЕ прошёл проверку (файл не дописан, маркер не
-тот, турн оборвался не через `end_turn` и т.п.) — поведение не изменилось:
-`_abort_restart()` вызывается как раньше, сессия падает на собственное сжатие
-Claude Code/codex, ничего не печатается.
+If verification fails (incomplete file, wrong marker, turn did not end through
+`end_turn`, etc.), behavior is unchanged: `_abort_restart()` is called and the
+session falls through its own Claude Code/codex compaction without printing anything.
 
-Тесты: `test/test_codex.py`, класс `TestStayingAheadOfCodex` —
-`test_codex_getting_there_first_does_not_lose_a_landed_handoff` (новый путь:
-валидный хэндофф переживает гонку и unfold всё равно уходит) и
-`test_codex_getting_there_first_with_no_handoff_still_aborts` (старое
-поведение при невалидном хэндоффе не сломано; существовавший тест
-`test_codex_getting_there_first_is_said_and_ends_the_restart` тоже остаётся
-зелёным без изменений). Полный `./test/run.sh` (все файлы, включая
-`test_pty.py`) прогнан целиком — всё зелёное, орфанов процессов после прогона
-не осталось.
+Tests: `test/test_codex.py`, class `TestStayingAheadOfCodex` —
+`test_codex_getting_there_first_does_not_lose_a_landed_handoff` (valid handoff
+survives the race and unfold is sent) and
+`test_codex_getting_there_first_with_no_handoff_still_aborts` (invalid handoff
+retains old behavior; existing `test_codex_getting_there_first_is_said_and_ends_the_restart`
+also remains green unchanged). Full `./test/run.sh`, including `test_pty.py`,
+was run successfully; no orphaned processes remained.
 
-Не сделано в этом заходе (осталось на потом, время поджимало):
-- Находка 2/3 (резерв `CR_CODEX_RESERVE_TOKENS` и повторные прерывания уже во
-  время fold-турна) — фикс никак не уменьшает шанс самой гонки, только чинит
-  её последствие (потерянный unfold). Гонка по-прежнему может случаться так
-  же часто, как и раньше.
-- Пункты из "Не проверено": почему 137k → 231k случился одним скачком, и
-  устойчивость `notify()` для permanent-абортов.
-- Живой прогон на реальном codex не делался (только юнит-тесты на
-  `Controller`) — сценарий гонки в юнит-тестах смоделирован через
-  `Handoff.write()` + `compacted=True`, реальный codex/pty не проверялся.
+Not done in this pass:
+- Findings 2/3 (`CR_CODEX_RESERVE_TOKENS` and repeated interruptions during
+  fold) — the fix does not reduce the race itself, only its lost-unfold result.
+- The “Not checked” items: the 137k → 231k jump and `notify()` robustness for
+  permanent aborts.
+- No live run on real codex was performed, only `Controller` unit tests. The
+  race was simulated with `Handoff.write()` + `compacted=True`; real codex/pty
+  was not tested.
