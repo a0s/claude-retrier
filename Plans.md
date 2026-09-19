@@ -94,7 +94,7 @@ Purpose: one source-of-truth table for T13 headroom and T21 real-time model chan
 | T18 | `[lane:gate]` `[tdd:required]` `MODEL_PROFILES` (window/restart_at/compact_at), `model_restart_at()`, `--cr-models` | Profile consistency, threshold precedence, and table tests pass | T01 | cc:done [0f90975] |
 | T19 | `[lane:gate]` `[tdd:required]` Unknown-slug window fallback with correction (`resolve_window()`, `estimated=True`) | Family/modal fallback, boundary correction, and `~` badge tests pass | T18 | cc:done [76e3d05] |
 | T21 | `[lane:gate]` `[tdd:required]` Real-time model changes via `Controller.on_model()` and `local-command-stdout` hint | Round-trip, shrinking-window, override, and `codex_cap` tests pass | T04, T18, T19 | cc:done [f19c35c] |
-| T20 | `[lane:gate]` `[tdd:required]` Claude effective window through `--cr-statusline` proxy; cheap signals first | Settings behavior, call frequency, pty statusline, and disable switch tests pass | T18, T19 | cc:in-progress (`task/t20-claude-effective-window`, started in parallel with T21 — see Next step) |
+| T20 | `[lane:gate]` `[tdd:required]` Claude effective window through `--cr-statusline` proxy; cheap signals first | Settings behavior, call frequency, pty statusline, and disable switch tests pass | T18, T19 | cc:done [454193e] (`--settings` merge-vs-replace and invocation frequency remain unverified live — coded against the fail-safe assumption, see docs/backlog/T20-claude-effective-window.md "Verified") |
 
 ## Phase 6: Restart stability and failure visibility (Epic B, remainder)
 
@@ -129,11 +129,26 @@ Purpose: close technical debt (unrotated log, 4 unreleased commits) and update d
 
 ## Next step
 
-Phases 1, 2, 4, 5, and 6 are complete: T01, T02, T03, T04, T05, T06, T08, T09,
-T10, T11, T12, T13, T14, T18, T19, T21, T26, T27, T28 are all done. T07, T22,
-T23, T25 (Phase 7/8) are also done. Only **T20** (Phase 5) is still in
-progress right now (`task/t20-claude-effective-window`, started in parallel
-with T21 rather than waiting for it — see the 2026-09-19 batch entry below).
+All of Phases 1, 2, 4, 5, and 6 are now complete: T01, T02, T03, T04, T05,
+T06, T08, T09, T10, T11, T12, T13, T14, T18, T19, T20, T21, T26, T27, T28.
+T07, T22, T23, T25 (Phase 7/8) are also done — see the 2026-09-19 batch entry
+below for how this last batch of six (T07, T20, T21, T22, T23, T25) was run
+and merged.
+
+Still open:
+- **T15** (Phase 3) is still blocked on a live, manual codex 0.154 TUI
+  investigation (`[tdd:skip:live-investigation]`) — needs a human-in-the-loop
+  session. T16/T17 depend on it and stay blocked until it's done.
+- **T24** (release) and **T26-live** both need explicit user confirmation
+  before running — T24 for the external-send event listed above (git push,
+  gh release, homebrew formula), T26-live because it deliberately burns quota
+  on a live codex session. Neither was started in this batch.
+- Minor polish, not blocking anything: T20's `on_status` still updates
+  `context_model` inline (a leftover from having been developed in parallel
+  with T21, before `Controller.on_model()` existed in its branch) instead of
+  calling T21's now-merged `on_model()`. Functionally equivalent, just not
+  consolidated — worth a small follow-up commit if picking up more work here,
+  not urgent.
 
 Still open after this batch lands:
 - **T15** (Phase 3) is still blocked on a live, manual codex 0.154 TUI
