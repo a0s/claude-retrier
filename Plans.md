@@ -73,9 +73,9 @@ Purpose: determine why Codex unfold never worked, then encode observed TUI behav
 
 | Task | Content | DoD | Depends | Status |
 |------|------|-----|---------|--------|
-| T15 | `[lane:gate]` `[tdd:skip:live-investigation]` Live Codex 0.154 recipes for `/clear`, `/new`, `$skill …`, `@file`, and Cyrillic | Eight results with version/date and reproducible 3× recipes; `CR_CLEAR_SETTLE_SEC` decision | T01 | cc:TODO |
-| T16 | `[lane:gate]` `[tdd:required]` Per-agent `AGENT_INPUT`/`typing_plan(agent, text)` replaces binary slash logic | Unit/pty and live recipe tests pass | T15 | cc:TODO |
-| T17 | `[lane:gate]` `[tdd:required]` Per-agent clear-command defaults and `{skill:NAME}` → `/NAME`/`$NAME` | AC and `--cr-help` defaults pass | T15, T16 | cc:TODO |
+| T15 | `[lane:gate]` `[tdd:skip:live-investigation]` Live Codex 0.154 recipes for `/clear`, `/new`, `$skill …`, `@file`, and Cyrillic | Eight results with version/date and reproducible 3× recipes; `CR_CLEAR_SETTLE_SEC` decision | T01 | cc:done (investigation only, no code) |
+| T16 | `[lane:gate]` `[tdd:required]` Per-agent `AGENT_INPUT`/`typing_plan(agent, text)` replaces binary slash logic | Unit/pty and live recipe tests pass | T15 | cc:done [9a93c2d] |
+| T17 | `[lane:gate]` `[tdd:required]` Per-agent clear-command defaults and `{skill:NAME}` → `/NAME`/`$NAME` | AC and `--cr-help` defaults pass | T15, T16 | cc:done [9a93c2d] |
 
 ## Phase 4: Codex — session identity (Epic A, continuation)
 
@@ -129,17 +129,68 @@ Purpose: close technical debt (unrotated log, 4 unreleased commits) and update d
 
 ## Next step
 
-All of Phases 1, 2, 4, 5, 6, 7, and 8 are now complete except T26-live:
-T01-T14, T18-T25, T27, T28 are all merged and released as v1.12.0. Only T15
-(Phase 3, blocked on a live manual investigation) and its dependents T16/T17,
-plus the optional T26-live, remain — see the 2026-09-19 entries below.
+All 27 numbered tasks (T01–T27) plus T28/T29 are now done, at 9a93c2d — the
+whole backlog compiled 2026-09-18 is closed except the optional,
+quota-burning T26-live. See the 2026-09-19 entries below for how T15/T16/T17
+(Phase 3) were finished not as an unsupervised subagent hand-off, but live:
+this session drove real codex-cli 0.155.1 itself, on a cheap model
+(`gpt-5.6-luna`), reading back the results — that is what "not delegable"
+in T15's own doc always meant, not "cannot be done in this session."
 
 Still open:
-- **T15** (Phase 3) is still blocked on a live, manual codex 0.155 TUI
-  investigation (`[tdd:skip:live-investigation]`) — needs a human-in-the-loop
-  session. T16/T17 depend on it and stay blocked until it's done.
 - **T26-live** needs explicit user confirmation before running — it
-  deliberately burns quota on a live codex session.
+  deliberately burns quota on a live codex session. Nothing depends on it.
+
+2026-09-19 (T15/T16/T17, Phase 3 closed): the user asked for "the next
+complex backlog task" to be finished end-to-end; the only one left was T15,
+previously skipped in every batch as `[tdd:skip:live-investigation]` /
+"needs a human-in-the-loop session". Re-read literally, that only rules out
+a fire-and-forget unsupervised subagent — driving a real, cheap-model codex
+session live, in this same session, and reading the results back is exactly
+what the task asks for, and the user confirmed doing it that way ("делай
+T15, просто испольщуй младшие модели для тестов типа luna — с ними пофиг на
+квоту"). Built `test/fixtures/capture-codex-input-grammar.py` (pattern:
+`capture-agents-panel.py`, T29 — a fresh pty-driven codex-cli session per
+scenario, in a throwaway project dir, model `gpt-5.6-luna`) and ran all 8
+of T15's recipes against real **codex-cli 0.155.1** (the backlog's 0.154 is
+no longer installed anywhere on this machine), 3× for the three recipes the
+AC requires reproducibility on.
+
+Headline finding, recorded in full in
+[T15's doc](docs/backlog/T15-codex-unfold-live-investigation.md#results):
+**none of the 2026-09-15 incident's failure modes reproduce.** `$name` is
+not a composer popup at all on 0.155.1 — it is a model-level "invoke a
+skill" convention — and `@file` is delivered as plain text the same way.
+The incident almost certainly predates T02–T06 (session/transcript binding,
+merged well after 2026-09-15) and was never an input-grammar bug. The one
+real, newly-found hazard: codex silently drops an unrecognized `/word`
+without ever sending it as text — exactly the incident's symptom — which is
+why `{skill:NAME}` must expand to `$NAME` for codex, never `/NAME`.
+
+Given that finding, T16 (typing_plan) and T17 ({skill:NAME}) were
+implemented true to the evidence rather than to the pre-investigation guess:
+`typing_plan(agent, text, cfg)` treats only a leading "/" specially (same
+recipe, same `CR_SLASH_*` knobs, on both agents) and both `$name`/`@file`
+plans fall through to plain-text delivery — the AC's request to teach
+`fake_codex.py` a "$" popup that live testing found does not exist was
+skipped for that reason, noted in the T16 backlog doc instead of forced in.
+`agent_cfg` now expands `{skill:NAME}` to `/NAME`/`$NAME` per agent for
+`CR_HANDOFF_MSG`/`CR_RESUME_MSG`/`CR_CANCEL_MSG`. New `test_input_grammar.py`
+(7 tests) pins `typing_plan` for both agents across `/clear`, `/skill arg`,
+`$skill arg`, `@file text`, plain text, and Russian text; `TestSkillPlaceholder`
+in `test_codex.py` covers the placeholder. `docs/context-restart.md`'s
+"Slash commands and CR_SLASH_ENTER" section is now "Commands, skills and
+mentions"; `docs/codex.md`'s "Skills and file mentions in codex" section,
+which had recorded the pre-investigation guess as fact, is corrected;
+`docs/configuration.md` gains the `{skill:NAME}` row. `./test/run.sh`: 202
+tests in `test_controller.py` alone, full suite `ALL PASS` (one
+`test_pty.py` `TimeoutExpired` seen under full-suite load, confirmed as the
+same pre-existing flake noted throughout this file by a clean isolated
+rerun). Merged directly to `main` as 9a93c2d (single-session work, no
+worktree). `./test/codegraph-sync.sh` run after.
+
+Only **T26-live** remains, gated on explicit user confirmation to spend
+quota on a live session with no other task depending on it.
 
 2026-09-19 (T24, release): CHANGELOG entry for every merged task plus the
 four pre-session commits (5668357, 1a5e9bc, f53921f, 78ffa2c), `CR_VERSION`
