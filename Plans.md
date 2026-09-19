@@ -122,33 +122,55 @@ Purpose: close technical debt (unrotated log, 4 unreleased commits) and update d
 |------|------|-----|---------|--------|
 | T23 | `[lane:gate]` `[tdd:required]` Concurrent-safe log rotation (`CR_LOG_MAX_BYTES`/`CR_LOG_KEEP`) | Startup rotation and below-limit tests pass | - | cc:done [2b5201c] |
 | T25 | `[lane:fast]` `[tdd:skip:docs-only]` Update four docs without stale Caveats | Grep is empty; links and anchors valid | T02, T04, T05, T08, T09 | cc:done [4ed1c1d] |
-| T24 | `[lane:release]` `[tdd:skip:release-prep]` CHANGELOG, `CR_VERSION`, tag, GitHub release, and Homebrew formula | Every commit/task recorded; version tests, tag, release, and formula pass (no user-machine brew install/upgrade) | completed P0 tasks | cc:TODO |
+| T24 | `[lane:release]` `[tdd:skip:release-prep]` CHANGELOG, `CR_VERSION`, tag, GitHub release, and Homebrew formula | Every commit/task recorded; version tests, tag, release, and formula pass (no user-machine brew install/upgrade) | completed P0 tasks | cc:done [72a3c3b, v1.12.0] |
 | T26-live | `[lane:fast]` `[tdd:skip:optional-manual]` Optional `test/run.sh --live-codex` checklist with confirmation and orphan cleanup | Explicit confirmation required; quota deliberate; process groups killed afterward | T15, T26 | cc:TODO |
 
 ---
 
 ## Next step
 
-All of Phases 1, 2, 4, 5, and 6 are now complete: T01, T02, T03, T04, T05,
-T06, T08, T09, T10, T11, T12, T13, T14, T18, T19, T20, T21, T26, T27, T28.
-T07, T22, T23, T25 (Phase 7/8) are also done — see the 2026-09-19 batch entry
-below for how this last batch of six (T07, T20, T21, T22, T23, T25) was run
-and merged.
+All of Phases 1, 2, 4, 5, 6, 7, and 8 are now complete except T26-live:
+T01-T14, T18-T25, T27, T28 are all merged and released as v1.12.0. Only T15
+(Phase 3, blocked on a live manual investigation) and its dependents T16/T17,
+plus the optional T26-live, remain — see the 2026-09-19 entries below.
 
 Still open:
-- **T15** (Phase 3) is still blocked on a live, manual codex 0.154 TUI
+- **T15** (Phase 3) is still blocked on a live, manual codex 0.155 TUI
   investigation (`[tdd:skip:live-investigation]`) — needs a human-in-the-loop
   session. T16/T17 depend on it and stay blocked until it's done.
-- **T24** (release) and **T26-live** both need explicit user confirmation
-  before running — T24 for the external-send event listed above (git push,
-  gh release, homebrew formula), T26-live because it deliberately burns quota
-  on a live codex session. Neither was started in this batch.
-- Minor polish, not blocking anything: T20's `on_status` still updates
-  `context_model` inline (a leftover from having been developed in parallel
-  with T21, before `Controller.on_model()` existed in its branch) instead of
-  calling T21's now-merged `on_model()`. Functionally equivalent, just not
-  consolidated — worth a small follow-up commit if picking up more work here,
-  not urgent.
+- **T26-live** needs explicit user confirmation before running — it
+  deliberately burns quota on a live codex session.
+
+2026-09-19 (T24, release): CHANGELOG entry for every merged task plus the
+four pre-session commits (5668357, 1a5e9bc, f53921f, 78ffa2c), `CR_VERSION`
+bumped to 1.12.0, `docs/how-it-works.md`'s test count corrected to the actual
+760 (`Ran N tests` summed across all 17 files, not the looser "500+"). Tag
+`v1.12.0` pushed after the user's explicit go-ahead for the external-send
+event (git push, gh release, homebrew formula) — but its first CI run
+(35439903275) **failed** `./test/run.sh` on `ubuntu-latest`
+(`test_fake_agents.py`/`test_two_wrappers.py`), green locally on macOS both
+times. Reproduced under `./test/run-docker.sh` (after first fixing a second,
+independent bug it uncovered: `test/Dockerfile`'s Debian slim never installed
+`procps`, so `pgrep` didn't exist and `test/helper.py`'s `_descendant_pids`
+silently swallowed the resulting `OSError` and returned `[]` — every
+pid-dependent assertion saw `None`). With `pgrep` actually present, `ps
+--forest` showed the real cause: `claude-retrier.sh`'s own hand-off to python
+(`exec ... 3< <(printf ...)`) forks a bash to feed that process substitution,
+which becomes a direct, unreaped `<defunct>` child of the supervisor the
+moment it exits — a lower pid than the real agent (it forked first), and
+`_descendant_pids`'s `children[0]` picked it over the live `fake_claude.py`
+underneath. Fixed by filtering zombies (`ps -o stat=`) out of the descendant
+walk; confirmed 3x clean under Docker, then the whole Linux suite (764 tests,
+`ALL PASS`) and again natively on macOS. Also picked up, in parallel while waiting on CI: the small T20/T21
+consolidation polish (`on_status`'s inline model-id handling now routes
+through `Controller.on_model()`, per the note left when T20/T21 landed
+concurrently — 0650ce1). Tag moved to the fixed commit (72a3c3b) — the original v1.12.0 push had never
+actually published a release (the Publish step is skipped on a red suite),
+so nothing public pointed at the broken commit; moving a *pushed* tag is
+normally treated as destructive and needed a second explicit confirmation.
+Second run (35441371397) green; release published, Homebrew formula updated
+to the new tarball/sha256 (57c109b in the tap) without any `brew
+install`/`upgrade` on this machine.
 
 Still open after this batch lands:
 - **T15** (Phase 3) is still blocked on a live, manual codex 0.154 TUI
