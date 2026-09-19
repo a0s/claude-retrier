@@ -1221,6 +1221,52 @@ class TestFoldCostAndReserve(unittest.TestCase):
         self.assertEqual(ctl.interrupt_line(), WINDOW - expected_reserve)
 
 
+class TestModelSwitchResetsTheCodexCap(unittest.TestCase):
+    """T21: `codex_cap` is read live off the rollout's own usage log and is
+    specific to whichever model wrote it. A model switch — named through
+    `turn_context`/`thread_settings_applied`, on the very next turn — has to
+    blank it until a fresh usage line for the NEW model arrives, or
+    `interrupt_line()` goes on answering for a model that is no longer
+    running."""
+
+    def ctl(self, **over):
+        cfg = dict(context_pct=60, codex_reserve=32000)
+        cfg.update(over)
+        ctl = codex_controller(**cfg)
+        feed(ctl, 0, window=WINDOW, model="gpt-5.6-sol")
+        logged_usage(ctl, 1, 150000)
+        return ctl
+
+    def test_turn_context_with_a_new_model_blanks_the_cap_until_a_fresh_line(self):
+        ctl = self.ctl()
+        self.assertEqual(ctl.codex_cap, 258400)
+        self.assertEqual(ctl.interrupt_line(), 258400 - 32000)
+
+        logged_before = len(ctl.log_lines)
+        feed(ctl, 2, model="gpt-5.6-terra")      # the next turn's model
+        self.assertIsNone(ctl.codex_cap)
+        self.assertIsNone(ctl.interrupt_line())
+        switched = ctl.log_lines[logged_before:]
+        self.assertTrue(any("model switched: gpt-5.6-sol" in l
+                            and "gpt-5.6-terra" in l and "[codex log]" in l
+                            for l in switched), switched)
+
+        logged_usage(ctl, 3, 50000, cap=258400)
+        self.assertEqual(ctl.codex_cap, 258400)
+        self.assertEqual(ctl.interrupt_line(), 258400 - 32000)
+
+    def test_thread_settings_applied_reaches_on_model_the_same_way(self):
+        ctl = self.ctl()
+        path = rollout(tempfile.mkdtemp(prefix="cr-t21-"),
+                       rows=[("event_msg", {"type": "thread_settings_applied",
+                                           "thread_settings": {"model": "gpt-5.6-luna"}})])
+        _, recs = cr.codex_records(path, 0)
+        hits = [r for r in recs if r.get("model") == "gpt-5.6-luna"]
+        self.assertEqual(len(hits), 1)
+        feed(ctl, 2, model="gpt-5.6-luna")
+        self.assertIsNone(ctl.codex_cap)
+
+
 class TestFindingAStallOnScreen(unittest.TestCase):
     def test_the_capacity_line_is_found(self):
         self.assertEqual(cr.find_stall("⚠ " + CAPACITY), "⚠ " + CAPACITY)
