@@ -68,6 +68,8 @@ More in [context-restart.md](context-restart.md). All of these do nothing until
 | `CR_CONTEXT_PCT` | `0` | restart at this % of the window; `0` is off |
 | `CR_CONTEXT_TOKENS` | `0` | absolute threshold (`500k` is fine); beats the % |
 | `CR_CONTEXT_WINDOW` | `auto` | `auto` \| `200k` \| `1M` \| a number |
+| `CR_STATUSLINE_PROXY` | `1` | `0` disables the statusline proxy entirely — no `--settings` is added to claude's launch, and `[1m]` vs 200k falls back to the profile table alone; see [context-restart.md](context-restart.md#1m-vs-200k-the-statusline-proxy) |
+| `CR_STATUS_DIR` | `~/.claude-retrier/status` | where `--cr-statusline` writes what claude's own statusline reports, one file per wrapper pid |
 | `CR_CLAUDE_TOKENS_<SLUG>`, `CR_CODEX_TOKENS_<SLUG>` | unset | absolute threshold for one model by name, e.g. `CR_CLAUDE_TOKENS_CLAUDE_OPUS_5=510000` or `CR_CODEX_TOKENS_GPT_5_6_SOL=140000` (`<SLUG>` = the model slug, uppercased, non-alphanumerics turned to `_`) — outranks everything above, for that model only |
 | `CR_MODEL_LOOKUP` | `1` | look an unfamiliar model up; `0` never touches the network |
 | `CR_MODEL_CACHE` | `~/.claude-retrier/windows.json` | what the lookup learned |

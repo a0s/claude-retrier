@@ -2021,6 +2021,63 @@ class TestModelSwitchRealtime(RestartTestCase):
         self.assertIsNone(self.tick(ctl, 32))      # never folded on the transient hint
 
 
+class TestClaudesOwnStatusLine(RestartTestCase):
+    """`on_status` (T20): the `--cr-statusline` proxy's own signal, filed
+    under the same `context_window_hint` codex's rollout accounting already
+    uses -- the fix for a 200k session that assumed 1M (from the model's own
+    profile table) and let Claude Code self-compact around ~190k instead of
+    the wrapper ever restarting it.
+    """
+
+    def test_a_200k_report_overrides_the_1m_model_table(self):
+        # claude-sonnet-5 is a _BIG_CLAUDE (1M) model in the profile table;
+        # the statusline is the one thing that can prove THIS session did not
+        # actually get that window.
+        ctl = restart_controller(context_window="auto", context_pct=51)
+        ctl.on_status(dict(context_window_size=200000, model_id="claude-sonnet-5"), 0)
+        self.assertEqual(ctl.context_window, 200000)
+        self.assertEqual(ctl.context_limit, 102000)
+        self.assertTrue(any("claude's status line" in l for l in ctl.log_lines),
+                        ctl.log_lines)
+
+    def test_the_model_id_moves_context_model_inline(self):
+        # T21 will add a dedicated on_model(); until it merges this is
+        # handled inline, mirroring on_context's own model-change branch.
+        ctl = restart_controller(context_window="auto")
+        ctl.on_status(dict(model_id="claude-opus-5"), 0)
+        self.assertEqual(ctl.context_model, "claude-opus-5")
+        self.assertEqual(ctl.context_window, 1000000)   # the profile table, by the new model
+
+    def test_a_repeated_report_does_not_re_resolve(self):
+        ctl = restart_controller(context_window="auto", context_pct=51)
+        ctl.on_status(dict(context_window_size=200000, model_id="claude-sonnet-5"), 0)
+        before = len(ctl.log_lines)
+        ctl.on_status(dict(context_window_size=200000, model_id="claude-sonnet-5"), 5)
+        self.assertEqual(len(ctl.log_lines), before)
+
+    def test_codexs_own_rollout_label_is_unaffected(self):
+        # This is a claude-only signal; codex's own accounting must keep
+        # saying "the transcript", never relabelled by anything on_status does.
+        ctl = restart_controller(agent="codex", context_window="auto", context_pct=50)
+        ctl.on_context(dict(kind="alive", path=MINE, sidechain=False,
+                            tokens=10, model="gpt-5", window=400000), 0)
+        self.assertTrue(any("(the transcript)" in l for l in ctl.log_lines), ctl.log_lines)
+
+    def test_session_id_is_filed_but_does_not_bind_the_transcript(self):
+        # A secondary, corroborating signal at most -- T02's own
+        # ClaudeSessionRegistry binding is untouched by it.
+        ctl = restart_controller(context_window="auto")
+        ctl.on_status(dict(session_id="abc123"), 0)
+        self.assertEqual(ctl.status_session_id, "abc123")
+        self.assertIsNone(ctl.context_path)
+
+    def test_a_missing_field_is_simply_not_acted_on(self):
+        ctl = restart_controller(context_window="auto")
+        ctl.on_status(dict(), 0)
+        self.assertIsNone(ctl.context_window_hint)
+        self.assertIsNone(ctl.context_model)
+
+
 class TestSettingsAsPeopleWriteThem(unittest.TestCase):
     """The thresholds are typed by hand into a shell, and a value that fails to
     parse falls back on the default — which for this feature is "off". Silently

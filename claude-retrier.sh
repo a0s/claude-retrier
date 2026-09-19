@@ -13,6 +13,7 @@
 #         codex-retrier [codex args...]          # the same file, codex by default
 #         claude-retrier.sh --cr-dump-python      # print the embedded Python (used by tests)
 #         claude-retrier.sh --cr-models           # print the model profile table (T18)
+#         claude-retrier.sh --cr-statusline <path> # statusline proxy (used via --settings, T20)
 #         claude-retrier.sh --cr-version
 #
 # `--cmd` (or CR_CLAUDE_CMD) is whatever YOU type to start the agent: a binary, a
@@ -802,6 +803,7 @@ import os
 import pty
 import re
 import select
+import shlex
 import signal
 import struct
 import subprocess
@@ -965,6 +967,9 @@ CFG = dict(
     models_api_url=_env("CR_MODELS_API_URL", "https://api.anthropic.com/v1/models"),
     context_env_max=_env("CLAUDE_CODE_MAX_CONTEXT_TOKENS", 0, int),
     context_no_1m=_env("CLAUDE_CODE_DISABLE_1M_CONTEXT", "0") not in ("0", "false", "no"),
+    # -- claude's own statusline, relayed by --cr-statusline (T20) --
+    statusline_proxy=_env("CR_STATUSLINE_PROXY", "1") == "1",
+    status_dir=_env("CR_STATUS_DIR", os.path.expanduser("~/.claude-retrier/status")),
 )
 
 
@@ -2418,6 +2423,41 @@ def codex_launch_args(cfg):
     return list(CODEX_HOLD_ARGS)
 
 
+def claude_launch_args(cfg, agent, argv, pid=None):
+    """`--settings` that route claude's own statusline through our proxy (T20).
+
+    Claude-only (codex has no statusline of its own, hence no need of this),
+    and only once something is actually racing the context: without a restart
+    armed there is nothing for the window signal to inform, same reasoning as
+    `codex_launch_args` above. Skipped outright when the user's own argv
+    already names `--settings` -- an explicit flag on the command line always
+    wins, exactly as if this feature did not exist, rather than fight it for
+    the same key.
+
+    Whether Claude Code MERGES a `--settings` value with the user's real
+    settings.json or REPLACES it outright is not something this project has
+    verified live (no real Claude Code session was available while building
+    this -- see docs/backlog/T20-claude-effective-window.md's "Verified"
+    section). MERGE is the assumption this is coded against, since a proxy
+    that silently replaced someone's other settings would be a worse failure
+    than this feature just not helping.
+    """
+    if agent != "claude" or not cfg.get("statusline_proxy", True):
+        return []
+    if (cfg.get("context_pct", 0) <= 0 and cfg.get("context_tokens", 0) <= 0
+            and not cfg.get("context_restart_on")):
+        return []                    # nothing needs the window signal yet
+    if any(a == "--settings" or a.startswith("--settings=") for a in (argv or [])):
+        return []                    # the user's own flag always wins
+    raw_self = os.environ.get("CR_SELF") or ""
+    self_path = os.path.realpath(raw_self) if raw_self else "claude-retrier"
+    status_path = os.path.join(cfg["status_dir"],
+                               "%d.json" % (pid if pid is not None else os.getpid()))
+    command = "%s --cr-statusline %s" % (shlex.quote(self_path), shlex.quote(status_path))
+    settings = json.dumps({"statusLine": {"type": "command", "command": command}})
+    return ["--settings", settings]
+
+
 def usage_tokens(usage):
     """The context a turn was sent with, or None when the row does not say."""
     if not isinstance(usage, dict):
@@ -3328,6 +3368,11 @@ class Controller:
         self.context_tokens = None    # what the session's last turn was sent with
         self.context_model = None
         self.context_window_hint = None   # a window the transcript states outright
+        self.context_window_hint_source = "the transcript"   # _resolve_window's log label
+        self.status_session_id = None   # claude's own statusline session_id (T20): a
+                                         # corroborating signal only -- T02's own
+                                         # ClaudeSessionRegistry binding still decides
+                                         # which transcript is ours.
         self.context_window = None
         self.context_estimated = False  # the window above is a guess, not a confirmed one (T19)
         self.window_unknown = None    # a model nothing here can size, for the lookup
@@ -3901,6 +3946,7 @@ class Controller:
         self.turn_open = None
         self.codex_cap = None
         self.context_window_hint = None
+        self.context_window_hint_source = "the transcript"
         self.counted_by_log = None
         self.last_stop_reason = None
         self.context_grew_at = 0.0
@@ -4157,6 +4203,44 @@ class Controller:
         self.agent_status = status
         self.agent_status_at = updated_at
 
+    def on_status(self, rec, now=None):
+        """Claude's own statusline JSON, relayed by the `--cr-statusline`
+        proxy (T20): a second, independent source for the window and the
+        model, on top of whatever the transcript itself states.
+
+        `context_window.context_window_size` is the one thing nothing derived
+        from the model slug alone can answer — whether THIS session actually
+        got the 1M window or fell back to 200k depends on the account plan,
+        `/model …[1m]`, and CLAUDE_CODE_DISABLE_1M_CONTEXT, none of which show
+        up in the slug (see `_resolve_window`). Filed under the same
+        `context_window_hint` codex's own rollout accounting already uses, so
+        the priority order in `_resolve_window` falls out unchanged.
+
+        `model.id` is handled inline here, mirroring the model-change branch
+        `on_context` already has, rather than through a dedicated
+        `on_model()` — T21 is adding exactly that; once it merges, this is a
+        candidate to route through it instead.
+
+        `session_id` is filed away as a corroborating signal only: T02's own
+        `ClaudeSessionRegistry` binding is still the one thing that decides
+        which transcript is ours, and nothing here competes with it.
+        """
+        moved = False
+        model = rec.get("model_id")
+        if model and model != self.context_model:
+            self.context_model = model
+            moved = True
+        window = rec.get("context_window_size")
+        if window and window != self.context_window_hint:
+            self.context_window_hint = int(window)
+            self.context_window_hint_source = "claude's status line"
+            moved = True
+        if moved:
+            self._resolve_window()
+        session_id = rec.get("session_id")
+        if session_id:
+            self.status_session_id = session_id
+
     # -- codex's own compaction --------------------------------------------- #
     def interrupt_line(self):
         """The count past which a running codex turn is stopped, or None.
@@ -4404,7 +4488,8 @@ class Controller:
 
           1. CR_CONTEXT_WINDOW — said outright, so nothing below is asked.
           2. reported by the agent itself — codex states one in every row of
-             accounting; T20 will have claude's own statusline do the same.
+             accounting; claude's own statusline does the same, relayed by
+             the `--cr-statusline` proxy (T20) into `on_status`.
           3. claude's own environment (CLAUDE_CODE_MAX_CONTEXT_TOKENS /
              CLAUDE_CODE_DISABLE_1M_CONTEXT) — narrows what its native window
              would otherwise be; meaningless for codex, which states its own.
@@ -4434,7 +4519,8 @@ class Controller:
         if forced:
             self.context_window, why = forced, "CR_CONTEXT_WINDOW"
         elif self.context_window_hint:
-            self.context_window, why = self.context_window_hint, "the transcript"
+            self.context_window, why = (self.context_window_hint,
+                                        self.context_window_hint_source)
         elif not self.codex and self.cfg["context_env_max"] > 0:
             self.context_window, why = (int(self.cfg["context_env_max"]),
                                         "CLAUDE_CODE_MAX_CONTEXT_TOKENS")
@@ -5893,6 +5979,39 @@ class SubagentRegistry:
         return self.models.get(agent_id)
 
 
+class StatusPoller:
+    """Reads back what `--cr-statusline`'s proxy mode last wrote for THIS
+    session (T20): `~/.claude-retrier/status/<pid>.json`, one file per
+    wrapper pid, written atomically every time Claude Code invokes the
+    statusline command. Polled by mtime, no more often than `poll` seconds --
+    the same idiom `SubagentRegistry`/`TranscriptWatcher` already use.
+    """
+    def __init__(self, path, poll=2.0):
+        self.path = path
+        self.poll = poll
+        self.next_poll = 0.0
+        self.mtime = None
+
+    def poll_now(self, now=None):
+        now = now if now is not None else time.time()
+        if now < self.next_poll:
+            return None
+        self.next_poll = now + self.poll
+        try:
+            mtime = os.path.getmtime(self.path)
+        except OSError:
+            return None
+        if mtime == self.mtime:
+            return None
+        self.mtime = mtime
+        try:
+            with open(self.path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+
+
 class AgentOverlay:
     def __init__(self, cfg):
         self.enabled = bool(cfg["agents_overlay"])
@@ -6056,6 +6175,93 @@ def is_roster_launch(argv):
     return False
 
 
+# --------------------------------------------------------------------------- #
+# claude's own statusline, relayed to us (T20)
+# --------------------------------------------------------------------------- #
+def _user_statusline_command(cwd):
+    """Claude Code's own `statusLine` setting, read straight from whichever
+    settings file would answer it for a session started in `cwd` -- checked in
+    the precedence Claude Code's own docs describe: a local project override
+    first, then the shared project one, then the user's own. Not independently
+    verified live (see docs/backlog/T20-claude-effective-window.md's
+    "Verified" section) -- `None` either way means "nothing configured",
+    never a reason to invent one of our own.
+    """
+    home_settings = os.path.join(
+        os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude"),
+        "settings.json")
+    for path in (os.path.join(cwd, ".claude", "settings.local.json"),
+                os.path.join(cwd, ".claude", "settings.json"),
+                home_settings):
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        line = data.get("statusLine") if isinstance(data, dict) else None
+        if isinstance(line, dict) and line.get("command"):
+            return line
+    return None
+
+
+def run_statusline_proxy(status_path, stdin=None, stdout=None):
+    """`--cr-statusline <path>`: what Claude Code actually runs as the
+    statusline command, once `claude_launch_args` has pointed `--settings` at
+    us (T20).
+
+    Reads exactly what Claude Code hands any statusline command -- one blob
+    of JSON on stdin, documented to carry `model.id`,
+    `context_window.context_window_size`, `session_id` and
+    `transcript_path` -- records the fields the supervisor wants at
+    `status_path` (atomically: a temp file in the same directory, then
+    `os.rename`, the pattern `WindowLookup`/`UpdateCheck`/`HandoffRegistry`
+    already use for a JSON file more than one process can touch), then runs
+    the user's OWN `statusLine` command, if `settings.json`/
+    `settings.local.json` name one, with that same stdin, and prints exactly
+    what it printed. A user with no statusline configured at all gets no
+    output here either -- inventing one would be a lie about what their
+    settings actually say.
+    """
+    stdin = stdin if stdin is not None else sys.stdin
+    stdout = stdout if stdout is not None else sys.stdout
+    raw = stdin.read()
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    model = payload.get("model") or {}
+    window = payload.get("context_window") or {}
+    record = dict(model_id=model.get("id"),
+                 context_window_size=window.get("context_window_size"),
+                 session_id=payload.get("session_id"),
+                 transcript_path=payload.get("transcript_path"),
+                 at=time.time())
+    try:
+        parent = os.path.dirname(status_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = "%s.%d.tmp" % (status_path, os.getpid())
+        with open(tmp, "w") as fh:
+            json.dump(record, fh)
+        os.rename(tmp, status_path)
+    except OSError:
+        pass
+    workspace = payload.get("workspace") or {}
+    cwd = workspace.get("current_dir") or workspace.get("project_dir") or os.getcwd()
+    line = _user_statusline_command(cwd)
+    if not line or line.get("type", "command") != "command":
+        return 0
+    try:
+        result = subprocess.run(line["command"], shell=True, input=raw,
+                                text=True, capture_output=True)
+    except OSError:
+        return 0
+    stdout.write(result.stdout)
+    return result.returncode
+
+
 def main(argv):
     # Started from a temp file because /dev/fd was not available: it has done its
     # job the moment python has read it, and leaving it behind would litter /tmp
@@ -6115,6 +6321,15 @@ def main(argv):
     if extra:
         log("holding codex's own compaction back for the context restart: %s"
             % " ".join(extra))
+    supervisor_pid = os.getpid()   # stable for the whole session; fork_pty below
+                                    # only ever changes the CHILD's pid, never ours
+    status_path = os.path.join(run_cfg["status_dir"], "%d.json" % supervisor_pid)
+    statusline_args = claude_launch_args(run_cfg, agent_name, argv, pid=supervisor_pid)
+    if statusline_args:
+        log("claude's own statusline is proxied through --cr-statusline, so "
+            "its own report of the session's window (200k vs [1m]) can correct "
+            "the restart threshold (T20; CR_STATUSLINE_PROXY=0 to disable)")
+    extra = extra + statusline_args
 
     rows, cols = get_winsize(stdout_fd) if interactive else (24, 80)
     pid, master = fork_pty(rows, cols)
@@ -6168,6 +6383,7 @@ def main(argv):
     updater.refresh()
 
     ctl = Controller(run_cfg, log, session_id=session_id)
+    status_poller = StatusPoller(status_path, poll=CFG["poll"]) if statusline_args else None
     lookup = WindowLookup(CFG, log)
     badge = Badge(CFG)
     agents = AgentOverlay(CFG)
@@ -6454,6 +6670,10 @@ def main(argv):
                 for total, cap in usage_log.poll(watcher.agent.thread_id(watcher.current), now):
                     ctl.on_context(dict(kind="alive", source="log", path=watcher.current,
                                         sidechain=False, tokens=total, cap=cap), now)
+            if status_poller is not None:
+                status = status_poller.poll_now(now)
+                if status:
+                    ctl.on_status(status, now)
 
             # A model the shipped table cannot size. Asking is off the hot path
             # in a worker thread, so this is only ever "post the question" and
@@ -6605,6 +6825,10 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["--cr-models"]:
         # A pure lookup, not a session: no pty, no fork, nothing to supervise.
         sys.exit(print_models_table())
+    if sys.argv[1:2] == ["--cr-statusline"]:
+        # Claude Code itself is the caller here, not a person: no pty, no
+        # fork, and its own exit code is the only thing it ever looks at.
+        sys.exit(run_statusline_proxy(sys.argv[2] if len(sys.argv) > 2 else ""))
     code = main(sys.argv[1:])
     # waitstatus_to_exitcode reports a signal death as a negative number, which
     # sys.exit would turn into 255. Report it the way a shell does.
@@ -6651,6 +6875,25 @@ case "${1:-}" in
     CR_MODELS_RC=$?
     rm -f "$CR_MODELS_TMP"
     exit "$CR_MODELS_RC" ;;
+  --cr-statusline)
+    # Claude Code itself runs this, as the command `claude_launch_args` (T20)
+    # put in `--settings`: no claude/codex needs to be installed for it, and
+    # stdin/stdout are left exactly alone, since the JSON claude hands over
+    # arrives on the former and the user's own statusline output has to leave
+    # on the latter.
+    CR_PYTHON_BIN=$(cr_find_python) || {
+      echo "claude-retrier: no usable python3 found" >&2
+      exit 1
+    }
+    CR_STATUSLINE_TMP=$(mktemp "${TMPDIR:-/tmp}/claude-retrier.XXXXXX") || {
+      echo "claude-retrier: cannot write a temporary file" >&2
+      exit 1
+    }
+    printf '%s' "$CR_PY" >"$CR_STATUSLINE_TMP"
+    "$CR_PYTHON_BIN" "$CR_STATUSLINE_TMP" --cr-statusline "${2:-}"
+    CR_STATUSLINE_RC=$?
+    rm -f "$CR_STATUSLINE_TMP"
+    exit "$CR_STATUSLINE_RC" ;;
 esac
 
 # ---- degrade paths: any of these and we run claude untouched -----------------

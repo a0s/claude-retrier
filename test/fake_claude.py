@@ -50,10 +50,26 @@ too, reproducing test/fixtures/agents-panel-2.1.273.bin:
   FAKE_AGENTS_PANEL  1 = draw the panel once at startup; `repaint-panel`
                     redraws it (state flips to "done", the same ESC[K erase
                     the real repaint does)
+
+For T20 (claude's own statusline, proxied through `--cr-statusline`) it can
+also play claude's half of that: if launched with a `--settings` naming a
+statusLine command (exactly what `claude_launch_args` adds), it runs that
+command the way Claude Code itself would -- once, stdin fed a payload built
+from the knobs below, stdout printed straight onto the screen so a test can
+see whatever the proxy chained through to the user's own statusline:
+
+  FAKE_STATUSLINE_RUN     1 = actually run it (never on by default: most
+                          tests neither need nor want the extra process)
+  FAKE_STATUS_MODEL       model.id in the payload (default claude-sonnet-5)
+  FAKE_STATUS_WINDOW      context_window.context_window_size (default 200000)
+  FAKE_STATUSLINE_DELAY   seconds to wait first (default 0.5): the wrapper
+                          seeds its own pollers before this runs, the same
+                          reasoning as FAKE_USAGE_DELAY above
 """
 import json
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -278,6 +294,52 @@ def draw_agents_panel(out, state="running"):
     out.flush()
 
 
+def maybe_run_statusline():
+    """T20: if `--settings` (as `claude_launch_args` builds it) named a
+    statusLine command, run it the way Claude Code itself would -- stdin fed
+    the JSON payload FAKE_STATUS_MODEL/FAKE_STATUS_WINDOW describe, stdout
+    printed straight onto the screen. Off unless FAKE_STATUSLINE_RUN asks for
+    it: most tests have no use for the extra process.
+    """
+    if not os.environ.get("FAKE_STATUSLINE_RUN"):
+        return
+    settings = None
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--settings" and i + 1 < len(argv):
+            settings = argv[i + 1]
+        elif a.startswith("--settings="):
+            settings = a[len("--settings="):]
+    if not settings:
+        return
+    try:
+        data = json.loads(settings)
+    except ValueError:
+        return
+    status_line = (data.get("statusLine") or {}) if isinstance(data, dict) else {}
+    command = status_line.get("command")
+    if not command or status_line.get("type", "command") != "command":
+        return
+    time.sleep(float(os.environ.get("FAKE_STATUSLINE_DELAY", "0.5")))
+    payload = {
+        "model": {"id": os.environ.get("FAKE_STATUS_MODEL", "claude-sonnet-5")},
+        "context_window": {
+            "context_window_size": int(os.environ.get("FAKE_STATUS_WINDOW", "200000"))},
+        "session_id": SESSION[0],
+        "transcript_path": transcript_path(),
+        "workspace": {"current_dir": os.getcwd(), "project_dir": os.getcwd()},
+    }
+    try:
+        result = subprocess.run(command, shell=True, input=json.dumps(payload),
+                                text=True, capture_output=True, timeout=10)
+    except Exception as exc:
+        sys.stdout.write("statusline-proxy-error: %s\r\n" % exc)
+        sys.stdout.flush()
+        return
+    sys.stdout.write("STATUSLINE:%s\r\n" % result.stdout.replace("\n", "\\n"))
+    sys.stdout.flush()
+
+
 def fold_up(line):
     """Write (or fail to write) the handoff the wrapper just asked for."""
     mode = os.environ.get("FAKE_HANDOFF", "ok")
@@ -314,6 +376,7 @@ def main():
 
     write_pid_file("idle")
     run_script(os.environ.get("FAKE_SCRIPT"))
+    threading.Thread(target=maybe_run_statusline, daemon=True).start()
 
     if os.environ.get("FAKE_AGENT_TREE"):
         # A pause first: the wrapper seeds its transcript watcher at whatever

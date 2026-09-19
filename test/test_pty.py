@@ -6,6 +6,7 @@ through — because a wrapper that degrades the everyday session is worse than n
 wrapper. Second, that a limit really does get detected and answered, through
 each of the two channels, without tmux anywhere in the picture.
 """
+import json
 import os
 import pty
 import re
@@ -975,6 +976,110 @@ class TestContextRestart(PtyTestCase):
         sc = Screen(40, 120)
         sc.feed(s.buf)
         self.assertIn("restart off", sc.line(40))
+
+
+class TestClaudesStatusLineProxy(PtyTestCase):
+    """T20, end to end: claude's own statusline JSON, relayed through
+    `--cr-statusline`, can correct the window the profile table alone would
+    have guessed -- and the user's own statusline (chained through the
+    proxy) still reaches the screen.
+    """
+
+    def setUp(self):
+        self.cfg = tempfile.mkdtemp(prefix="cr-cfg-")
+        self.work = tempfile.mkdtemp(prefix="cr-work-")
+        self.addCleanup(shutil.rmtree, self.cfg, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, self.work, ignore_errors=True)
+        self.log = os.path.join(self.cfg, "log")
+
+    def env(self, **over):
+        e = {
+            "CLAUDE_CONFIG_DIR": self.cfg,
+            "CR_LOG": self.log,
+            "CR_SCRAPE": "never",
+            "CR_CONTEXT_PCT": "51",              # 102k of a 200k window
+            "CR_POLL_SEC": "0.2",
+            "CR_USER_IDLE_SEC": "0",
+            "FAKE_USAGE": "10",
+            "FAKE_USAGE_DELAY": "0.3",
+            "FAKE_MODEL": "claude-opus-5",        # a 1M model in the profile table
+        }
+        e.update(over)
+        return e
+
+    def logged(self):
+        try:
+            with open(self.log) as fh:
+                return fh.read()
+        except OSError:
+            return ""
+
+    def wait_log(self, needle, session, timeout=20):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if needle in self.logged():
+                return True
+            session.drain(0.3)
+        return needle in self.logged()
+
+    def _user_statusline_script(self):
+        """A stand-in for a person's own statusLine command: reads the same
+        JSON any statusline command gets and prints one recognisable line,
+        proof that whatever ran it did not swallow it.
+        """
+        path = os.path.join(self.cfg, "user_statusline.py")
+        with open(path, "w") as fh:
+            fh.write(
+                "import json, sys\n"
+                "d = json.loads(sys.stdin.read() or '{}')\n"
+                "w = (d.get('context_window') or {}).get('context_window_size')\n"
+                "print('USER-STATUS window=%s' % w)\n")
+        return path
+
+    def test_settings_names_the_proxy_once_a_restart_is_armed(self):
+        s = self.session(env=self.env(), cwd=self.work)
+        self.assertTrue(s.read_until("ready"))
+        self.assertIn('"statusLine"', s.buf)
+        self.assertIn("--cr-statusline", s.buf)
+
+    def test_without_a_restart_armed_nothing_is_added(self):
+        s = self.session(env=self.env(CR_CONTEXT_PCT="0"), cwd=self.work)
+        self.assertTrue(s.read_until("ready"))
+        s.drain(1)
+        self.assertNotIn("--settings", s.buf)
+
+    def test_the_off_switch_stops_settings_being_added_at_all(self):
+        s = self.session(env=self.env(CR_STATUSLINE_PROXY="0"), cwd=self.work)
+        self.assertTrue(s.read_until("ready"))
+        s.drain(1)
+        self.assertNotIn("--settings", s.buf)
+
+    def test_the_statusline_report_overrides_the_1m_model_table(self):
+        # FAKE_MODEL is a 1M model by the profile table; the statusline says
+        # this SESSION only actually got 200k (no [1m]) -- exactly the
+        # invisible-self-compaction failure T20 exists to close.
+        s = self.session(env=self.env(FAKE_STATUSLINE_RUN="1",
+                                      FAKE_STATUS_MODEL="claude-opus-5",
+                                      FAKE_STATUS_WINDOW="200000"),
+                         cwd=self.work)
+        self.assertTrue(self.wait_log("context window (claude's status line)", s),
+                        self.logged())
+        self.assertIn("200k context window", self.logged())
+        self.assertIn("restarting at 102k", self.logged())   # 51% of 200k, not 510k
+
+    def test_the_users_own_statusline_still_reaches_the_screen(self):
+        d = os.path.join(self.work, ".claude")
+        os.makedirs(d, exist_ok=True)
+        script = self._user_statusline_script()
+        with open(os.path.join(d, "settings.json"), "w") as fh:
+            json.dump({"statusLine": {"type": "command",
+                                      "command": "%s %s" % (sys.executable, script)}}, fh)
+        s = self.session(env=self.env(FAKE_STATUSLINE_RUN="1"), cwd=self.work)
+        self.assertTrue(s.read_until("STATUSLINE:", timeout=15), s.buf)
+        s.drain(0.5)
+        sc = Screen(40, 120)
+        sc.feed(s.buf)
+        self.assertIn("USER-STATUS window=200000", sc.text())
 
 
 class TestUniqueHandoffFile(PtyTestCase):
