@@ -462,6 +462,12 @@ CR_CANCEL_MSG_DEFAULT='The context restart was cancelled — the handoff is not 
 # switches the trigger off for the rest of the session instead of guessing at
 # a better number (T13). 0 = no cap.
 : "${CR_CONTEXT_MAX_PER_HOUR:=3}"
+# A standing debt -- an unfold that never reached the session, or the trigger
+# switched off for the rest of it -- gets one notify() line same as anything
+# else, and Claude's own repaint erases that line within a frame. Said again
+# every this many seconds until a key is pressed, so it cannot go unnoticed
+# for hours just because nothing else changed (T14).
+: "${CR_NOTIFY_REPEAT_SEC:=300}"
 # Typing a "/" opens Claude Code's command list, where Enter can pick the
 # highlighted entry instead of submitting what was typed. On Claude Code 2.1.222
 # one Enter runs /clear and nothing asks for confirmation — so a slash command
@@ -908,6 +914,7 @@ CFG = dict(
     context_max_cycles=_env("CR_CONTEXT_MAX_CYCLES", 0, int),
     context_min_headroom=parse_tokens(os.environ.get("CR_CONTEXT_MIN_HEADROOM") or "80k") or 0,
     context_max_per_hour=_env("CR_CONTEXT_MAX_PER_HOUR", 3, int),
+    notify_repeat=_env("CR_NOTIFY_REPEAT_SEC", 300.0, float),
     slash_gap=_env("CR_SLASH_GAP_SEC", 0.9, float),
     slash_enter=_env("CR_SLASH_ENTER", 2, int),
     slash_enter_gap=_env("CR_SLASH_ENTER_GAP_SEC", 0.6, float),
@@ -3049,7 +3056,7 @@ CONTEXT_DEFAULTS = dict(
                "now. Continue with what you were doing before it was requested.",
     root_idle=20.0, handoff_timeout=900.0, step_gap=3.0, clear_settle=5.0,
     context_cooldown=600.0, context_max_cycles=0,
-    context_min_headroom=80000, context_max_per_hour=3,
+    context_min_headroom=80000, context_max_per_hour=3, notify_repeat=300.0,
     model_lookup=False, model_lookup_timeout=10.0,
     model_cache=os.path.expanduser("~/.claude-retrier/windows.json"),
     model_cache_ttl=604800.0, models_doc_url="", models_api_url="",
@@ -3244,7 +3251,12 @@ class Controller:
         self.clear_sent_at = 0.0      # when the current /clear (or its one reprint) went out
         self.clear_retried = False    # the one reprint CLEAR_SENT allows itself
         self._clear_from_path = None  # context_path at /clear time; a change confirms it
-        self._unfold_notify_at = 0.0  # last time a stuck CLEARED/UNFOLD_FAILED said so
+        self._debt_notify_at = 0.0    # last time a stuck CLEARED/UNFOLD_FAILED/off-for-
+                                       # the-session debt said so again (T14)
+        self._cleared_at = 0.0        # when this restart's CLEARED step began, so a gate
+                                       # held past a minute can say so (badge_warn, T14)
+        self._off_reason = None       # why context_off was set, for the repeated notify
+        self._context_off_acked = False   # a key was pressed while that debt stood (T14)
         self._restart_tick = None     # last tick the restart clock actually ran
         self._rearm = False           # a wait ended mid-restart: re-send the step
         self._gate_note = None
@@ -3380,9 +3392,18 @@ class Controller:
             if self.rstate == UNFOLD_FAILED:
                 # The failure itself is not undone -- context_off stays set -- but
                 # a human is now at the keyboard, and a badge/notify that keeps
-                # repeating at someone who already saw it is just noise.
+                # repeating at someone who already saw it is just noise. What is
+                # left of the debt (context_off, badge_warn's "restart off") is
+                # acknowledged in the same stroke -- the same person just saw it.
                 self.log("a key was pressed; the unfold-failed notice is dismissed")
                 self._end_restart(now)
+                self._context_off_acked = True
+            elif self.context_off:
+                # Not the unfold-failed case -- T13's frequency guard, or a clear
+                # that did nothing -- but the same standing debt (T14): a key
+                # pressed while it is outstanding is proof enough that someone
+                # finally saw it, and the repeated notify can stop.
+                self._context_off_acked = True
         if self.pending_input_chars != before:
             self.last_draft_change = now
 
@@ -3714,7 +3735,7 @@ class Controller:
     GATE_RETRY = 5.0       # how long to sit on a held step before looking again
     INTERRUPT_RETRY = 20.0 # between Escs, if the first did not close the turn
     HANDOFF_ECHO_RETRIES = 2   # retypes for a phrase that left no trace at all
-    NOTIFY_INTERVAL = 300.0    # how often a stuck CLEARED/UNFOLD_FAILED says so again
+    UNFOLD_STUCK = 60.0    # CLEARED held on the gate this long reads as stuck, not routine (T14)
 
     @property
     def context_enabled(self):
@@ -4013,7 +4034,8 @@ class Controller:
             self.rstate = CLEARED
             self.restart_left = self.cfg["handoff_timeout"]
             self.rwake = now
-            self._unfold_notify_at = now
+            self._debt_notify_at = now
+            self._cleared_at = now
             return
         self._abort_restart("%s compacted the thread itself during %s" % (agent, self.rstate),
                             now)
@@ -4091,14 +4113,41 @@ class Controller:
             return None
         return self.context_pct()
 
-    def badge_warn(self):
+    def badge_warn(self, now=None):
         """The one thing the corner has to say while nothing is happening.
 
-        A disarmed trigger is silent by construction, and silence is exactly what
-        an armed one looks like too. Anyone who set CR_CONTEXT_PCT and is relying
-        on it deserves to see that it is not currently protecting them.
+        In priority order (T14), each ranked above the next because it is
+        further along the road to a session nobody is watching any more:
+
+          1. `unfold failed` -- the debt T08 leaves behind when the resume
+             phrase never once reached the session. Outranks everything: no
+             retry is coming, and only a person can do anything about it.
+          2. `unfold?` -- CLEARED has no timeout of its own (`_wait_for_unfold_
+             gate`), so a gate held shut past `UNFOLD_STUCK` looks the same on
+             screen as an ordinary few-second wait unless this says otherwise.
+          3. `restart off` -- `context_off`, permanent for the rest of the
+             session (T13's frequency guard included, via the same flag). A
+             disarmed trigger is silent by construction, which looks exactly
+             like an armed one quietly protecting you; this is the difference.
+          4. `window?` -- the trigger is armed but nothing has said how big the
+             window is yet (only ever true before a session's first turn).
+          5. `~est` -- the window came from a guess (T19), not a firm answer,
+             for as long as nothing nearer the threshold already says so:
+             `badge_context()` covers that moment with its own "~" prefix, and
+             this only speaks when that one has nothing to show.
         """
-        return "window?" if self._needs_window() and self.context_model else None
+        if self.rstate == UNFOLD_FAILED:
+            return "unfold failed"
+        if (self.rstate == CLEARED and now is not None
+                and now - self._cleared_at > self.UNFOLD_STUCK):
+            return "unfold?"
+        if self.context_off:
+            return "restart off"
+        if self._needs_window() and self.context_model:
+            return "window?"
+        if self.context_estimated and self.context_enabled and self.badge_context() is None:
+            return "~est"
+        return None
 
     def inject_note(self):
         """The one line the human sees when something is typed for them."""
@@ -4254,6 +4303,13 @@ class Controller:
     def _tick_restart(self, now):
         prev, self._restart_tick = self._restart_tick, now
         if self.rstate is None:
+            if self.context_off:
+                # The trigger itself never fires again this session, but a debt
+                # that sits silent for hours is exactly what T14 exists to
+                # prevent -- repeat it until a key proves someone finally saw it.
+                return (None if self._context_off_acked else
+                        self._renotify(now, "context restart is switched off for "
+                                            "this session (%s)" % self._off_reason))
             return self._maybe_restart(now)
         if prev is not None:
             # The clock only runs on ticks where the restart could actually have
@@ -4307,12 +4363,13 @@ class Controller:
         return why
 
     def _renotify(self, now, text):
-        """Say a standing debt again if it has been `NOTIFY_INTERVAL` since the
-        last time -- a debt that can sit for hours must not go quiet after the
-        first mention just because nothing else changed."""
-        if now - self._unfold_notify_at < self.NOTIFY_INTERVAL:
+        """Say a standing debt again if it has been `CR_NOTIFY_REPEAT_SEC` since
+        the last time -- a debt that can sit for hours must not go quiet after
+        the first mention just because nothing else changed (T14: covers a
+        stuck unfold, a failed one, and the trigger switched off for good)."""
+        if now - self._debt_notify_at < self.cfg["notify_repeat"]:
             return None
-        self._unfold_notify_at = now
+        self._debt_notify_at = now
         return ("notify", text)
 
     def _wait_for_unfold_gate(self, now):
@@ -4461,7 +4518,8 @@ class Controller:
     def _enter_cleared(self, why, now):
         self.rstate = CLEARED
         self.rwake = now + self.cfg["step_gap"]
-        self._unfold_notify_at = now
+        self._debt_notify_at = now
+        self._cleared_at = now
         self.log("the clear took hold (%s); unfolding once the gate opens" % why)
         return None
 
@@ -4688,7 +4746,9 @@ class Controller:
     def _enter_unfold_failed(self, now):
         self.rstate = UNFOLD_FAILED
         self.context_off = True
-        self._unfold_notify_at = now
+        self._off_reason = "the resume phrase never reached the session"
+        self._context_off_acked = False
+        self._debt_notify_at = now
         self.log("unfold failed: the resume phrase never reached the session in "
                  "%d attempts — switched off for this session until a key is pressed"
                  % self.cfg["resume_attempts"])
@@ -4761,6 +4821,9 @@ class Controller:
         self._end_restart(now)
         if permanent:
             self.context_off = True
+            self._off_reason = why
+            self._context_off_acked = False
+            self._debt_notify_at = now
             self.log("restart aborted at %s: %s — not attempting another this session"
                      % (at, why))
             return ("notify", "context restart aborted (%s); switched off for this session"
@@ -4913,6 +4976,13 @@ class Badge:
             # Red and not blinking, like `warn`: nothing is being typed into the
             # session any more, and the debt sits there until a person acts.
             return ("%s %s %s" % (mark, self.label, RESTART_LABELS[restart]), "2;31")
+        if warn:
+            # Dim red and not blinking: something needs attention, and -- unlike
+            # an active step -- nothing is being typed into the session over it.
+            # Ranked ahead of the ordinary restart label below (T14): CLEARED's
+            # gate stuck past badge_warn's own "unfold?" threshold is a stall,
+            # not progress, and a blinking "cleared" over it would say otherwise.
+            return ("%s %s %s" % (mark, self.label, warn), "2;31")
         if restart:
             # Minutes of typing into a live session, ending in a cleared one.
             # While that is happening it is the most important thing the corner
@@ -4921,10 +4991,6 @@ class Badge:
                 mark = self.MARK_ALT
             return ("%s %s %s" % (mark, self.label,
                                   RESTART_LABELS.get(restart, restart)), "2;35")
-        if warn:
-            # Dim red and not blinking: something needs attention, but nothing is
-            # being typed into the session over it.
-            return ("%s %s %s" % (mark, self.label, warn), "2;31")
         if context is not None:
             # Rounded, not truncated: codex's status line rounds, and a corner
             # saying 4% under a line saying 5% reads as two different sessions.
@@ -6162,7 +6228,7 @@ def main(argv):
                             # the terminal; anything written now lands inside it.
                             blocked=bool(esc_carry), deferred=ctl.deferred,
                             restart=ctl.rstate, context=ctl.badge_context(),
-                            warn=ctl.badge_warn(), context_estimated=ctl.context_estimated)
+                            warn=ctl.badge_warn(now), context_estimated=ctl.context_estimated)
 
             try:
                 done, status = os.waitpid(pid, os.WNOHANG)
@@ -6390,7 +6456,7 @@ export CR_CLAUDE_RESUME_MSG CR_CODEX_RESUME_MSG
 export CR_CLAUDE_CANCEL_MSG CR_CODEX_CANCEL_MSG
 export CR_ROOT_IDLE_SEC CR_HANDOFF_TIMEOUT_SEC CR_STEP_GAP_SEC CR_CLEAR_SETTLE_SEC
 export CR_CONTEXT_COOLDOWN_SEC CR_CONTEXT_MAX_CYCLES
-export CR_CONTEXT_MIN_HEADROOM CR_CONTEXT_MAX_PER_HOUR
+export CR_CONTEXT_MIN_HEADROOM CR_CONTEXT_MAX_PER_HOUR CR_NOTIFY_REPEAT_SEC
 export CR_SLASH_GAP_SEC CR_SLASH_ENTER CR_SLASH_ENTER_GAP_SEC
 
 # The supervisor is handed over on a file descriptor rather than as an argument.

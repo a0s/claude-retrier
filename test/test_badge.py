@@ -62,6 +62,32 @@ class TestText(unittest.TestCase):
         text, _ = badge().frame(cr.IDLE, 0, 0, 3, 0, context=47.0, context_estimated=True)
         self.assertEqual(text, "◆ cr ~47%")
 
+    def test_each_warn_state_paints_dim_red_and_does_not_blink(self):
+        # T14: badge_warn()'s five words -- whichever one Controller hands
+        # over, Badge just says it, in the same colour "unfold failed" (its
+        # own dedicated branch) already used.
+        for msg in ("unfold failed", "unfold?", "restart off", "window?", "~est"):
+            text, sgr = badge().frame(cr.IDLE, 0, 0, 3, 0, warn=msg)
+            self.assertEqual(text, "◆ cr %s" % msg)
+            self.assertEqual(sgr, "2;31")
+
+    def test_a_warn_outranks_a_blinking_restart_label(self):
+        # T14: "unfold?" fires precisely while rstate is still CLEARED (the
+        # gate has been stuck on the unfold step past a minute) -- the ordinary
+        # blinking "cleared" label must not cover it up.
+        text, sgr = badge().frame(cr.IDLE, 0, 0, 3, 0, restart=cr.CLEARED, warn="unfold?")
+        self.assertEqual(text, "◆ cr unfold?")
+        self.assertEqual(sgr, "2;31")
+
+    def test_unfold_failed_is_unaffected_by_its_own_warn_text(self):
+        # main() passes both restart=UNFOLD_FAILED and warn="unfold failed"
+        # together once badge_warn() knows about the state too -- the dedicated
+        # branch still wins, with the exact same text and colour either way.
+        text, sgr = badge().frame(cr.IDLE, 0, 0, 3, 0,
+                                  restart=cr.UNFOLD_FAILED, warn="unfold failed")
+        self.assertEqual(text, "◆ cr unfold failed")
+        self.assertEqual(sgr, "2;31")
+
     def test_waiting_blinks_but_nothing_else_does(self):
         b = badge()
         marks = {b.frame(cr.WAITING, 60, 0, 3, t)[0][0] for t in (0, b.PULSE, 2 * b.PULSE)}

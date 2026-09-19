@@ -863,6 +863,19 @@ class TestRestartFrequencyGuard(RestartTestCase):
         self.assertIsNone(ctl.badge_context())
         self.assertIsNone(ctl.rstate)
         self.assertEqual(ctl.cycles, 3)            # the fourth never started
+        self.assertEqual(ctl.badge_warn(), "restart off")
+
+        # T14: this debt never went through UNFOLD_FAILED at all, but it is the
+        # same standing-off-for-the-session state, and it is repeated the same
+        # way -- until a key proves someone is actually looking.
+        self.assertIsNone(self.tick(ctl, 330 + 299))
+        again = self.tick(ctl, 330 + 301)
+        self.assertEqual(again[0], "notify")
+        self.assertIn("switched off for this session", again[1])
+
+        ctl.on_user_bytes(b"x", now=330 + 302)
+        self.assertIsNone(self.tick(ctl, 330 + 301 + 400))    # acknowledged: quiet now
+        self.assertEqual(ctl.badge_warn(), "restart off")     # ...but still true on screen
 
 
 class TestACollapsedRowKeepsEndTurn(RestartTestCase):
@@ -1028,6 +1041,20 @@ class TestTheClearNeedsConfirmation(RestartTestCase):
         # later, and the resume goes out the moment it does.
         self.assertIsNone(self.tick(ctl, 1080))
         self.assertEqual(self.tick(ctl, 1090), ("inject", RESUME, False))
+
+    def test_a_gate_stuck_past_a_minute_says_so_in_the_badge(self):
+        # T14: CLEARED has no timeout of its own -- the only way the corner can
+        # tell a routine few-second wait for the gate apart from one that has
+        # been stuck for minutes is to time it itself.
+        ctl = restart_controller()
+        self.cleared(ctl)                             # rstate -> CLEARED at t=66
+        for t in range(66, 132, 5):                    # a person at the keyboard, never idle
+            ctl.on_user_bytes(b"x", now=t)
+            self.tick(ctl, t)
+        self.assertEqual(ctl.rstate, cr.CLEARED)        # still held throughout
+
+        self.assertIsNone(ctl.badge_warn(100))          # under a minute since CLEARED began
+        self.assertEqual(ctl.badge_warn(130), "unfold?")   # the same hold, past a minute now
 
 
 class TestNothingIsClearedOnAPromise(RestartTestCase):
@@ -1239,7 +1266,14 @@ class TestTheClearHasToHaveWorked(RestartTestCase):
         self.assertIn("did not fall", action[1])
         self.assertTrue(ctl.context_off)
         usage(ctl, 200, FULL)
-        self.assertIsNone(self.tick(ctl, 1000))    # and never tries again
+        self.assertIsNone(self.tick(ctl, 200))     # too soon to repeat, and never retries
+        # T14: the debt itself is repeated well past CR_NOTIFY_REPEAT_SEC -- the
+        # one notify() line and Claude's own repaint are not enough for a debt
+        # that can sit for hours -- but the trigger stays off, not merely quiet.
+        again = self.tick(ctl, 1000)
+        self.assertEqual(again[0], "notify")
+        self.assertIn("switched off for this session", again[1])
+        self.assertIsNone(ctl.rstate)
 
     def test_the_reading_it_is_judged_against_is_the_one_it_acted_on(self):
         # A project directory can hold more than one live transcript, and the
@@ -1410,6 +1444,7 @@ class TestUnfoldCanFail(RestartTestCase):
         self.assertEqual(ctl.rstate, cr.UNFOLD_FAILED)
         self.assertTrue(ctl.context_off)
         self.assertFalse(ctl.context_enabled)
+        self.assertEqual(ctl.badge_warn(), "unfold failed")     # T14: outranks everything
 
         badge = cr.Badge(dict(badge=1, badge_pos="bottom-right", badge_label="cr"))
         text, sgr = badge.frame(cr.IDLE, 0, 0, 3, now=0, restart=ctl.rstate)
@@ -1424,6 +1459,10 @@ class TestUnfoldCanFail(RestartTestCase):
         ctl.on_user_bytes(b"\r", now=t + 302)       # any key dismisses the notice
         self.assertIsNone(ctl.rstate)
         self.assertTrue(ctl.context_off)            # ...but the trigger stays off
+        # T14: the specific "unfold failed" notice resets, and what is left of
+        # the debt (the trigger permanently off) takes its place in the badge.
+        self.assertEqual(ctl.badge_warn(), "restart off")
+        self.assertIsNone(self.tick(ctl, t + 302 + 400))   # ...and stays quiet: acknowledged
 
 
 class TestTheLimitOutranksTheContext(RestartTestCase):
@@ -1617,6 +1656,10 @@ class TestWhatCountsAsContext(RestartTestCase):
         self.assertEqual(ctl.context_limit, 500000)
         self.assertTrue(ctl.context_estimated)
         self.assertEqual(ctl.window_unknown, "claude-something-9")   # still worth asking
+        # T14: far from the threshold `badge_context()` has nothing to show, so
+        # the guess still gets a word of its own rather than going silent.
+        self.assertIsNone(ctl.badge_context())
+        self.assertEqual(ctl.badge_warn(), "~est")
 
     def test_an_estimate_keeps_escalating_past_what_usage_proves_it(self):
         ctl = restart_controller(context_window="auto")

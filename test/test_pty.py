@@ -959,6 +959,23 @@ class TestContextRestart(PtyTestCase):
         self.assertIn("restarting at 300k", self.logged())
         self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
 
+    def test_a_permanently_aborted_restart_shows_restart_off_in_the_badge(self):
+        # T14: "the clear did nothing" is one of the two paths to a PERMANENT
+        # abort (T13's frequency guard is the other) -- the trigger never fires
+        # again this session, and that has to stay on screen for as long as the
+        # session runs, not just for the one notify() line Claude's own repaint
+        # erases within a frame. FAKE_USAGE_AFTER equal to FAKE_USAGE means the
+        # context claude reports right after `/clear` never actually fell.
+        s = self.session(env=self.env(CR_BADGE="1", FAKE_USAGE_AFTER="700000"),
+                         cwd=self.work)
+        self.assertTrue(s.read_until("GOT:resume", timeout=30), s.buf[-500:])
+        self.assertTrue(self.wait_log("not attempting another this session", s),
+                        self.logged())
+        s.drain(1.0)
+        sc = Screen(40, 120)
+        sc.feed(s.buf)
+        self.assertIn("restart off", sc.line(40))
+
 
 class TestUniqueHandoffFile(PtyTestCase):
     """T05, single-session end: `{id}` resolves to a real file, and a custom
