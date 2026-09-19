@@ -178,16 +178,36 @@ skipped for that reason, noted in the T16 backlog doc instead of forced in.
 `CR_HANDOFF_MSG`/`CR_RESUME_MSG`/`CR_CANCEL_MSG`. New `test_input_grammar.py`
 (7 tests) pins `typing_plan` for both agents across `/clear`, `/skill arg`,
 `$skill arg`, `@file text`, plain text, and Russian text; `TestSkillPlaceholder`
-in `test_codex.py` covers the placeholder. `docs/context-restart.md`'s
+in `test_codex.py` covers the placeholder; and two pty tests (5c33a40) pin the
+end-to-end delivery the AC asked for — `@README.md …` reaching fake_claude
+whole, and one *shared* `CR_RESUME_MSG` holding `{skill:supervisor}` arriving
+at codex as `$supervisor …` after the round trip through bash and `agent_cfg`. `docs/context-restart.md`'s
 "Slash commands and CR_SLASH_ENTER" section is now "Commands, skills and
 mentions"; `docs/codex.md`'s "Skills and file mentions in codex" section,
 which had recorded the pre-investigation guess as fact, is corrected;
 `docs/configuration.md` gains the `{skill:NAME}` row. `./test/run.sh`: 202
-tests in `test_controller.py` alone, full suite `ALL PASS` (one
-`test_pty.py` `TimeoutExpired` seen under full-suite load, confirmed as the
-same pre-existing flake noted throughout this file by a clean isolated
-rerun). Merged directly to `main` as 9a93c2d (single-session work, no
-worktree). `./test/codegraph-sync.sh` run after.
+tests in `test_controller.py` alone, `test_pty.py` 67 and `test_codex.py` 156
+with the new cases, full suite `ALL PASS` (one `test_pty.py` `TimeoutExpired`
+seen on an earlier run under full-suite load, confirmed as the same
+pre-existing flake noted throughout this file by a clean isolated rerun, and
+absent from the final run). Merged directly to `main` as 9a93c2d, then
+5c33a40 for the pty tests (single-session work, no worktree).
+`./test/codegraph-sync.sh` run after.
+
+One correction worth recording, since it is the kind of thing this file
+exists to stop from being repeated: the first write-up of T15's results
+claimed `/clear` "executes on a single Enter" — but every capture had sent
+*two* and only photographed the screen before the first and after the
+second, so the single-Enter part was an inference, not an observation. It
+was re-run sending exactly one Enter and nothing after it; the banner was
+already there, so the claim holds and is now marked as directly verified.
+Re-running it also exposed a real bug in the driver itself (fixed in
+5c33a40): it waited a fixed 2s for the folder-trust gate, but codex loads its
+model catalog first, so the gate lands 3–4s in — and the boot splash already
+draws "Ask Codex to do anything", so the readiness check returned before the
+gate had even appeared and the phrase was typed into that menu, which picks
+"No, quit". It now renders the current screen each poll and waits for the
+"Context N% used" status line the splash never paints.
 
 Only **T26-live** remains, gated on explicit user confirmation to spend
 quota on a live session with no other task depending on it.
