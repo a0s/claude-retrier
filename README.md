@@ -81,6 +81,9 @@ should get that by accident. `CR_CONTEXT_PCT` turns it on — see
   → [context restart](docs/context-restart.md)
 - **Wraps codex as well as Claude Code**, with its own command and its own
   context threshold. → [codex](docs/codex.md)
+- **Keeps two sessions in one project apart**: each gets its own identity, its
+  own handoff file, and its own tagged log lines, so neither one's restart can
+  read or clear the other's. → [troubleshooting](docs/troubleshooting.md#two-sessions-in-one-project)
 - **Runs your claude, not `claude`**: a binary, a command line, an alias or a
   function. → [custom command](docs/custom-command.md)
 - **Never types over you.** An unsent draft or an unfinished turn makes it wait.

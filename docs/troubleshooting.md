@@ -10,16 +10,52 @@ limitations.
 `~/.claude-retrier/log` (or `CR_LOG`) has the whole story with numbers. It is
 the only file the wrapper writes under your home directory.
 
+## How to read the log by pid
+
 Two sessions in the same project write into the same log, so every line
 carries `[cr <pid> <agent>]` right after the timestamp — the pid is the
 supervisor process, printed on `start:`. `grep 'cr 48213'` isolates one
 session's own `start: … → … → exit:` sequence out of the interleaved file.
+
+## Two sessions in one project
+
+This used to be a real hazard — the wrapper guessed which transcript was
+"ours" by which file grew last, and a neighbour under the same working
+directory could briefly win that guess. It no longer does: claude identifies
+its own transcript from `~/.claude/sessions/<pid>.json`, and codex confirms
+its rollout with the fold phrase's own nonce echoed back into it — see
+[context-restart.md](context-restart.md#which-session-is-mine) for the whole
+chain. Each session also gets its own handoff file (`{id}` in
+`CR_HANDOFF_FILE`, or the wrapper's own registry-based coordination when you
+leave it out — see [context-restart.md](context-restart.md#turning-it-on)),
+so two folds in the same project no longer overwrite each other. What is left
+of the old limitation is the fallback path for an older Claude Code with no
+session registry file — see [Caveats](context-restart.md#caveats) — and
+follow [how to read the log by pid](#how-to-read-the-log-by-pid) above to
+untangle the two sessions' log lines while you check.
+
+## Unfold failed — what to do
+
+`◆ cr unfold failed` in the corner means `/clear` went out, but the resume
+phrase (`CR_RESUME_MSG`) never reached the session after `CR_RESUME_ATTEMPTS`
+retries — the session is sitting there empty, waiting for nobody. The log
+names the handoff file it was about to point the session at; open it
+yourself and paste its contents (or the resume phrase itself) into the
+session by hand. Pressing any key in the session clears the nagging repeat of
+this notice, but the context-restart trigger itself (`context_off`) stays off
+for the rest of the session either way — nothing here re-arms on its own,
+because a restart that already failed once is not owed a second try against
+the same session. See
+[context-restart.md](context-restart.md#why-clear-is-the-last-thing-it-will-do)
+for the full unfold sequence and why giving up looks the way it does.
 
 ## Common checks
 
 - **The context restart never fires.** See
   [When nothing happens](context-restart.md#when-nothing-happens) — the log
   lines listed there, in order of likelihood.
+- **The badge says `unfold failed`.** See
+  [Unfold failed — what to do](#unfold-failed--what-to-do).
 - **The wrong command runs, or an alias is not found.**
   `claude-retrier --cmd X --cr-dump-argv` prints exactly what will be executed.
   See [custom-command.md](custom-command.md).
@@ -50,6 +86,14 @@ session's own `start: … → … → exit:` sequence out of the interleaved fil
   ships as `/bin/bash`, cannot be asked for an alias body at all and falls back
   to running the alias through `bash -i`.)
 - The context restart reads its figures from one transcript at a time, the one
-  this terminal's session writes. Another live session under the same working
-  directory can, briefly, be the file that grew last.
+  this terminal's session writes. claude identifies that transcript
+  explicitly and codex confirms it by echo nonce (see
+  [two sessions in one project](#two-sessions-in-one-project)); only without a
+  session registry file (an older Claude Code) does the wrapper fall back to
+  guessing which file grew last, and only there can a neighbour under the
+  same working directory briefly win that guess — see
+  [Caveats](context-restart.md#caveats).
+- `$skill` and `@file` phrases on codex are not yet given the same safe-typing
+  treatment `/` gets, so their Enter can be swallowed by codex's own popup —
+  see [codex: skills and file mentions](codex.md#skills-and-file-mentions-in-codex).
 - Windows is not supported (no pty).

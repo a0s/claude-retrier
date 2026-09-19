@@ -8,6 +8,7 @@ file, verifies it, runs `/clear` and points the fresh session at the file.
 - [Turning it on](#turning-it-on)
 - [What you will see](#what-you-will-see)
 - [The four steps](#the-four-steps)
+- [Which session is mine](#which-session-is-mine)
 - [Why `/clear` is the last thing it will do](#why-clear-is-the-last-thing-it-will-do)
 - [Writing your own phrases](#writing-your-own-phrases)
 - [Choosing a threshold](#choosing-a-threshold)
@@ -125,6 +126,38 @@ that was sent. The check rides on a row the wrapper had already parsed, so it
 costs two comparisons and happens only when the transcript actually grew. The
 denominator comes from the model slug in the same row.
 
+## Which session is mine
+
+Every step above — the badge's percentage, whether the fold is answered,
+whether `/clear` is safe to send — is read off one transcript, and two
+sessions sharing a project directory means there is more than one to choose
+from. Three things pin down which one is this terminal's:
+
+- **claude** identifies it explicitly: Claude Code (>= 2.1.273) writes
+  `~/.claude/sessions/<pid>.json` naming the transcript for that pid, and the
+  wrapper reads it (`ClaudeSessionRegistry`) rather than guessing which file
+  grew last. An older build, or a registry that cannot resolve one candidate
+  unambiguously, falls back to a heuristic instead — see
+  [Caveats](#caveats) for exactly when that applies and what it still gets
+  wrong.
+- **codex** has no such file to read (a rollout's head names no pid), so
+  identity rests on the one thing nobody else can produce: the fold phrase's
+  nonce (`HANDOFF-xxxxxxxx`), unique machine-wide. Its echo landing in a
+  rollout is the proof that rollout is really this session's — see
+  [codex: two sessions in one directory](codex.md#two-sessions-in-one-directory)
+  for how the wrapper reads, but does not act on, a candidate before that
+  proof arrives.
+- Either way, `bind_transcript` is the one place the wrapper ever switches
+  which file it is reading. The context percentage, whether the session
+  counts as busy, the alive check that clears a wait, and the fold/clear/resume
+  checks are all filtered to that one file, so a neighbour's turn cannot feed
+  this session a number, or an echo, that was never its own.
+
+Once identity is settled, the [per-session handoff file](#turning-it-on)
+means the two sessions do not need to agree on a filename either: put `{id}`
+in `CR_HANDOFF_FILE` yourself, or leave it out and let the wrapper's own
+registry-based coordination pick one aside automatically.
+
 ## Why `/clear` is the last thing it will do
 
 Clearing a session that was not folded up loses the work with nothing written
@@ -145,11 +178,20 @@ down, so `/clear` goes out only when four independent things agree:
 turn rows instead — see [codex](codex.md#how-it-differs-from-claude-underneath).)
 
 If any of them is missing the wrapper asks for the fold again, and then gives
-up. Giving up leaves the session untouched: it can still fall back on Claude Code's own
-compaction, which is a far better outcome than a history thrown away on a
-promise. If `/clear` did go out and the context did not actually fall, the
-feature switches itself off for the rest of the session rather than typing into
-a full one for ever.
+up. What giving up means depends on whether the fold phrase ever reached the
+session. If its echo was never seen, nothing was told to the model, and giving
+up really does leave the session untouched — it can still fall back on Claude
+Code's own compaction, a far better outcome than a history thrown away on a
+promise. But once the phrase was delivered, the model has already been told to
+wrap up and start nothing new, and simply walking away would leave it sitting
+on an instruction that never gets followed up. So instead the wrapper types
+`CR_CANCEL_MSG` — "The context restart was cancelled — the handoff is not
+needed now. Continue with what you were doing before it was requested." — to
+say the ask is off (`restart aborted at handoff_sent: ...` followed by
+`restart cancelled; asking the session to carry on` in the log; see
+[When nothing happens](#when-nothing-happens)). If `/clear` did go out and the
+context did not actually fall, the feature switches itself off for the rest of
+the session rather than typing into a full one for ever.
 
 And the unfold is owed after it. Once `/clear` has gone out, the session sitting
 there has nothing in it — the one thing left to do is type the resume phrase,
