@@ -12,6 +12,7 @@ file, verifies it, runs `/clear` and points the fresh session at the file.
 - [Writing your own phrases](#writing-your-own-phrases)
 - [Choosing a threshold](#choosing-a-threshold)
 - [The context window](#the-context-window)
+- [`[1m]` vs 200k: the statusline proxy](#1m-vs-200k-the-statusline-proxy)
 - [Slash commands and `CR_SLASH_ENTER`](#slash-commands-and-cr_slash_enter)
 - [When nothing happens](#when-nothing-happens)
 - [Caveats](#caveats)
@@ -312,7 +313,8 @@ resolves it in the order `resolve_window` trusts most to least:
 
 1. `CR_CONTEXT_WINDOW` itself, if it names a number rather than `auto`.
 2. What the agent states outright — codex writes its window into every row of
-   accounting; a claude statusline will do the same once T20 lands.
+   accounting; claude's own statusline does the same, relayed by the
+   `--cr-statusline` proxy (see "`[1m]` vs 200k: the statusline proxy" below).
 3. Claude Code's own environment: it narrows to 200k if
    `CLAUDE_CODE_DISABLE_1M_CONTEXT` or `CLAUDE_CODE_MAX_CONTEXT_TOKENS` is set
    in the environment claude is started with.
@@ -377,6 +379,57 @@ at 510k`).
 
 This is the one thing in the wrapper that talks to the network, and only ever
 about a model name: it sends a slug and reads back a number.
+
+## `[1m]` vs 200k: the statusline proxy
+
+The profile table above is a guess about the SLUG, not about this particular
+session: whether it actually got a 1M window depends on `/model sonnet[1m]`,
+the account plan (Max/Team/Enterprise vs Pro), `CLAUDE_CODE_DISABLE_1M_CONTEXT`
+and `CLAUDE_CODE_MAX_CONTEXT_TOKENS` — none of which show up in the bare slug
+the transcript writes (`claude-sonnet-5`, `[1m]` suffix included or not, is
+only ever "believe it if it's there," never proof of the opposite). Assume 1M
+on a session that actually has 200k and the restart threshold sits past the
+point Claude Code compacts the context on its own — the exact "invisible"
+failure this whole feature exists to prevent.
+
+Claude Code's own statusline is asked, instead of guessed at: once a restart
+is armed (`CR_CONTEXT_PCT`/`CR_CONTEXT_TOKENS`/`CR_CONTEXT_RESTART`), the
+wrapper passes claude a `--settings` naming
+`<this file> --cr-statusline <path>` as its `statusLine` command. Claude Code
+invokes that command with a JSON payload including
+`context_window.context_window_size` (200000 or 1000000) and `model.id`; the
+proxy records those into `~/.claude-retrier/status/<pid>.json` (one file per
+wrapper, written atomically) and then runs YOUR OWN `statusLine` command, if
+`settings.json`/`settings.local.json` name one, with the same stdin — so
+whatever you already see in that corner keeps appearing exactly as before. No
+statusLine configured at all means no output from the proxy either: it never
+fabricates one.
+
+The supervisor polls that file every `CR_POLL_SEC` and feeds
+`context_window_size` into the same `context_window_hint` codex's own rollout
+accounting already uses (stage 2 above) — the log names the source `claude's
+status line` instead of `the transcript` — and `model.id` into an immediate
+model-name update.
+
+`CR_STATUSLINE_PROXY=0` turns the whole mechanism off: no `--settings` is
+added at all, and the wrapper is back to guessing purely from the model
+profile table (stage 4).
+
+**Verified vs assumed** (2026-09-19, no live Claude Code session was
+available while building this): the documented statusline payload shape
+(`context_window.context_window_size`, `model.id`, `session_id`,
+`transcript_path`, `exceeds_200k_tokens`) and the existence of `--settings
+<file-or-json>` are taken from Claude Code's own documentation, not observed
+live. Two things documentation does not state and this build could not test
+against a real binary: whether `--settings` on the command line MERGES with
+or REPLACES the user's own `settings.json`/`settings.local.json`, and exactly
+how often (every render? every N seconds?) the statusline command is
+invoked. This is coded against the safer assumption — **merge** — since a
+proxy that silently discarded someone's other settings would be a worse
+failure than this feature simply not helping; and against the poll cadence
+being frequent enough that `CR_POLL_SEC` (not the statusline's own interval)
+is the bottleneck. Full detail in
+[T20's backlog entry](backlog/T20-claude-effective-window.md#verified).
 
 ## Slash commands and `CR_SLASH_ENTER`
 
