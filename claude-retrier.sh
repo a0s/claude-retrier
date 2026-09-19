@@ -377,7 +377,22 @@ CR_AGENTS_PANEL_ROW_PATTERNS=(
 # hard cap. 64k is the reserve a fold like that needs to land in.
 : "${CR_CODEX_RESERVE_TOKENS:=64k}"     # room kept under codex's cap for the fold
 : "${CR_CODEX_INTERRUPT:=1}"            # 0 = never interrupt a running turn
+# An orchestrator turn can run for hours -- far longer than the cap-reserve line
+# gives it room for -- so the threshold between turns is nearly irrelevant on its
+# own (T22). 0 (default) changes nothing: a running turn is still only ever
+# interrupted at the cap-reserve line. A number here also interrupts it once it
+# has sat past the ordinary threshold (trigger_limit) that long.
+: "${CR_CODEX_INTERRUPT_AFTER_SEC:=0}"
 : "${CR_CODEX_LOGS_DB:=}"               # default: the newest $CODEX_HOME/logs_*.sqlite
+# What a fold actually costs (tokens at the handoff being accepted minus tokens
+# when it was asked for) is logged and accumulated here after every codex fold,
+# so CR_CODEX_RESERVE_TOKENS can be judged against real folds instead of the one
+# incident it was picked from (T22).
+: "${CR_CODEX_FOLDS_FILE:=$HOME/.claude-retrier/folds.json}"
+# 1 = once an observed fold cost outgrows CR_CODEX_RESERVE_TOKENS, use
+# 1.25x the largest one seen (from CR_CODEX_FOLDS_FILE) as the effective reserve
+# from then on, instead of only recommending the change in the log.
+: "${CR_CODEX_RESERVE_ADAPT:=0}"
 # A model this file has never heard of is estimated rather than left to disarm
 # the trigger (T19): a slug nobody shipped this build knowing about is almost
 # always a NEW model, i.e. a large one, and a session with nothing armed at all
@@ -898,6 +913,10 @@ CFG = dict(
     codex_hold_compact=_env("CR_CODEX_HOLD_COMPACT", "1") != "0",
     codex_reserve=parse_tokens(os.environ.get("CR_CODEX_RESERVE_TOKENS") or "64k") or 0,
     codex_interrupt=_env("CR_CODEX_INTERRUPT", "1") != "0",
+    codex_interrupt_after_sec=_env("CR_CODEX_INTERRUPT_AFTER_SEC", 0.0, float),
+    codex_reserve_adapt=_env("CR_CODEX_RESERVE_ADAPT", "0") == "1",
+    codex_folds_file=_env("CR_CODEX_FOLDS_FILE",
+                          os.path.expanduser("~/.claude-retrier/folds.json")),
     codex_logs_db=_env("CR_CODEX_LOGS_DB", ""),
     handoff_file=_env("CR_HANDOFF_FILE", ".claude-retrier/handoff.md"),
     handoff_registry_dir=_env("CR_HANDOFF_REGISTRY_DIR",
@@ -2316,6 +2335,12 @@ CONTEXT_WINDOWS = {slug: p.window for slug, p in MODEL_PROFILES["claude"].items(
 # the user is watching still says 57%. Measured, not remembered: 13,711 tokens
 # of a 258,400 window is "Context 1% used" on codex-cli 0.154, and 5% without
 # the baseline.
+#
+# T22 ran against the same codex-cli version and did NOT re-measure this live —
+# there was no way to drive a real codex session in that environment. Left as
+# is on the strength of the 0.154 measurement above; someone with a live codex
+# session on a newer release should re-check it rather than assume it still
+# holds.
 CODEX_BASELINE_TOKENS = 12000
 
 
@@ -2574,10 +2599,67 @@ def _compaction_reserve(agent):
     """Live headroom this project holds back under a model's own compaction
     point -- CR_CODEX_RESERVE_TOKENS for codex, the only agent with a knob of
     its own; nothing for claude. Read fresh rather than trusting a number
-    frozen into the profile, which has no way to see this env var."""
+    frozen into the profile, which has no way to see this env var.
+
+    CR_CODEX_RESERVE_ADAPT=1 (T22) can raise this further: once
+    CR_CODEX_FOLDS_FILE shows a fold that cost more than this number, 1.25x
+    the largest one ever recorded there is used instead, so a session that
+    starts after the file already knows this benefits immediately rather than
+    waiting for one more fold of its own."""
     if agent != "codex":
         return 0
-    return parse_tokens(os.environ.get("CR_CODEX_RESERVE_TOKENS") or "64k") or 0
+    base = parse_tokens(os.environ.get("CR_CODEX_RESERVE_TOKENS") or "64k") or 0
+    if _env("CR_CODEX_RESERVE_ADAPT", "0") != "1":
+        return base
+    path = os.path.expanduser(_env("CR_CODEX_FOLDS_FILE", "~/.claude-retrier/folds.json"))
+    return max(base, int(1.25 * _fold_history_max(path)))
+
+
+def _fold_history_max(path):
+    """The largest codex fold cost ever recorded at `path` (T22), or 0.
+
+    A missing or corrupt file is simply empty -- the same tolerance
+    `WindowLookup._read_cache` gives the model-window cache, for the same
+    reason: this is a courtesy to future sessions, never a source of truth
+    worth failing over."""
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except Exception:
+        return 0
+    if not isinstance(data, list):
+        return 0
+    costs = [r.get("cost") for r in data if isinstance(r, dict)]
+    costs = [c for c in costs if isinstance(c, (int, float)) and not isinstance(c, bool)]
+    return int(max(costs)) if costs else 0
+
+
+def _append_fold_record(path, agent, cwd, cost, now):
+    """`{agent, cwd, cost, date}` appended to the folds.json array at `path`
+    (T22): read, append, atomic rename -- the same shape `WindowLookup._store`
+    already uses for the model-window cache."""
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+        if not isinstance(data, list):
+            data = []
+    except Exception:
+        data = []
+    data.append(dict(agent=agent, cwd=cwd, cost=int(cost),
+                     date=datetime.fromtimestamp(now).strftime("%Y-%m-%d")))
+    tmp = "%s.%d" % (path, os.getpid())
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(tmp, "w") as fh:
+            json.dump(data, fh)
+        os.rename(tmp, path)                  # atomic: two sessions can race
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def human_tokens(n):
@@ -3228,6 +3310,13 @@ class Controller:
         self.counted_by_log = None    # the rollout whose count now comes from that log
         self.interrupt_at = 0.0       # when a running turn was last interrupted
         self.self_compactions = 0     # times codex got there first
+        self.threshold_crossed_at = None  # when context_tokens first reached
+                                       # trigger_limit() for the turn now running;
+                                       # None until it does, cleared on open/close
+                                       # (CR_CODEX_INTERRUPT_AFTER_SEC, T22)
+        self._observed_fold_cost = None   # largest codex fold cost seen so far,
+                                       # seeded from codex_folds_file on first use
+                                       # (CR_CODEX_RESERVE_ADAPT, T22)
         self.rstate = None            # None | HANDOFF_SENT | HANDOFF_OK | CLEAR_SENT |
                                        # CLEARED | RESUME_SENT | UNFOLD_FAILED |
                                        # CANCEL_PENDING
@@ -3955,6 +4044,10 @@ class Controller:
     def on_turn(self, state, now):
         """codex opened or closed a turn in the rollout this session writes."""
         self.turn_open = state == "open"
+        # Whatever "over the threshold this long" had been counting belonged to
+        # the turn that just ended, or is stale from before this one opened
+        # either way, not something the next turn should inherit (T22).
+        self.threshold_crossed_at = None
 
     def on_agent_status(self, status, updated_at):
         """`sessions/<pid>.json` (T02): one more "is anyone home" signal.
@@ -3977,7 +4070,25 @@ class Controller:
         """
         if not self.codex or not self.codex_cap:
             return None
-        return max(0, self.codex_cap - int(self.cfg.get("codex_reserve", 0) or 0))
+        return max(0, self.codex_cap - self._effective_codex_reserve())
+
+    def _folds_path(self):
+        return self.cfg.get("codex_folds_file") or os.path.expanduser(
+            "~/.claude-retrier/folds.json")
+
+    def _effective_codex_reserve(self):
+        """CR_CODEX_RESERVE_TOKENS, or more once CR_CODEX_RESERVE_ADAPT=1 and an
+        observed fold has outgrown it (T22): 1.25x the largest fold cost seen,
+        seeded from codex_folds_file so a session benefits from what earlier
+        ones already learned even before it folds once itself. Never lower
+        than the configured number -- this only ever raises it.
+        """
+        base = int(self.cfg.get("codex_reserve", 0) or 0)
+        if not self.cfg.get("codex_reserve_adapt"):
+            return base
+        if self._observed_fold_cost is None:
+            self._observed_fold_cost = _fold_history_max(self._folds_path())
+        return max(base, int(1.25 * (self._observed_fold_cost or 0)))
 
     def trigger_limit(self):
         """The restart threshold, never past the point codex would get there first."""
@@ -4045,11 +4156,28 @@ class Controller:
                             now)
 
     def _maybe_interrupt(self, now):
-        """Stop a running codex turn that is about to be compacted, or None."""
+        """Stop a running codex turn that is about to be compacted -- or one
+        that has simply sat past the ordinary threshold too long, or None.
+
+        This is only ever reached (via `_maybe_restart`) once `context_tokens`
+        has already reached `trigger_limit()`, so the first call each turn is
+        exactly when that crossing happened. An orchestrator turn can run for
+        hours -- far longer than the cap-reserve line below reliably gives it
+        room for -- so CR_CODEX_INTERRUPT_AFTER_SEC (T22) interrupts it once it
+        has sat past that ordinary threshold this many seconds, without waiting
+        for the harder line. 0 (default): unchanged, only the line below fires.
+        """
         if not (self.codex and self.turn_open and self.cfg.get("codex_interrupt", True)):
             return None
+        if self.threshold_crossed_at is None:
+            self.threshold_crossed_at = now
         line = self.interrupt_line()
-        if line is None or self.context_tokens is None or self.context_tokens < line:
+        over_line = (line is not None and self.context_tokens is not None
+                    and self.context_tokens >= line)
+        after_sec = self.cfg.get("codex_interrupt_after_sec", 0) or 0
+        stuck = (not over_line and after_sec > 0
+                and now - self.threshold_crossed_at >= after_sec)
+        if not (over_line or stuck):
             return None
         if now - self.interrupt_at < self.INTERRUPT_RETRY:
             return None                  # one Esc, then give the turn time to close
@@ -4058,10 +4186,17 @@ class Controller:
             self._gate_note = why
             return None
         self.interrupt_at = now
-        self.log("context is %s, within %s of codex compacting at %s; interrupting the "
-                 "running turn to fold it up" % (human_tokens(self.context_tokens),
-                                                 human_tokens(self.codex_cap - line),
-                                                 human_tokens(self.codex_cap)))
+        if over_line:
+            self.log("context is %s, within %s of codex compacting at %s; interrupting the "
+                     "running turn to fold it up" % (human_tokens(self.context_tokens),
+                                                     human_tokens(self.codex_cap - line),
+                                                     human_tokens(self.codex_cap)))
+        else:
+            self.log("the running turn has sat past the %s threshold for %.0fs "
+                     "(CR_CODEX_INTERRUPT_AFTER_SEC=%d); interrupting it before codex "
+                     "gets there on its own"
+                     % (human_tokens(self.trigger_limit() or 0),
+                        now - self.threshold_crossed_at, int(after_sec)))
         return ("interrupt", "context is nearly full; interrupting the turn to fold it up")
 
     def note_growth(self, paths, now):
@@ -4538,6 +4673,30 @@ class Controller:
         self.log("unfolding from %s" % self.cfg["handoff_file"])
         return ("inject", self.resume_text, self._take_dismiss())
 
+    def _record_fold_cost(self, now):
+        """What this fold actually cost -- tokens when the handoff was accepted
+        minus tokens when it was asked for -- logged and accumulated in
+        codex_folds_file (T22), so CR_CODEX_RESERVE_TOKENS can be judged
+        against real folds rather than the one incident it was picked from.
+        """
+        cost = max(0, (self.context_tokens or 0) - (self.context_before or 0))
+        reserve = int(self.cfg.get("codex_reserve", 0) or 0)
+        self.log("the fold cost %s tokens (reserve %s)"
+                 % (human_tokens(cost), human_tokens(reserve)))
+        path = self._folds_path()
+        prior_max = _fold_history_max(path)
+        _append_fold_record(path, "codex", os.getcwd(), cost, now)
+        self._observed_fold_cost = max(prior_max, cost)
+        if reserve and cost > 0.8 * reserve:
+            self.log("the fold cost more than 80%% of the %s reserve; "
+                     "CR_CODEX_RESERVE_TOKENS could stand to be raised"
+                     % human_tokens(reserve))
+        if (self.cfg.get("codex_reserve_adapt")
+                and int(1.25 * self._observed_fold_cost) > reserve):
+            self.log("CR_CODEX_RESERVE_ADAPT: the effective reserve is now %s "
+                     "(1.25x the largest fold cost seen)"
+                     % human_tokens(self._effective_codex_reserve()))
+
     # -- the five layers ------------------------------------------------------ #
     def _check_handoff(self, now):
         """`/clear` goes out only when all five of these agree.
@@ -4574,6 +4733,8 @@ class Controller:
             self.rwake = now
             self.log("handoff accepted: %d bytes ending in %s, turn closed with end_turn"
                      % (st["size"], self.nonce))
+            if self.codex:
+                self._record_fold_cost(now)
             return self._send_clear(now)
         if self.restart_left <= 0:
             return self._abort_restart(
@@ -6509,6 +6670,7 @@ export CR_STALL_WAIT_SEC CR_STALL_BACKOFF CR_STALL_MAX_WAIT_SEC CR_STALL_MAX_ATT
 export CR_CONTEXT_PCT CR_CONTEXT_TOKENS CR_CONTEXT_WINDOW CR_CONTEXT_RESTART
 export CR_CODEX_CONTEXT_PCT CR_CODEX_CONTEXT_TOKENS
 export CR_CODEX_HOLD_COMPACT CR_CODEX_RESERVE_TOKENS CR_CODEX_INTERRUPT CR_CODEX_LOGS_DB
+export CR_CODEX_INTERRUPT_AFTER_SEC CR_CODEX_FOLDS_FILE CR_CODEX_RESERVE_ADAPT
 export CR_UPDATE_CHECK CR_UPDATE_REPO CR_UPDATE_URL CR_UPDATE_BREW_FORMULA
 export CR_UPDATE_CACHE CR_UPDATE_TTL_SEC CR_UPDATE_TIMEOUT_SEC CR_UPDATE_NOTICE_SEC
 export CR_VERSION CR_SELF
