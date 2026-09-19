@@ -154,6 +154,48 @@ class TestDegradation(unittest.TestCase):
         self.assertIn("fake-claude ready", r.stdout)
         self.assertTrue(self.supervised())
 
+    def wrapped(self, args):
+        """Launch with args, feed `quit` so a real session ends on its own,
+        and report whether the pty supervisor actually ran."""
+        r = subprocess.run([WRAP, *args], env={**clean_env(), **self.env(), "CR_NOTIFY": "0"},
+                           input="quit\n", capture_output=True, text=True, timeout=25)
+        return r, self.supervised()
+
+    def test_stop_subcommand_runs_directly(self):
+        # T07: `claude stop <id>` is a one-shot control command, not a session
+        # -- no TUI to type into, and the pty supervisor would sleep for
+        # CR_UPDATE_NOTICE_SEC and write start:/exit: to the log for nothing.
+        r = run(["stop", "abc"], env=self.env(), timeout=20)
+        self.assertIn("fake-claude ready", r.stdout)
+        self.assertFalse(self.supervised())
+
+    def test_mcp_subcommand_runs_directly(self):
+        r = run(["mcp", "list"], env=self.env(), timeout=20)
+        self.assertIn("fake-claude ready", r.stdout)
+        self.assertFalse(self.supervised())
+
+    def test_attach_is_still_wrapped(self):
+        # `attach` opens a real session, unlike the control commands above --
+        # it must stay wrapped.
+        r, started = self.wrapped(["attach", "abc"])
+        self.assertIn("fake-claude ready", r.stdout)
+        self.assertTrue(started)
+
+    def test_agents_roster_is_still_wrapped(self):
+        # `agents` is the TUI roster of OTHER sessions, handled inside the
+        # supervisor itself (T29) -- it must stay wrapped, not exec'd directly.
+        r, started = self.wrapped(["agents"])
+        self.assertIn("fake-claude ready", r.stdout)
+        self.assertTrue(started)
+
+    def test_a_prompt_that_names_a_subcommand_is_still_wrapped(self):
+        # The first positional word decides, and it must match exactly: a
+        # plain prompt is one argument, so it never equals "stop" outright
+        # even though it contains the word.
+        r, started = self.wrapped(["fix the stop command"])
+        self.assertIn("fake-claude ready", r.stdout)
+        self.assertTrue(started)
+
 
 class TestHowTheSupervisorIsHandedOver(unittest.TestCase):
     """The embedded Python is ~140KB, and Linux caps a single argument at 128KB.
