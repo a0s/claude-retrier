@@ -79,16 +79,35 @@ def _fake_bin(agent):
     return path
 
 
+def _is_zombie(pid):
+    try:
+        out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                              capture_output=True, text=True)
+    except OSError:
+        return False
+    return out.stdout.strip().startswith("Z")
+
+
 def _descendant_pids(pid):
-    """Every pid under `pid`, however many `setsid()` calls put distance
-    between them — `pgrep -P` walks one generation at a time regardless."""
+    """Every live pid under `pid`, however many `setsid()` calls put distance
+    between them — `pgrep -P` walks one generation at a time regardless.
+
+    Zombies are excluded: the wrapper's own hand-off to python (`exec ... 3<
+    <(printf ...)`, at the end of `claude-retrier.sh`) forks a bash to feed that
+    process substitution, which becomes a direct, unreaped child of the
+    supervisor the moment it exits — a lower pid than the real agent, since it
+    forked first, and `pgrep` lists it right alongside. Left in, it is what
+    `agent_pid()` finds instead of the agent (reproduced on Linux, where it
+    lingers long enough to be seen; not exercised the same way on macOS).
+    """
     try:
         out = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
     except OSError:
         return []
     children = [int(p) for p in out.stdout.split() if p.strip()]
-    pids = list(children)
-    for child in children:
+    live = [c for c in children if not _is_zombie(c)]
+    pids = list(live)
+    for child in live:
         pids.extend(_descendant_pids(child))
     return pids
 

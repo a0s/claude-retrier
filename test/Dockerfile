@@ -11,8 +11,11 @@ FROM debian:12-slim
 
 # zsh is not optional here — half the alias tests are about it, and skipping them
 # silently is how a Linux-only alias bug would ship.
+# procps: test/helper.py walks a wrapper's descendants with pgrep -P, which
+# Debian slim does not ship by default -- without it the lookup fails silently
+# (an OSError caught and swallowed) and every pid-dependent assertion sees None.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends python3 bash zsh ca-certificates \
+ && apt-get install -y --no-install-recommends python3 bash zsh ca-certificates procps \
  && rm -rf /var/lib/apt/lists/*
 
 # A non-root user: root's HOME and permissions hide the very mistakes (rc files
