@@ -226,6 +226,13 @@ class TestClaudeLaunchArgsAddTheStatuslineProxy(unittest.TestCase):
         self.assertEqual(
             cr.claude_launch_args(self.cfg(), "claude", ["--settings={}"]), [])
 
+    def test_attach_keeps_its_command_position(self):
+        # In current Claude Code, `claude --settings '{}' attach ID` starts a
+        # prompt instead of the attach command.  The proxy flag cannot go after
+        # the subcommand either, so do not inject it for this launch shape.
+        self.assertEqual(
+            cr.claude_launch_args(self.cfg(), "claude", ["attach", "session-id"]), [])
+
     def test_the_path_is_named_after_the_given_pid(self):
         args = cr.claude_launch_args(self.cfg(), "claude", [], pid=999)
         payload = json.loads(args[1])

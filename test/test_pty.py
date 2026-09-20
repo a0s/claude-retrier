@@ -154,6 +154,14 @@ class TestTransparency(PtyTestCase):
         s = self.session(args=["--model", "opus", "--verbose"])
         self.assertTrue(s.read_until("argv=--model opus --verbose"))
 
+    def test_attach_arguments_are_not_preceded_by_statusline_settings(self):
+        # Claude parses a prepended --settings as the start of a normal launch,
+        # not an `attach` subcommand.  Keep the user vector intact even while a
+        # context restart would ordinarily enable the statusline proxy.
+        s = self.session(env={"CR_CONTEXT_TOKENS": "135200"},
+                         args=["attach", "session-id"])
+        self.assertTrue(s.read_until("argv=attach session-id"), s.buf)
+
     def test_terminal_size_is_propagated(self):
         s = self.session(rows=40, cols=120)
         self.assertTrue(s.read_until("winsize 120x40"))

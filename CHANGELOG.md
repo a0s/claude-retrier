@@ -7,6 +7,15 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [2.0.1] - 2026-09-20
+
+### Fixed
+- `claude-retrier attach <id>` could start a new prompt instead of attaching
+  to the named background session whenever context restart was armed. The
+  statusline proxy added `--settings` before `attach`, but current Claude Code
+  only recognizes that subcommand as the first token. Attach launches now keep
+  their original argument vector; the statusline proxy is skipped for them.
+
 ## [2.0.0] - 2026-09-19
 
 **Breaking:** `CR_CONTEXT_PCT` and `CR_CODEX_CONTEXT_PCT` are removed. A

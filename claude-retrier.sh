@@ -79,7 +79,7 @@
 
 set -u
 
-CR_VERSION="2.0.0"
+CR_VERSION="2.0.1"
 # Which copy of this file is running. The update notice prints the command
 # that updates THIS one, and `brew upgrade` at someone running a git clone
 # would be advice that does nothing.
@@ -2520,6 +2520,12 @@ def claude_launch_args(cfg, agent, argv, pid=None):
         return []                    # nothing needs the window signal yet
     if any(a == "--settings" or a.startswith("--settings=") for a in (argv or [])):
         return []                    # the user's own flag always wins
+    if is_attach_launch(argv):
+        # Claude's `attach` command must be its first token.  A global
+        # `--settings` before it makes recent Claude Code builds treat `attach`
+        # and its session id as a prompt instead, so retaining the command's
+        # semantics is more important than observing its status line.
+        return []
     raw_self = os.environ.get("CR_SELF") or ""
     self_path = os.path.realpath(raw_self) if raw_self else "claude-retrier"
     status_path = os.path.join(cfg["status_dir"],
@@ -6261,6 +6267,15 @@ def is_roster_launch(argv):
         if arg.startswith("-"):
             continue
         return arg == "agents"
+    return False
+
+
+def is_attach_launch(argv):
+    """Does argv start Claude's interactive background-session attachment?"""
+    for arg in argv or []:
+        if arg.startswith("-"):
+            continue
+        return arg == "attach"
     return False
 
 
