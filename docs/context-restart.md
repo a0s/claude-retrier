@@ -191,7 +191,13 @@ turn rows instead — see [codex](codex.md#how-it-differs-from-claude-underneath
 
 If any of them is missing the wrapper asks for the fold again, and then gives
 up. What giving up means depends on whether the fold phrase ever reached the
-session. If its echo was never seen, nothing was told to the model, and giving
+session. That is proven either by its echo in the transcript or by the handoff
+file ending with this attempt's marker — the marker was typed into this terminal
+and nowhere else, so a file carrying it is the model's answer. (A phrase typed
+while a turn is still running is queued by Claude Code and written as a
+`queued_command` row rather than an ordinary user row; the wrapper reads both,
+and does not retype a phrase it can see waiting in that queue.) If neither was
+ever seen, nothing was told to the model, and giving
 up really does leave the session untouched — it can still fall back on Claude
 Code's own compaction, a far better outcome than a history thrown away on a
 promise. But once the phrase was delivered, the model has already been told to

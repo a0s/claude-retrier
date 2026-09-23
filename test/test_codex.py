@@ -858,10 +858,11 @@ class TestACodexRestart(unittest.TestCase):
         feed(ctl, 31, turn="open", window=WINDOW)
         ctl.handoff.write(ctl, at=40)
         feed(ctl, 41, turn="closed", stop_reason="aborted")
-        action = ctl.tick(70)
-        self.assertEqual(action[0], "notify")
-        self.assertIn("stop_reason=aborted", action[1])
-        self.assertIsNone(ctl.rstate)
+        # The file carries this attempt's marker, so the phrase was delivered
+        # and the abort owes the model a cancel (T09), not a plain notify.
+        self.assertIsNone(ctl.tick(70))
+        self.assertIn("stop_reason=aborted", ctl.log_lines[-1])
+        self.assertEqual(ctl.rstate, cr.CANCEL_PENDING)
 
     def test_a_new_rollout_forgets_the_old_turn(self):
         ctl = codex_controller(codex_context_tokens=135200)

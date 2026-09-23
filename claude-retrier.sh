@@ -79,7 +79,7 @@
 
 set -u
 
-CR_VERSION="2.0.1"
+CR_VERSION="2.0.2"
 # Which copy of this file is running. The update notice prints the command
 # that updates THIS one, and `brew upgrade` at someone running a git clone
 # would be advice that does nothing.
@@ -1428,6 +1428,14 @@ def transcript_limit_records(path, offset=0, echo=None):
     know until it is too late: how many tokens the context actually held right
     before claude decided on its own that it was full.
 
+    A message typed while a turn is still running never gets that user row:
+    Claude Code queues it, logs a `queue-operation` "enqueue" row, and later
+    hands it to the model as an `attachment` row of type `queued_command`
+    (mid-turn, or once the turn ends). The attachment is the same proof the
+    user row is and comes back as an "echo"; the enqueue row only says the
+    message is waiting — it can still be pulled back out of the queue — and
+    comes back as its own kind, "queued".
+
     Consecutive assistant rows collapse into one: a single answer can be a dozen
     of them, and the caller only needs the fact. A `compact_boundary` row never
     joins that collapse in either direction — merging it into a neighbour would
@@ -1439,7 +1447,8 @@ def transcript_limit_records(path, offset=0, echo=None):
     new_offset, rows = _appended(path, offset)
     for raw in rows:
         limitish = b"rate_limit" in raw or b"isApiErrorMessage" in raw
-        echoish = b'"user"' in raw and any(k in raw for k in echo_keys)
+        echoish = ((b'"user"' in raw or b"queued_command" in raw or b"queue-operation" in raw)
+                   and any(k in raw for k in echo_keys))
         modelish = b"local-command-stdout" in raw and b"Set model to" in raw
         # Prefilters only — all four can match on a tool result that merely
         # quotes the words, so the row's own "type" decides below.
@@ -1456,6 +1465,17 @@ def transcript_limit_records(path, offset=0, echo=None):
             out.append(dict(kind="alive", ts=rec.get("timestamp"), quiet=True,
                             compacted=True, sidechain=False,
                             pre_tokens=int(pre) if isinstance(pre, (int, float)) else None))
+            continue
+        if echoish and rec.get("type") in ("attachment", "queue-operation"):
+            att = rec.get("attachment") if rec.get("type") == "attachment" else None
+            if isinstance(att, dict) and att.get("type") == "queued_command":
+                queued = att.get("prompt")
+                if isinstance(queued, str) and queued.strip() in echoes:
+                    out.append(dict(kind="echo", text=queued.strip(), ts=rec.get("timestamp")))
+            elif rec.get("type") == "queue-operation" and rec.get("operation") == "enqueue":
+                queued = rec.get("content")
+                if isinstance(queued, str) and queued.strip() in echoes:
+                    out.append(dict(kind="queued", text=queued.strip(), ts=rec.get("timestamp")))
             continue
         if not rec.get("isApiErrorMessage"):
             text = (record_text(rec)
@@ -3521,6 +3541,7 @@ class Controller:
         self.resume_echoed = False
         self.handoff_text = None      # the exact fold phrase last sent, nonce and all
         self.handoff_echoed = False   # that phrase, seen echoed back in a transcript
+        self.handoff_queued = False   # ...or at least seen waiting in claude's queue
         self.handoff_echo_retries = 0 # retypes for want of an echo, not for a bad file
         self.last_output_at = 0.0     # last byte of any kind read from the pty
         self.clear_sent_at = 0.0      # when the current /clear (or its one reprint) went out
@@ -4515,6 +4536,19 @@ class Controller:
             self.bind_transcript(path, "our handoff phrase was echoed there", now)
         return True
 
+    def on_handoff_queued(self, now):
+        """claude queued the fold phrase behind a turn still running.
+
+        Not yet proof it was delivered -- a queued message can still be pulled
+        back out -- but proof enough that retyping it would only stack a second
+        phrase, with a second marker, behind the first.
+        """
+        if self.rstate != HANDOFF_SENT or self.handoff_queued:
+            return False
+        self.log("the handoff phrase is queued behind the running turn")
+        self.handoff_queued = True
+        return True
+
     # -- what the badge shows ----------------------------------------------- #
     def badge_context(self):
         """The context percentage worth putting on screen, or None.
@@ -4890,6 +4924,7 @@ class Controller:
         # transcript belongs to whichever attempt came before.
         self.handoff_text = text
         self.handoff_echoed = False
+        self.handoff_queued = False
         self.log("asking for a handoff into %s (attempt %d/%d, marker %s)"
                  % (self.cfg["handoff_file"], self.handoff_tries,
                     self.cfg["handoff_attempts"], self.nonce))
@@ -4982,22 +5017,28 @@ class Controller:
 
         The model saying it is done is not one of them. It is a report about its
         own intent, and the failure this guards against is precisely the one
-        where that intent was sincere and the file is still half a page. Nor is
-        a file that merely looks right: without the echo, it could just as
-        easily have been left by a neighbouring session (T06) — the nonce
-        proves which attempt wrote it, but only the echo proves it was typed
-        into THIS session at all.
+        where that intent was sincere and the file is still half a page.
+
+        That the phrase reached this session (T06) is proven either by its echo
+        or by the file itself ending with this attempt's marker: the marker is
+        fresh per attempt and typed only into this terminal, so no neighbour's
+        file can carry it. Waiting on the echo alone once hung a restart for
+        good -- Claude Code wrote a phrase queued mid-turn as a row the echo
+        check did not know, the file came out perfect, and `/clear` never went.
         """
         busy = self._session_busy(now)
         st = self.probe(self.handoff_path)
+        if not self.handoff_echoed and self._carries_nonce(st):
+            # The marker is fresh for this attempt and was only ever typed into
+            # this terminal, so a file that ends with it is the model's answer to
+            # it: the phrase got through even if its echo was never recognised
+            # (Claude Code's rows for a message queued mid-turn look nothing like
+            # the ordinary user row). A neighbour's file cannot carry it.
+            self.handoff_echoed = True
+            self.log("the handoff file ends with %s: the phrase reached the session"
+                     % self.nonce)
         fault = self._handoff_fault(st)
         if fault is None:
-            if not self.handoff_echoed:
-                # Everything about the file checks out, but the one thing that
-                # says the phrase ever reached this session has not shown up
-                # yet. Wait for it rather than clear on the strength of a file
-                # that, on its own, could belong to somebody else entirely.
-                return None
             # Latch here rather than wait for `busy` to clear: background
             # activity (an agent's notification, notify_idle, a hook) can start
             # a new turn once the fold's end_turn already landed, and that turn
@@ -5019,7 +5060,7 @@ class Controller:
             return self._abort_restart(
                 "no usable handoff within %.0fs: %s"
                 % (self.cfg["handoff_timeout"], fault or busy), now)
-        if (not self.handoff_echoed and st is None
+        if (not self.handoff_echoed and not self.handoff_queued and st is None
                 and now - self.handoff_sent_at >= self.cfg["verify"]):
             # Nothing at all came of it: no echo, no file. A popup that ate the
             # keystrokes and a lost write look identical from here, and both are
@@ -5032,9 +5073,9 @@ class Controller:
             self.log("the handoff phrase left no trace; sending it again (%d/%d)"
                      % (self.handoff_echo_retries, self.HANDOFF_ECHO_RETRIES))
             return self._send_handoff(now, fresh=False)
-        if busy or fault is None:
-            # Still writing, or written and the model kept going anyway. Either
-            # way the answer is to wait, and the timeout above is the bound.
+        if busy:
+            # Still writing. The answer is to wait, and the timeout above is
+            # the bound -- as it is for every other wait in this step.
             return None
         if self.last_stop_reason in (None, "tool_use", "pause_turn"):
             return None                  # the turn has not landed yet
@@ -5045,6 +5086,13 @@ class Controller:
         if self.handoff_tries >= self.cfg["handoff_attempts"]:
             return self._abort_restart(fault, now)
         return self._send_handoff(now, fresh=True)
+
+    def _carries_nonce(self, st):
+        """The file was written after this attempt's request and ends with its marker."""
+        return (st is not None and bool(self.nonce)
+                and st["mtime"] >= self.handoff_sent_at - self.MTIME_SLACK
+                and re.search(r"(?:\A|\n)[ \t]*%s\Z" % re.escape(self.nonce),
+                              st["tail"].rstrip()) is not None)
 
     def _handoff_fault(self, st):
         """Which layer is not satisfied, in words, or None when all of them are.
@@ -5231,6 +5279,7 @@ class Controller:
         self.resume_echoed = False
         self.handoff_text = None
         self.handoff_echoed = False
+        self.handoff_queued = False
         self.context_before = 0
         self._restart_tick = None
         self._rearm = False
@@ -6702,6 +6751,10 @@ def main(argv):
             ctl.on_candidates(len(watcher.candidates) > 1 and not watcher.confirmed
                               and not watcher.bound_session_id, now)
             for rec in recs:
+                if rec.get("kind") == "queued":
+                    if ctl.handoff_text and rec.get("text") == ctl.handoff_text:
+                        ctl.on_handoff_queued(now)
+                    continue
                 if rec.get("kind") == "echo":
                     # The fold phrase's nonce is unique machine-wide, so its
                     # echo is definitive proof of identity on its own (T06) —

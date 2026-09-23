@@ -1073,6 +1073,13 @@ class TestNothingIsClearedOnAPromise(RestartTestCase):
         usage(ctl, 70, FULL)
         return self.tick(ctl, 95)
 
+    def assertCancelledFor(self, ctl, action, why):
+        """A file carrying this attempt's marker proves the phrase was delivered,
+        so the abort owes the model a cancel (T09) rather than a plain notify."""
+        self.assertIsNone(action)
+        self.assertEqual(ctl.rstate, cr.CANCEL_PENDING)
+        self.assertIn(why, ctl.log_lines[-1])
+
     def test_a_file_that_was_never_written(self):
         ctl = self.failing()
         usage(ctl, 40, FULL)
@@ -1092,7 +1099,7 @@ class TestNothingIsClearedOnAPromise(RestartTestCase):
         self.tick(ctl, 65)
         ctl.handoff.write(ctl, at=70, body="", size=8)
         action = self.second_attempt_then_abort(ctl)
-        self.assertIn("byte floor", action[1])
+        self.assertCancelledFor(ctl, action, "byte floor")
         self.assertNeverCleared()
 
     def test_a_file_that_stops_before_the_marker(self):
@@ -1126,9 +1133,7 @@ class TestNothingIsClearedOnAPromise(RestartTestCase):
         self.tick(ctl, 65)
         ctl.handoff.write(ctl, at=70)
         usage(ctl, 70, FULL, stop="max_tokens")
-        action = self.tick(ctl, 95)
-        self.assertEqual(action[0], "notify")
-        self.assertIn("max_tokens", action[1])
+        self.assertCancelledFor(ctl, self.tick(ctl, 95), "max_tokens")
         self.assertNeverCleared()
 
     def test_a_turn_that_was_refused(self):
@@ -1138,7 +1143,7 @@ class TestNothingIsClearedOnAPromise(RestartTestCase):
         self.tick(ctl, 65)
         ctl.handoff.write(ctl, at=70)
         usage(ctl, 70, FULL, stop="refusal")
-        self.assertIn("refusal", self.tick(ctl, 95)[1])
+        self.assertCancelledFor(ctl, self.tick(ctl, 95), "refusal")
         self.assertNeverCleared()
 
     def test_a_session_that_kept_working_is_waited_for_not_cleared(self):
@@ -1239,16 +1244,49 @@ class TestTheHandoffPhraseHasToHaveLanded(RestartTestCase):
         self.assertEqual(ctl.context_path, other)
         self.assertIn("was echoed there", ctl.log_lines[-1])
 
-    def test_a_valid_looking_file_does_not_clear_before_the_echo_does(self):
+    def test_a_file_ending_with_this_attempts_marker_proves_delivery(self):
+        # The echo can go unrecognised (a phrase queued mid-turn is written as
+        # a row of its own), but the marker was typed into this terminal only:
+        # a file ending with it is the answer to it. Waiting on the echo here
+        # once left a restart hanging forever on a perfect handoff.
         ctl = restart_controller()
         self.fold(ctl, echo=False)
         self.folded(ctl, written_at=40)
-        self.assertIsNone(self.tick(ctl, 65))            # every other layer agrees...
-        self.assertFalse(ctl.handoff_echoed)              # ...but this one hasn't
+        self.assertEqual(self.tick(ctl, 65), ("inject", "/clear", False))
+        self.assertTrue(ctl.handoff_echoed)
+        self.assertTrue(any("the phrase reached the session" in l for l in ctl.log_lines))
+
+    def test_a_file_ending_with_a_previous_marker_proves_nothing(self):
+        ctl = restart_controller()
+        self.fold(ctl, echo=False)
+        ctl.handoff.write(ctl, at=40)
+        ctl.nonce = "HANDOFF-00000000"                  # as if a later attempt were out
+        usage(ctl, 40, FULL)
+        self.tick(ctl, 65)
+        self.assertFalse(ctl.handoff_echoed)
         self.assertNeverCleared()
 
-        self.assertTrue(ctl.on_handoff_echo(MINE, 66))
-        self.assertEqual(self.tick(ctl, 67), ("inject", "/clear", False))
+    def test_a_queued_phrase_is_not_retyped(self):
+        # Retyping a phrase that is only waiting in claude's queue stacks a
+        # second marker behind the first and makes the model write it twice.
+        ctl = restart_controller()
+        self.fold(ctl, echo=False)
+        self.assertTrue(ctl.on_handoff_queued(31))
+        self.assertIn("queued behind the running turn", ctl.log_lines[-1])
+        self.assertIsNone(self.tick(ctl, 90))            # past CR_VERIFY_SEC
+        self.assertIsNone(self.tick(ctl, 150))
+        self.assertEqual(ctl.handoff_echo_retries, 0)
+        self.assertEqual(len(self.injected()), 1)
+
+    def test_a_queued_phrase_still_answers_to_the_timeout(self):
+        ctl = restart_controller(handoff_timeout=120)
+        self.fold(ctl, echo=False)
+        ctl.on_handoff_queued(31)
+        action = self.tick(ctl, 400)
+        self.assertEqual(action[0], "notify")
+        self.assertIn("never written", action[1])
+        self.assertIsNone(ctl.rstate)
+        self.assertNeverCleared()
 
 
 class TestTheClearHasToHaveWorked(RestartTestCase):

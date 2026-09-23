@@ -696,6 +696,43 @@ class TestSeveralEchoes(unittest.TestCase):
             fh.write(json.dumps(user_row(msg), ensure_ascii=False) + "\n")
         self.assertEqual([r["kind"] for r in w.poll_now()], ["echo"])
 
+    # A phrase typed while a turn is still running, exactly as Claude Code
+    # 2.1.280 wrote one into a live transcript: never a user row, only the
+    # queue's own bookkeeping and then an attachment handed to the model.
+    QUEUED = ("Wrap up now. Write a complete handoff — the very last line must "
+              "be exactly HANDOFF-759560d5 and nothing else.")
+
+    def write_raw(self, rec):
+        with open(os.path.join(self.dir, "s.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def test_a_queued_phrase_is_reported_as_queued_then_echoed(self):
+        w = cr.TranscriptWatcher(self.dir, poll=0, echo=[self.QUEUED])
+        self.write_raw({"type": "queue-operation", "operation": "enqueue",
+                        "timestamp": "2026-09-23T12:31:25.298Z", "content": self.QUEUED})
+        found = w.poll_now()
+        self.assertEqual([r["kind"] for r in found], ["queued"])
+        self.assertEqual(found[0]["text"], self.QUEUED)
+        self.write_raw({"type": "queue-operation", "operation": "remove",
+                        "timestamp": "2026-09-23T12:31:29.731Z", "content": self.QUEUED,
+                        "reason": "absorbed_mid_turn"})
+        self.write_raw({"parentUuid": "ee8994fa", "isSidechain": False, "type": "attachment",
+                        "attachment": {"type": "queued_command", "prompt": self.QUEUED,
+                                       "commandMode": "prompt", "origin": {"kind": "human"},
+                                       "humanTurn": True},
+                        "timestamp": "2026-09-23T12:31:29.731Z"})
+        found = w.poll_now()
+        self.assertEqual([r["kind"] for r in found], ["echo"])
+        self.assertEqual(found[0]["text"], self.QUEUED)
+
+    def test_someone_elses_queued_message_is_not_ours(self):
+        w = cr.TranscriptWatcher(self.dir, poll=0, echo=[self.QUEUED])
+        self.write_raw({"type": "queue-operation", "operation": "enqueue",
+                        "content": "something else entirely"})
+        self.write_raw({"type": "attachment",
+                        "attachment": {"type": "queued_command", "prompt": "something else"}})
+        self.assertEqual(w.poll_now(), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

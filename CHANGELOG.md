@@ -7,6 +7,27 @@ of this file, so a release cannot describe itself differently from here.
 The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [2.0.2] - 2026-09-23
+
+### Fixed
+- A context restart could hang for good after a perfect handoff. When the
+  fold phrase was typed while a turn was still running, Claude Code queued
+  it and wrote it into the transcript as a `queued_command` attachment
+  rather than an ordinary user row; the wrapper never recognised that as
+  the phrase arriving, retyped it twice (making the model rewrite the
+  handoff each time), and then waited on that recognition with no timeout,
+  so `/clear` never went out. Now:
+  - a handoff file that ends with the current attempt's marker is itself
+    proof the phrase reached the session — the marker is fresh per attempt
+    and typed into this terminal only;
+  - a `queued_command` row counts as the phrase being delivered, and a
+    phrase seen waiting in Claude Code's queue is not retyped;
+  - every wait in the handoff step is bounded by `CR_HANDOFF_TIMEOUT_SEC`.
+- Because a marked file proves the model was told to wrap up, an abort
+  after one (the turn cut off at `max_tokens`, refused, or a file under
+  `CR_HANDOFF_MIN_BYTES`) now sends `CR_CANCEL_MSG` instead of leaving the
+  session on that instruction.
+
 ## [2.0.1] - 2026-09-20
 
 ### Fixed
