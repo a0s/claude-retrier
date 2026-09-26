@@ -343,7 +343,7 @@ def _lighten(rgb, amount):
 # no system fallback search the way Terminal.app has. Drawing these few
 # characters as simple vector shapes sidesteps font coverage entirely, so the
 # GIF looks right regardless of what is installed.
-VECTOR_GLYPHS = set("⏺●∙·◆◇▪■✦"
+VECTOR_GLYPHS = set("⏺●∙·◆◇▪■✦⏵⎿※"
                      "✣✳✶✷✸✹✺✻✽")
 
 
@@ -359,6 +359,18 @@ def draw_vector_glyph(draw, ch, x0, y0, cell_w, cell_h, color):
         draw.polygon([(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)], fill=color)
     elif ch == "◇":                               # outline diamond: ◇
         draw.polygon([(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)], outline=color)
+    elif ch == "⏵":                               # play triangle: ⏵ (accept edits on)
+        draw.polygon([(cx - r * 0.7, cy - r), (cx + r, cy), (cx - r * 0.7, cy + r)], fill=color)
+    elif ch == "⎿":                               # tool-result corner: ⎿
+        x = x0 + cell_w * 0.35
+        draw.line([x, y0, x, cy], fill=color, width=1)
+        draw.line([x, cy, x0 + cell_w, cy], fill=color, width=1)
+    elif ch == "※":                               # reference mark: ※ (notices)
+        draw.line([cx - r, cy - r, cx + r, cy + r], fill=color, width=1)
+        draw.line([cx - r, cy + r, cx + r, cy - r], fill=color, width=1)
+        d = r * 0.18
+        for px, py in ((cx, cy - r), (cx, cy + r), (cx - r, cy), (cx + r, cy)):
+            draw.ellipse([px - d, py - d, px + d, py + d], fill=color)
     elif ch in "▪■":                          # filled square: ▪ ■
         draw.rectangle([cx - r, cy - r, cx + r, cy + r], fill=color)
     else:                                                # the spinner family: ✦✣✳✶✷✸✹✺✻✽

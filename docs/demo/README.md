@@ -20,7 +20,7 @@ python3 docs/demo/record.py codex  docs/demo/codex-restart.cast
 
 # 2. cut the waiting out and render
 python3 docs/demo/cast2gif.py docs/demo/claude-restart.cast \
-        docs/demo/claude-restart.gif --title 'agent-retrier: context restart' --trim 0:149.9
+        docs/demo/claude-restart.gif --title 'agent-retrier: context restart' --trim 0:127.9
 ```
 
 **codex-restart.gif is not recorded yet.** `record.py codex` was written
