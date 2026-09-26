@@ -1,6 +1,6 @@
 <p align="center">
   <img src="docs/banner.webp" width="900"
-       alt="A laptop at night showing 'limit reached - resets 3pm', and below it the wrapper typing 'continue'">
+       alt="A retrowave desk at night: the monitor shows a session log, then 'limit reached - resets 3pm', and below it the wrapper typing 'continue'">
 </p>
 
 # agent-retrier
