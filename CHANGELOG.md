@@ -7,7 +7,7 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
-## [4.0.0] - 2026-09-26
+## [3.0.1] - 2026-09-26
 
 ### Changed
 - One name, a flag per agent. `agent-retrier --claude` and
