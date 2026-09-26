@@ -5,8 +5,8 @@ Priority: P0 · Epic: F · Depends on: T27 · Size: M
 ## Problem
 
 T27 added a second, independent way to paint over someone else's TUI
-(`AgentOverlay._paint_row`, claude-retrier.sh:4269), almost verbatim
-duplicating what `Badge` (class, claude-retrier.sh:3588) has done since 2023:
+(`AgentOverlay._paint_row`, agent-retrier.sh:4269), almost verbatim
+duplicating what `Badge` (class, agent-retrier.sh:3588) has done since 2023:
 `DECSC → CUP → SGR → text → SGR reset → DECRC`, never touching the last
 column, and padding with spaces to the old (wider) width so that shrinking
 text erases the tail of the previous text. The two places with the same
@@ -21,7 +21,7 @@ is demonstrably dangerous, not merely hypothetical.
 
 In addition to duplicating the arithmetic, the two paths are coordinated only
 manually: `AgentOverlay.paint()` receives `badge_row` as a parameter
-(claude-retrier.sh:4608-4609) and manually excludes that row, while `Badge`
+(agent-retrier.sh:4608-4609) and manually excludes that row, while `Badge`
 knows nothing about the subagent tree and checks nothing — it merely happened
 to be the only one before T27. Centralization removes both the duplicated
 arithmetic and the manual coordination where “one side knows the other by

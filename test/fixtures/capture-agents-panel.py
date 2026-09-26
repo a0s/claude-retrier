@@ -9,7 +9,7 @@ investigation on 2.1.273 established these are NOT two ways to the same
 place -- the left arrow (plain and application-cursor-key encodings, in both
 the default and "manual" permission mode) backgrounds the whole conversation
 and opens the CROSS-SESSION roster (other, unrelated sessions' titles and
-summaries), exactly the screen CR_ROSTER_PATTERNS in claude-retrier.sh exists
+summaries), exactly the screen CR_ROSTER_PATTERNS in agent-retrier.sh exists
 to never scrape. /tasks is the confirmed, safe way to this session's OWN
 subagent panel, which is what this driver uses.
 
@@ -49,7 +49,7 @@ PROMPT = (
 
 # Substrings that mean "this is the cross-session roster / background view,
 # not this session's own subagent panel" -- the same shape CR_ROSTER_PATTERNS
-# in claude-retrier.sh refuses to scrape.
+# in agent-retrier.sh refuses to scrape.
 ROSTER_SIGNS = (
     b"awaiting input", b"describe a task for a new session",
     b"moved to the background", b"ctrl+x to delete",
@@ -73,7 +73,7 @@ def main():
 
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("CLAUDE_CODE_") and not k.startswith("CR_")
-           and k != "CLAUDE_RETRIER_ACTIVE"}
+           and k != "AGENT_RETRIER_ACTIVE"}
     env["TERM"] = "xterm-256color"
     env["COLUMNS"] = str(COLS)
     env["LINES"] = str(ROWS)

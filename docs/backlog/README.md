@@ -1,13 +1,13 @@
 # Backlog: context restart, session identity, models
 
-Compiled on 2026-09-18 following a full audit of `claude-retrier.sh` (1.11.0 +
-4 unreleased commits), `~/.claude-retrier/log`, real transcripts from
+Compiled on 2026-09-18 following a full audit of `agent-retrier.sh` (1.11.0 +
+4 unreleased commits), `~/.agent-retrier/log`, real transcripts from
 Claude Code 2.1.273, and codex-cli 0.154 rollout files.
 
 Each task is a separate `T##-*.md` file with the sections “Problem / Evidence /
 What to do / Acceptance criteria / Where in the code”. A task is considered
 complete only when **all** AC items are satisfied and `./test/run.sh` passes.
-After modifying `claude-retrier.sh`, always run `./test/codegraph-sync.sh` (see
+After modifying `agent-retrier.sh`, always run `./test/codegraph-sync.sh` (see
 `CLAUDE.md`).
 
 ## Logical model (how it should work)

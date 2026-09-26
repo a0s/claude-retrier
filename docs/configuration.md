@@ -58,7 +58,7 @@ resolves, so you never have to guess one.
 
 ## Minimal configs
 
-**Nothing at all** is a working config: `claude-retrier` and `codex-retrier`
+**Nothing at all** is a working config: `agent-retrier` and `codex-retrier`
 wait out usage limits and nudge refused turns out of the box. The context
 restart is the one feature that is off until you ask for it, because it clears
 a session's history.
@@ -68,7 +68,7 @@ copy:
 
 ```sh
 export CR_CONTEXT_RESTART=1
-export CR_HANDOFF_FILE='.claude-retrier/handoff-{id}.md'
+export CR_HANDOFF_FILE='.agent-retrier/handoff-{id}.md'
 ```
 
 `CR_CONTEXT_RESTART=1` arms the restart without making you pick a number: each
@@ -77,14 +77,14 @@ agent uses its own row in the [model profile table](context-restart.md#the-conte
 — which is exactly the point, because the right number is not the same one on
 both. `{id}` gives every session its own handoff path, so a claude and a codex
 session running side by side in the same directory can never write over each
-other. Add `.claude-retrier/` to `.gitignore` and that is the setup.
+other. Add `.agent-retrier/` to `.gitignore` and that is the setup.
 
 **Pick the numbers yourself** instead:
 
 ```sh
 export CR_CONTEXT_TOKENS=500k         # claude: this many tokens, exactly
 export CR_CODEX_CONTEXT_TOKENS=190k   # codex: its own number — never inherited from claude's
-export CR_HANDOFF_FILE='.claude-retrier/handoff-{id}.md'
+export CR_HANDOFF_FILE='.agent-retrier/handoff-{id}.md'
 ```
 
 **One phrase, both agents**, when the handoff should go through a skill of
@@ -165,9 +165,9 @@ Resolved most specific first — the full order is in
 | variable | default | applies to | |
 |---|---|---|---|
 | `CR_STATUSLINE_PROXY` | `1` | claude | `0` disables the statusline proxy — no `--settings` is added to claude's launch, and `[1m]` vs 200k falls back to the profile table; see [the statusline proxy](context-restart.md#1m-vs-200k-the-statusline-proxy) |
-| `CR_STATUS_DIR` | `~/.claude-retrier/status` | claude | where `--cr-statusline` writes what claude's own statusline reports, one file per wrapper pid |
+| `CR_STATUS_DIR` | `~/.agent-retrier/status` | claude | where `--cr-statusline` writes what claude's own statusline reports, one file per wrapper pid |
 | `CR_MODEL_LOOKUP` | `1` | both | look an unfamiliar model up; `0` never touches the network |
-| `CR_MODEL_CACHE` | `~/.claude-retrier/windows.json` | both | what the lookup learned |
+| `CR_MODEL_CACHE` | `~/.agent-retrier/windows.json` | both | what the lookup learned |
 | `CR_MODEL_CACHE_TTL_SEC` | `604800` | both | a week |
 
 ### The handoff file and the phrases
@@ -178,8 +178,8 @@ next to it. Set the shared one and both agents use it; set
 
 | variable | default | applies to | |
 |---|---|---|---|
-| `CR_HANDOFF_FILE` | `.claude-retrier/handoff.md` | both | where the fold is written; `{id}` makes it unique per session |
-| `CR_HANDOFF_REGISTRY_DIR` | `~/.claude-retrier/sessions` | both | where wrapper instances claim their handoff path, so two sharing an `{id}`-free `CR_HANDOFF_FILE` do not overwrite each other (T05) |
+| `CR_HANDOFF_FILE` | `.agent-retrier/handoff.md` | both | where the fold is written; `{id}` makes it unique per session |
+| `CR_HANDOFF_REGISTRY_DIR` | `~/.agent-retrier/sessions` | both | where wrapper instances claim their handoff path, so two sharing an `{id}`-free `CR_HANDOFF_FILE` do not overwrite each other (T05) |
 | `CR_HANDOFF_MSG` | (see `--cr-help`) | both | the folding phrase; `{file}`, `{marker}` |
 | `CR_RESUME_MSG` | ``Read `{file}` and continue from it.`` | both | the unfolding phrase; `{file}` |
 | `CR_CANCEL_MSG` | (see `--cr-help`) | both | said instead of a plain "restart aborted" notice when the abort comes after the fold already reached the session (T09); `{file}` |
@@ -223,7 +223,7 @@ context restart is on.
 | `CR_CODEX_HOLD_COMPACT` | `1` | codex | start codex with its own compaction threshold moved out of the restart's way; `0` leaves it alone |
 | `CR_CODEX_RESERVE_TOKENS` | `64k` | codex | room kept under codex's compaction cap for the fold; the threshold never goes past it |
 | `CR_CODEX_RESERVE_ADAPT` | `0` | codex | `1` raises the effective reserve to 1.25× the largest fold ever recorded, instead of only recommending it |
-| `CR_CODEX_FOLDS_FILE` | `~/.claude-retrier/folds.json` | codex | where the cost of each fold is recorded, so the reserve can be judged against real ones |
+| `CR_CODEX_FOLDS_FILE` | `~/.agent-retrier/folds.json` | codex | where the cost of each fold is recorded, so the reserve can be judged against real ones |
 | `CR_CODEX_INTERRUPT` | `1` | codex | press Esc on a running turn that crosses the line; `0` = only restart between turns |
 | `CR_CODEX_INTERRUPT_AFTER_SEC` | `0` | codex | `0` = only interrupt at the cap-minus-reserve line; a number interrupts a turn that has sat past the ordinary threshold this many seconds |
 | `CR_CODEX_LOGS_DB` | newest `$CODEX_HOME/logs_*.sqlite` | codex | where codex logs the count its compaction is decided on |
@@ -239,7 +239,7 @@ More in [how-it-works.md](how-it-works.md#a-sign-of-life).
 | `CR_BADGE` | `1` | both | `0` hides the corner mark |
 | `CR_BADGE_POS` | `bottom-right` | both | also `bottom-left`, `top-right`, `top-left` |
 | `CR_BADGE_LABEL` | `cr` | both | the word next to the mark |
-| `CR_NOTIFY` | `1` | both | `0` stops the dim `[claude-retrier] …` lines being printed into the session |
+| `CR_NOTIFY` | `1` | both | `0` stops the dim `[agent-retrier] …` lines being printed into the session |
 | `CR_AGENTS_OVERLAY` | `0` | claude | `1` annotates Claude Code's subagent tree with each agent's model and effort (T27) |
 | `CR_AGENTS_POS` | `right` | claude | `right` \| `label` — where that annotation is drawn |
 | `CR_AGENTS_POLL_SEC` | `1.0` | claude | how often the subagent transcripts are re-read for it |
@@ -253,9 +253,9 @@ More in [how-it-works.md](how-it-works.md#updates).
 | `CR_UPDATE_CHECK` | `1` | both | `0` never checks for a newer release and never mentions it |
 | `CR_UPDATE_NOTICE_SEC` | `2` | both | how long the notice stays before the agent starts |
 | `CR_UPDATE_TTL_SEC` | `86400` | both | between checks |
-| `CR_UPDATE_CACHE` | `~/.claude-retrier/update.json` | both | |
-| `CR_UPDATE_REPO` | `a0s/claude-retrier` | both | whose releases to read |
-| `CR_UPDATE_BREW_FORMULA` | `a0s/claude-retrier/claude-retrier` | both | named in the brew command |
+| `CR_UPDATE_CACHE` | `~/.agent-retrier/update.json` | both | |
+| `CR_UPDATE_REPO` | `a0s/agent-retrier` | both | whose releases to read |
+| `CR_UPDATE_BREW_FORMULA` | `a0s/agent-retrier/agent-retrier` | both | named in the brew command |
 
 ## Logging and switching it off
 
@@ -272,7 +272,7 @@ lines stay readable via the same per-line tag, so this is harmless.
 
 | variable | default | applies to | |
 |---|---|---|---|
-| `CR_LOG` | `~/.claude-retrier/log` | both | |
+| `CR_LOG` | `~/.agent-retrier/log` | both | |
 | `CR_LOG_MAX_BYTES` | `5M` | both | rotate once the log passes this size; accepts `5M`/`500k`-style sizes |
 | `CR_LOG_KEEP` | `2` | both | how many rotated copies (`log.1`, `log.2`, ...) to keep |
 | `CR_DISABLE` | | both | `1` runs plain claude or codex |
@@ -298,7 +298,7 @@ these were written for; reach for them when something specific is wrong.
 
 ## Detection patterns
 
-Detection patterns live in one array at the top of `claude-retrier.sh`. Add a
+Detection patterns live in one array at the top of `agent-retrier.sh`. Add a
 wording and nothing else changes. Patterns for a refused turn live in
 `CR_STALL_PATTERNS`, next to the other pattern arrays — see
 [stalls.md](stalls.md#detection-patterns).

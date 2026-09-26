@@ -11,11 +11,11 @@ that sets a settings file first. Name yours with `--cmd` and the wrapper runs
 it:
 
 ```sh
-claude-retrier --cmd claude-work                    # binary, or a name on PATH
-claude-retrier --cmd ~/bin/claude-personal          # a path to anything runnable
-claude-retrier --cmd 'claude --model opus'          # a whole command line
-claude-retrier --cmd my-claude-alias                # an alias from your ~/.zshrc
-claude-retrier --cmd my-claude-function             # a shell function, likewise
+agent-retrier --cmd claude-work                    # binary, or a name on PATH
+agent-retrier --cmd ~/bin/claude-personal          # a path to anything runnable
+agent-retrier --cmd 'claude --model opus'          # a whole command line
+agent-retrier --cmd my-claude-alias                # an alias from your ~/.zshrc
+agent-retrier --cmd my-claude-function             # a shell function, likewise
 ```
 
 ## Aliases and functions
@@ -24,7 +24,7 @@ An alias or a function exists nowhere except inside an interactive shell that
 has read your rc file, so that is where the wrapper looks when the name is not a
 file it can run directly (`CR_SHELL`, default `$SHELL`, is the shell it asks).
 It looks once, at startup, and lifts the definition out so the session itself
-runs from a plain shell. `claude-retrier --cmd X --cr-dump-argv` prints exactly
+runs from a plain shell. `agent-retrier --cmd X --cr-dump-argv` prints exactly
 what will be executed.
 
 Caveat: because the alias or function is read out of your rc file once, at
@@ -38,13 +38,13 @@ falls back to running the alias through `bash -i`.)
 Set `CR_CLAUDE_CMD` instead of passing the flag every time:
 
 ```sh
-alias claude='claude-retrier --cmd claude-work'     # in ~/.zshrc
+alias claude='agent-retrier --cmd claude-work'     # in ~/.zshrc
 export CR_CLAUDE_CMD=claude-work                    # or, once, in your env
 ```
 
 ## Arguments
 
-Everything after the command belongs to claude. `claude-retrier --cmd
+Everything after the command belongs to claude. `agent-retrier --cmd
 claude-work --resume` resumes, and a bare prompt stays a prompt. With no `--cmd`
 at all the wrapper finds `claude` the way your shell would.
 

@@ -29,9 +29,9 @@ window.
    nothing.
 2. **Statusline proxy** (the primary mechanism; requires live verification):
    the wrapper passes `--settings '{"statusLine":{"type":"command","command":
-   "<path to claude-retrier.sh> --cr-statusline <sock-or-file>"}}'`. The proxy
+   "<path to agent-retrier.sh> --cr-statusline <sock-or-file>"}}'`. The proxy
    reads JSON from stdin, appends `model.id`, `context_window.*`,
-   `session_id`, and `transcript_path` to `~/.claude-retrier/status/<pid>.json`
+   `session_id`, and `transcript_path` to `~/.agent-retrier/status/<pid>.json`
    (atomically), then **runs the user's original statusLine** (from their
    settings) with the same stdin and passes through its output — so the user's
    status line does not disappear. Verify: (a) whether `--settings` merges with
@@ -126,7 +126,7 @@ test_controller.py's `TestClaudesOwnStatusLine`, test_pty.py's
   armed (`CR_CONTEXT_PCT`/`CR_CONTEXT_TOKENS`/`CR_CONTEXT_RESTART`) and
   `CR_STATUSLINE_PROXY` is not `0`; never for codex; never if the user's own
   argv already names `--settings`.
-- `StatusPoller` (in the supervisor) polls `~/.claude-retrier/status/<pid>.json`
+- `StatusPoller` (in the supervisor) polls `~/.agent-retrier/status/<pid>.json`
   every `CR_POLL_SEC` and hands new content to `Controller.on_status`.
 - `Controller.on_status`: `context_window_size` → `context_window_hint` (the
   same field codex's own rollout accounting already sets) with source label

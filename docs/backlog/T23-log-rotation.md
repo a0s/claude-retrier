@@ -4,7 +4,7 @@ Priority: P2 · Epic: E · Depends on: — · Size: S
 
 ## Problem
 
-`~/.claude-retrier/log` grows without limit (`Logger`, 3800: `open(path,
+`~/.agent-retrier/log` grows without limit (`Logger`, 3800: `open(path,
 "a")`). After T01 and more detailed log lines, growth will accelerate. With
 several wrappers on the machine, the file is open for writing concurrently, so
 rotation must be safe for concurrent writers.

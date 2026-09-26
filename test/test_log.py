@@ -1,6 +1,6 @@
 """Log rotation (T23).
 
-`~/.claude-retrier/log` (or wherever CR_LOG points) is shared by every wrapper
+`~/.agent-retrier/log` (or wherever CR_LOG points) is shared by every wrapper
 process on the machine (T01's per-line `[cr <pid> <agent>]` tags exist exactly
 because of this), so it has no natural owner to truncate it. Left alone it
 grows forever. Rotation happens only at Logger construction (wrapper startup)

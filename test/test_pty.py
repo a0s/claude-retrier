@@ -1,4 +1,4 @@
-"""End-to-end runs of claude-retrier.sh against a real pty.
+"""End-to-end runs of agent-retrier.sh against a real pty.
 
 Two things are being proven here. First, that the wrapper is invisible during
 ordinary use — keystrokes, exit codes, terminal size and window resizes all pass
@@ -25,7 +25,7 @@ import unittest
 from screen import Screen
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WRAP = os.path.join(ROOT, "claude-retrier.sh")
+WRAP = os.path.join(ROOT, "agent-retrier.sh")
 
 
 def _fake_launcher():
@@ -49,17 +49,17 @@ FAKE = _fake_launcher()
 
 
 class Session:
-    """Runs claude-retrier.sh on a pty we control, the way a terminal emulator would."""
+    """Runs agent-retrier.sh on a pty we control, the way a terminal emulator would."""
 
     def __init__(self, env=None, args=(), rows=40, cols=120, cwd=None):
         self.master, slave = pty.openpty()
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         # A test run started from inside a wrapped session would inherit
-        # CLAUDE_RETRIER_ACTIVE=1 (and the caller's tuning), and every wrapper
+        # AGENT_RETRIER_ACTIVE=1 (and the caller's tuning), and every wrapper
         # under test would dutifully degrade into a plain exec. Start clean.
         full = {k: v for k, v in os.environ.items()
                 if not k.startswith("CR_")
-                and k not in ("CLAUDE_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+                and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
         full.update({
             "CR_CLAUDE_BIN": FAKE,
             "CR_LOG": os.path.join(tempfile.gettempdir(), "cr-pty-test.log"),

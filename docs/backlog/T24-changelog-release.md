@@ -9,7 +9,7 @@ After `v1.11.0`, `main` contains four commits with no entry in `CHANGELOG.md`:
 (per-agent phrases, 64k reserve), `f53921f` (`CR_CONTEXT_RESTART=1`, per-model
 override), `78ffa2c` (custom codex default behind a flag). `release.yml` reads notes
 from CHANGELOG, and a test checks that `CR_VERSION` matches the top entry.
-The release includes updating the formula in `homebrew-claude-retrier` (see the
+The release includes updating the formula in `homebrew-agent-retrier` (see the
 project memory: a tag without a formula is not a release).
 
 ## What to do

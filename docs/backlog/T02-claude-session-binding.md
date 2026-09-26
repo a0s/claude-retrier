@@ -4,7 +4,7 @@ Priority: P0 · Epic: A · Depends on: T01 · Size: L
 
 ## Problem
 
-`TranscriptWatcher._pick_current` (claude-retrier.sh:1816) selects “our”
+`TranscriptWatcher._pick_current` (agent-retrier.sh:1816) selects “our”
 transcript using the heuristic “stay on a file while it grows; otherwise take
 the newest of the files that grew.” Our session can be silent for seconds or
 minutes (an API request, a long tool call), and any poll during which a foreign
@@ -108,7 +108,7 @@ launched with `CLAUDE*`/`ANTHROPIC*` stripped from the environment (this
 audit itself runs inside a live Claude Code session, and a nested `claude`
 that inherits `CLAUDE_CODE_CHILD_SESSION` turns its own transcript/session
 writing off — worth knowing on its own, but orthogonal to T02, since
-claude-retrier never runs nested that way for a real user).
+agent-retrier never runs nested that way for a real user).
 
 - **(a) `sessionId` after `/clear`.** Changed within 0.3s of the phrase being
   submitted, same pid, same `cwd`, `startedAt` unchanged. `updatedAt` moved,

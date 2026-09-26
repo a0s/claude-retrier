@@ -34,9 +34,9 @@ should get that by accident. One variable. It is off until you set it, and
 nothing below happens without it:
 
 ```sh
-CR_CONTEXT_RESTART=1 claude-retrier       # restart where this model's own row says
+CR_CONTEXT_RESTART=1 agent-retrier       # restart where this model's own row says
 CR_CONTEXT_RESTART=1 codex-retrier        # ... which is a different point on codex
-CR_CONTEXT_TOKENS=500k claude-retrier     # or: restart at this many tokens, exactly
+CR_CONTEXT_TOKENS=500k agent-retrier     # or: restart at this many tokens, exactly
 ```
 
 Which of the two to reach for: `CR_CONTEXT_RESTART=1` if you run both agents,
@@ -87,7 +87,7 @@ first one's file mid-write:
   is about to use, and a session that finds another live one already holding
   it moves its own aside to `<stem>-<id><ext>` automatically, logging `handoff
   file is taken by pid N; using scratchpad/RESUME-3f9a1c2b.md`.
-  `CR_HANDOFF_REGISTRY_DIR` (default `~/.claude-retrier/sessions`) is where
+  `CR_HANDOFF_REGISTRY_DIR` (default `~/.agent-retrier/sessions`) is where
   that coordination lives.
 
 ## What you will see
@@ -101,13 +101,13 @@ prints a dim line before each of them so you are never left wondering what just
 happened:
 
 ```
-[claude-retrier] context is filling up; asking for a handoff
-[claude-retrier] handoff verified; clearing the context
-[claude-retrier] context cleared; unfolding the handoff
-[claude-retrier] context restarted: 700k down to 5k
+[agent-retrier] context is filling up; asking for a handoff
+[agent-retrier] handoff verified; clearing the context
+[agent-retrier] context cleared; unfolding the handoff
+[agent-retrier] context restarted: 700k down to 5k
 ```
 
-Behind those, `~/.claude-retrier/log` has the whole story with numbers:
+Behind those, `~/.agent-retrier/log` has the whole story with numbers:
 
 ```
 claude-opus-5: a 1.0M context window (the model), restarting at 510k
@@ -367,7 +367,7 @@ on its own (`compact_at`, used only for the capping in stages 3/4 above).
 `--cr-models` prints it resolved against your actual environment:
 
 ```
-$ CR_CONTEXT_RESTART=1 claude-retrier.sh --cr-models
+$ CR_CONTEXT_RESTART=1 agent-retrier.sh --cr-models
 agent   model              window  restart_at  compact_at  source
 ------  -----------------  ------  ----------  ----------  ------------------
 claude  claude-opus-5      1.0M    510k        967k        CR_CONTEXT_RESTART
@@ -472,7 +472,7 @@ wrapper passes claude a `--settings` naming
 `<this file> --cr-statusline <path>` as its `statusLine` command. Claude Code
 invokes that command with a JSON payload including
 `context_window.context_window_size` (200000 or 1000000) and `model.id`; the
-proxy records those into `~/.claude-retrier/status/<pid>.json` (one file per
+proxy records those into `~/.agent-retrier/status/<pid>.json` (one file per
 wrapper, written atomically) and then runs YOUR OWN `statusLine` command, if
 `settings.json`/`settings.local.json` name one, with the same stdin — so
 whatever you already see in that corner keeps appearing exactly as before. No
@@ -548,7 +548,7 @@ of them (whichever one happens to match the prefix you picked by hand). See
 
 ## When nothing happens
 
-Look in `~/.claude-retrier/log`. In order of likelihood:
+Look in `~/.agent-retrier/log`. In order of likelihood:
 
 - No `context restart armed` line at all: neither `CR_CONTEXT_RESTART` nor
   `CR_CONTEXT_TOKENS` reached the wrapper. Check that it is exported, and that

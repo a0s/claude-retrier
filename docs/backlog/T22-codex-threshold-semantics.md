@@ -18,7 +18,7 @@ Priority: P2 · Epic: C · Depends on: T18 · Size: M
    at the cap − reserve line).
 3. The 64k reserve was chosen based on one incident. The wrapper knows the actual
    cost of a fold turn: `tokens at handoff accepted − tokens at folding up`. It
-   should log and accumulate this (`~/.claude-retrier/folds.json`: agent, cwd,
+   should log and accumulate this (`~/.agent-retrier/folds.json`: agent, cwd,
    cost, date); if the observed cost exceeds 80% of the reserve, log a
    recommendation and (optionally, `CR_CODEX_RESERVE_ADAPT=1`) automatically raise
    the reserve to `1.25 × maximum observed`.

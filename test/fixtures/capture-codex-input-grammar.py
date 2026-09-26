@@ -45,7 +45,7 @@ _SCREEN = []      # the emulator class, loaded once
 
 
 def screen_cls():
-    """claude-retrier.sh's own Screen, so what this driver reads back is what
+    """agent-retrier.sh's own Screen, so what this driver reads back is what
     the supervisor would see. Cached: `helper.load` shells out to
     `--cr-dump-python` and rewrites os.environ, which is far too expensive to
     repeat on a half-second startup poll."""

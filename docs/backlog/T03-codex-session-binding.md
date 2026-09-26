@@ -4,7 +4,7 @@ Priority: P1 · Epic: A · Depends on: T01, T04, T06 · Size: L
 
 ## Problem
 
-`CodexAgent.keep` (claude-retrier.sh:1528) filters out subagent rollouts and other
+`CodexAgent.keep` (agent-retrier.sh:1528) filters out subagent rollouts and other
 `cwd` values, but two codex sessions in the same directory are indistinguishable,
 so the same `_pick_current` heuristic as for claude (T02) is used afterward.
 Furthermore, `CodexAgent.paths` (1518) scans only

@@ -1,4 +1,4 @@
-"""Loads the implementation straight out of claude-retrier.sh.
+"""Loads the implementation straight out of agent-retrier.sh.
 
 Both the code and the pattern arrays come from the shell script itself, so a test
 can never pass against a copy that has drifted from what actually ships.
@@ -17,7 +17,7 @@ import termios
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WRAP = os.path.join(ROOT, "claude-retrier.sh")
+WRAP = os.path.join(ROOT, "agent-retrier.sh")
 
 
 def _dump(flag):
@@ -25,7 +25,7 @@ def _dump(flag):
 
 
 def pattern_env():
-    """The CR_PAT_* environment exactly as claude-retrier.sh builds it."""
+    """The CR_PAT_* environment exactly as agent-retrier.sh builds it."""
     env = {}
     name = None
     for line in _dump("--cr-dump-patterns").split("\n"):
@@ -42,16 +42,16 @@ def load(**overrides):
 
     Inherited CR_* settings are dropped first: a suite run from inside a wrapped
     session would otherwise be testing the caller's tuning (and its
-    CLAUDE_RETRIER_ACTIVE) rather than the defaults that ship.
+    AGENT_RETRIER_ACTIVE) rather than the defaults that ship.
     """
     for k in [k for k in os.environ if k.startswith("CR_")]:
         del os.environ[k]
-    os.environ.pop("CLAUDE_RETRIER_ACTIVE", None)
+    os.environ.pop("AGENT_RETRIER_ACTIVE", None)
     for k, v in pattern_env().items():
         os.environ[k] = v
     for k, v in overrides.items():
         os.environ[k] = str(v)
-    os.environ.setdefault("CR_LOG", os.path.join(tempfile.gettempdir(), "claude-retrier-test.log"))
+    os.environ.setdefault("CR_LOG", os.path.join(tempfile.gettempdir(), "agent-retrier-test.log"))
 
     src = _dump("--cr-dump-python")
     path = os.path.join(tempfile.mkdtemp(prefix="cr-"), "cr_impl.py")
@@ -66,7 +66,7 @@ def load(**overrides):
 
 def _fake_bin(agent):
     """A single-exec launcher for fake_claude.py/fake_codex.py, named after the
-    agent: claude-retrier's own auto-detection (`cr_looks_like_codex`) reads the
+    agent: agent-retrier's own auto-detection (`cr_looks_like_codex`) reads the
     resolved binary's path for a `codex` component, the same way it would for a
     real install, so the launcher has to be named exactly that.
     """
@@ -93,7 +93,7 @@ def _descendant_pids(pid):
     between them — `pgrep -P` walks one generation at a time regardless.
 
     Zombies are excluded: the wrapper's own hand-off to python (`exec ... 3<
-    <(printf ...)`, at the end of `claude-retrier.sh`) forks a bash to feed that
+    <(printf ...)`, at the end of `agent-retrier.sh`) forks a bash to feed that
     process substitution, which becomes a direct, unreaped child of the
     supervisor the moment it exits — a lower pid than the real agent, since it
     forked first, and `pgrep` lists it right alongside. Left in, it is what
@@ -113,7 +113,7 @@ def _descendant_pids(pid):
 
 
 class WrapperSession:
-    """One claude-retrier.sh instance on its own pty.
+    """One agent-retrier.sh instance on its own pty.
 
     Independent of test_pty.py's `Session`: this one has to run either agent,
     to be one of a pair sharing a project dir and a `CR_LOG`, and to guarantee
@@ -129,7 +129,7 @@ class WrapperSession:
         self.master, slave = pty.openpty()
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
         full = {k: v for k, v in os.environ.items()
-                if not k.startswith("CR_") and k not in ("CLAUDE_RETRIER_ACTIVE",)}
+                if not k.startswith("CR_") and k not in ("AGENT_RETRIER_ACTIVE",)}
         full.update({
             "CR_CLAUDE_BIN": _fake_bin(agent),
             "CR_LOG": log,
@@ -198,7 +198,7 @@ class WrapperSession:
     def close(self):
         if self.proc.poll() is None:
             # The wrapper puts the agent it launches in its OWN session
-            # (`os.setsid()`, claude-retrier.sh's forkpty-alike, so a signal
+            # (`os.setsid()`, agent-retrier.sh's forkpty-alike, so a signal
             # aimed at us never lands mid-keystroke on it) — which means
             # `killpg` on our pid alone leaves it running. Kill every pid in
             # the tree individually, group by group, each a leader of its own.
@@ -228,7 +228,7 @@ class WrapperSession:
 
 
 def two_wrappers(project_dir, cfg_a, cfg_b):
-    """Two claude-retrier.sh wrappers sharing one project dir and one `CR_LOG`.
+    """Two agent-retrier.sh wrappers sharing one project dir and one `CR_LOG`.
 
     The bug class this exists for (T02/T04/T05: one session reading another's
     transcript) only reproduces with both wrappers alive over the same

@@ -20,7 +20,7 @@ python3 docs/demo/record.py codex  docs/demo/codex-restart.cast
 
 # 2. cut the waiting out and render
 python3 docs/demo/cast2gif.py docs/demo/claude-restart.cast \
-        docs/demo/claude-restart.gif --title 'claude-retrier'
+        docs/demo/claude-restart.gif --title 'agent-retrier: context restart' --trim 0:138.7
 ```
 
 **codex-restart.gif is not recorded yet.** `record.py codex` was written
@@ -31,13 +31,13 @@ updated here) and the directory-trust prompt's wording/default changed (also
 updated), but the recording still exits a few seconds after the fold is
 armed, before ever asking for a handoff — not yet root-caused.
 
-`record.py` drives `claude-retrier.sh` on its own 100x28 pty and writes
+`record.py` drives `agent-retrier.sh` on its own 100x28 pty and writes
 [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/) — a JSON
 header plus one `[time, "o", bytes]` line per write, so no `asciinema` binary
 is needed to make or to read one.
 
 `cast2gif.py` replays that file through the project's **own** `Screen`
-terminal emulator (the one inside `claude-retrier.sh`, reached the same way
+terminal emulator (the one inside `agent-retrier.sh`, reached the same way
 `test/screen.py` reaches it), so a frame it paints cannot drift from what the
 supervisor itself judges the user to be seeing. `--trim START:END` keeps only
 the interesting spans, `--idle-cap` squeezes dead air, `--speed` does the

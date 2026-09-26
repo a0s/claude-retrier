@@ -343,7 +343,7 @@ class TestPickingTheAgent(unittest.TestCase):
                          "claude")
 
     def test_a_prompt_that_says_codex_does_not_pick_codex(self):
-        # `claude-retrier "fix the codex build"` starts claude. Reading the
+        # `agent-retrier "fix the codex build"` starts claude. Reading the
         # sentence would send the watcher after a file nobody is writing.
         self.assertEqual(cr.pick_agent("auto", ["/usr/local/bin/claude"]), "claude")
 
@@ -1306,10 +1306,10 @@ class TestCodexSubcommands(unittest.TestCase):
     def run_wrapper(self, args):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("CR_")
-               and k not in ("CLAUDE_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+               and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
         env.update({"CR_CLAUDE_BIN": FAKE_CODEX, "CR_LOG": self.log,
                     "CODEX_HOME": self.dir, "CR_NOTIFY": "0"})
-        return subprocess.run([os.path.join(ROOT, "claude-retrier.sh"), *args],
+        return subprocess.run([os.path.join(ROOT, "agent-retrier.sh"), *args],
                               env=env, stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=30)
 
@@ -1342,10 +1342,10 @@ class TestCodexSubcommands(unittest.TestCase):
         """
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("CR_")
-               and k not in ("CLAUDE_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+               and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
         env.update({"CR_CLAUDE_BIN": FAKE_CODEX, "CR_LOG": self.log,
                     "CODEX_HOME": self.dir, "CR_NOTIFY": "0"})
-        proc = subprocess.Popen([os.path.join(ROOT, "claude-retrier.sh"), *args],
+        proc = subprocess.Popen([os.path.join(ROOT, "agent-retrier.sh"), *args],
                                 env=env, stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 start_new_session=True)
@@ -1376,13 +1376,13 @@ class TestCalledAsCodexRetrier(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.log = os.path.join(self.dir, "log")
         self.prog = os.path.join(self.dir, "codex-retrier")
-        os.symlink(os.path.join(ROOT, "claude-retrier.sh"), self.prog)
+        os.symlink(os.path.join(ROOT, "agent-retrier.sh"), self.prog)
         self.codex_dir = os.path.dirname(FAKE_CODEX)     # holds an executable `codex`
 
     def call(self, args, path=None, **over):
         env = {k: v for k, v in os.environ.items()
                if not k.startswith("CR_")
-               and k not in ("CLAUDE_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+               and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
         env.update({"PATH": path or (self.codex_dir + ":/usr/bin:/bin"),
                     "SHELL": "/bin/sh", "CR_LOG": self.log, "CODEX_HOME": self.dir,
                     "CR_NOTIFY": "0", "CR_UPDATE_CHECK": "0"})
@@ -1395,7 +1395,7 @@ class TestCalledAsCodexRetrier(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), FAKE_CODEX)
 
     def test_claudes_command_is_not_its_command(self):
-        # CR_CLAUDE_CMD lives in people's rc files, for claude-retrier.
+        # CR_CLAUDE_CMD lives in people's rc files, for agent-retrier.
         r = self.call(["--cr-dump-argv"], CR_CLAUDE_CMD="claude-work")
         self.assertEqual(r.stdout.strip(), FAKE_CODEX)
 

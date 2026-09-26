@@ -2,10 +2,10 @@
 for the README.
 
 Rendering never guesses what a byte stream would look like: it is fed to the
-project's own `Screen` terminal emulator (`claude-retrier.sh`'s `class
+project's own `Screen` terminal emulator (`agent-retrier.sh`'s `class
 Screen`, reached through `test/helper.py`), the same code the supervisor uses
 to judge what the user sees. A grid this script paints can therefore never
-drift from what claude-retrier itself renders.
+drift from what agent-retrier itself renders.
 
 Pipeline: parse the .cast -> optionally keep only the --trim spans (dropping
 boring waiting) -> compress any idle gap past --idle-cap -> apply --speed ->
@@ -15,7 +15,7 @@ hand the PNGs to ffmpeg's two-pass palette pipeline for a GIF.
 Recommended recording geometry: something WIDE and SHORT, e.g. 100 columns x
 28 rows, not the 120x50 a full-screen terminal defaults to. A GitHub README
 renders an embedded GIF at ~900px wide; at that width a 120-column recording
-needs a font too small to read the box-drawing glyphs claude-retrier's own
+needs a font too small to read the box-drawing glyphs agent-retrier's own
 badge/overlay draw, while a tall recording either gets letterboxed or forces
 the whole GIF down to keep width sane. 100x28 at the default --font-size 20
 lands close to 900px wide without downscaling.
@@ -44,7 +44,7 @@ CHROME_HEIGHT = 34     # px of title-bar strip when --chrome is on
 
 def load_screen_class():
     """helper.load() re-executes the CR_PYTHON_EOF heredoc out of
-    claude-retrier.sh itself, so this can never render against a stale copy
+    agent-retrier.sh itself, so this can never render against a stale copy
     of the emulator (see test/screen.py, which does the same thing)."""
     from helper import load
     return load().Screen
@@ -311,7 +311,7 @@ def _lighten(rgb, amount):
     return tuple(min(255, c + amount) for c in rgb)
 
 
-# claude-retrier.sh's own patterns match a handful of marker/spinner glyphs
+# agent-retrier.sh's own patterns match a handful of marker/spinner glyphs
 # real transcripts contain (_TOOL_HEADER's bullet class, the thinking-spinner
 # class) that turn out NOT to be in the recommended Nerd Font Mono build:
 # verified by rendering that it has box-drawing, but U+23FA/U+25C6/U+25AA/

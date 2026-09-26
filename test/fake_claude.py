@@ -345,7 +345,7 @@ def fold_up(line):
     mode = os.environ.get("FAKE_HANDOFF", "ok")
     m, t = _MARKER.search(line), _TARGET.search(line)
     marker = m.group(1) if m else "HANDOFF"
-    target = t.group(1) if t else ".claude-retrier/handoff.md"
+    target = t.group(1) if t else ".agent-retrier/handoff.md"
     body = "".join("state: step %d is done\n" % i for i in range(20))
     text = {"ok": body + marker + "\n",
             "short": marker + "\n",           # under the byte floor

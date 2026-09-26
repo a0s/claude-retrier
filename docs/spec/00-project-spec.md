@@ -1,7 +1,7 @@
-# claude-retrier — product spec
+# agent-retrier — product spec
 
 Created 2026-09-18 as the root spec for `harness-plan`. Source: audit of
-`docs/backlog/README.md` (2026-09-18, claude-retrier 1.11.0 + 4 unreleased
+`docs/backlog/README.md` (2026-09-18, agent-retrier 1.11.0 + 4 unreleased
 commits). Precedence: this file > Plans.md.
 
 ## Purpose
@@ -77,15 +77,15 @@ rule from block 1); otherwise, this backlog does not change the logic.
 
 ## Data And Contracts
 
-- `~/.claude-retrier/log` — shared machine-wide; every line must carry the tag
+- `~/.agent-retrier/log` — shared machine-wide; every line must carry the tag
   `[cr <pid> <agent>]` (T01) for investigating incidents involving multiple
   sessions.
-- `~/.claude-retrier/sessions/<pid>.json` — wrapper registry for handoff-file
+- `~/.agent-retrier/sessions/<pid>.json` — wrapper registry for handoff-file
   uniqueness (T05).
 - `MODEL_PROFILES` (in code) — the sole source of the default window/threshold/
   compaction for each (agent, slug) pair; overridden through the chain in block
   2.
-- `~/.claude-retrier/folds.json` — fold-turn cost history for adapting the
+- `~/.agent-retrier/folds.json` — fold-turn cost history for adapting the
   codex reserve (T22).
 
 ## Non-Goals
@@ -116,5 +116,5 @@ rule from block 1); otherwise, this backlog does not change the logic.
 - `docs/backlog/T01..T26-*.md` — detailed task files (problem/evidence/what to
   do/AC/where in code); the Plans.md task states the DoD briefly, with details
   there.
-- `CLAUDE.md` — map of the `claude-retrier.sh` file, CodeGraph mirror, and test
+- `CLAUDE.md` — map of the `agent-retrier.sh` file, CodeGraph mirror, and test
   runner.

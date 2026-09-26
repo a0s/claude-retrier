@@ -24,7 +24,7 @@ the whole spend.
 
 Differences from the T15 capture driver, both deliberate:
 
-  * codex runs UNDER the wrapper (`claude-retrier.sh --agent codex`), not
+  * codex runs UNDER the wrapper (`agent-retrier.sh --agent codex`), not
     bare, so what is proven is that the supervisor's pty relay leaves every
     one of those recipes intact;
   * the keystrokes come from the shipped `typing_plan()` itself, so this
@@ -56,7 +56,7 @@ import termios
 import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WRAP = os.path.join(ROOT, "claude-retrier.sh")
+WRAP = os.path.join(ROOT, "agent-retrier.sh")
 HERE = os.path.join(ROOT, "test")
 
 OK, FAILED, REFUSED, LOGGED_OUT = 0, 1, 2, 3
@@ -152,7 +152,7 @@ def _descendants(pid):
 
 
 class Session(object):
-    """One `claude-retrier.sh --agent codex` on a pty, driving real codex."""
+    """One `agent-retrier.sh --agent codex` on a pty, driving real codex."""
 
     def __init__(self, label):
         self.label = label
@@ -160,7 +160,7 @@ class Session(object):
         self.master, slave = pty.openpty()
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, COLS, 0, 0))
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("CR_") and k != "CLAUDE_RETRIER_ACTIVE"}
+               if not k.startswith("CR_") and k != "AGENT_RETRIER_ACTIVE"}
         env.update({
             "TERM": "xterm-256color",
             "COLUMNS": str(COLS), "LINES": str(ROWS),
@@ -477,7 +477,7 @@ def main():
     readme = os.path.join(PROJ, "README.md")
     if not os.path.exists(readme):
         with open(readme, "w") as fh:
-            fh.write("Throwaway project for claude-retrier's live codex checklist.\n")
+            fh.write("Throwaway project for agent-retrier's live codex checklist.\n")
     cr()                                      # load before the CR_* env is filtered
     LOG = os.path.join(PROJ, "live-codex.log")
 

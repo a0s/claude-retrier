@@ -174,7 +174,7 @@ SGR, DECSC/DECRC, deferred wrap, scroll counter). It is not in the supervisor.
       `test/fixtures/agent-tree-2.1.273.bin` and produces a grid where
       tree rows appear where the user sees them; `?2026h/l`, `ESC[L`/`ESC[M`,
       and the scroll region are covered by separate cases.
-- [ ] `test_screen.py`: `test/screen.py` and `Screen` in `claude-retrier.sh` are
+- [ ] `test_screen.py`: `test/screen.py` and `Screen` in `agent-retrier.sh` are
       the same code (the test fails on divergence).
 - [ ] `test_agents.py`: `find_agent_rows` on the grid from evidence 5 returns
       exactly two rows with labels `Report first file in cwd` and

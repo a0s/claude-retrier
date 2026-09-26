@@ -1,4 +1,4 @@
-"""The terminal emulator (T27): the grid claude-retrier.sh renders its own
+"""The terminal emulator (T27): the grid agent-retrier.sh renders its own
 subagent-tree overlay against, exercised the way the real supervisor drives
 it — fed with raw pty bytes, not hand-picked escape sequences.
 """
@@ -15,7 +15,7 @@ FIXTURE_PANEL = os.path.join(HERE, "fixtures", "agents-panel-2.1.273.bin")
 
 class TestOneSource(unittest.TestCase):
     def test_screen_py_has_no_implementation_of_its_own(self):
-        # test/screen.py re-exports claude-retrier.sh's own Screen rather than
+        # test/screen.py re-exports agent-retrier.sh's own Screen rather than
         # keeping a second copy, so the two can never quietly drift apart the
         # way a hand-maintained duplicate eventually does.
         with open(os.path.join(HERE, "screen.py")) as fh:

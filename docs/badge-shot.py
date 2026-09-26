@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerates docs/badge.svg — the badge picture in the README.
 
-Not a drawing: it starts a real claude-retrier over a stand-in that prints one
+Not a drawing: it starts a real agent-retrier over a stand-in that prints one
 still Claude-Code-shaped frame, captures what the wrapper actually writes to the
 terminal, replays that through the emulator the test suite uses, and renders the
 resulting screen. The badge in the picture is placed by the shipping code, so the
@@ -72,7 +72,7 @@ def capture(extra_env, seconds):
     os.chmod(launcher, 0o755)
 
     env = {k: v for k, v in os.environ.items()
-           if not k.startswith("CR_") and k != "CLAUDE_RETRIER_ACTIVE"}
+           if not k.startswith("CR_") and k != "AGENT_RETRIER_ACTIVE"}
     env.update({
         "CR_CLAUDE_BIN": launcher,
         "CR_NOTIFY": "0",
@@ -83,7 +83,7 @@ def capture(extra_env, seconds):
         "CR_LOG": os.path.join(tempfile.mkdtemp(), "log"),
     })
     env.update(extra_env)
-    proc = subprocess.Popen([os.path.join(ROOT, "claude-retrier.sh")],
+    proc = subprocess.Popen([os.path.join(ROOT, "agent-retrier.sh")],
                             stdin=slave, stdout=slave, stderr=slave, env=env,
                             cwd=tempfile.mkdtemp(), close_fds=True, start_new_session=True)
     os.close(slave)

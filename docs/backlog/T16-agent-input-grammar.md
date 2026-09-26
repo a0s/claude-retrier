@@ -95,6 +95,6 @@ never expands to `/NAME` for codex) and documented in both
 
 ## Where in the code
 
-`AGENT_INPUT` (claude-retrier.sh 2410–2413), `typing_plan` (2416–2436),
+`AGENT_INPUT` (agent-retrier.sh 2410–2413), `typing_plan` (2416–2436),
 `schedule_injection` (6536–6552), bash defaults `CR_SLASH_*` (505–507),
 `test/test_input_grammar.py`.

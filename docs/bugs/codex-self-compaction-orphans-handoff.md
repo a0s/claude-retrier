@@ -32,7 +32,7 @@ Sequence on screen:
 
 ## Investigation
 
-The `~/.claude-retrier/log` log for that night (project `openhopper.app`)
+The `~/.agent-retrier/log` log for that night (project `openhopper.app`)
 contains exactly what is needed:
 
 ```
@@ -46,7 +46,7 @@ This confirms what the screenshots show and explains the cause.
 
 ### Finding 1 (main): race between the fold turn and codex’s own compaction
 
-`Controller._lost_the_race()` (claude-retrier.sh): as soon as codex compacts the
+`Controller._lost_the_race()` (agent-retrier.sh): as soon as codex compacts the
 thread while `rstate` (`HANDOFF_SENT` here) is unfinished, the controller calls
 `_abort_restart(...)`. The abort does not check the result afterward:
 `context_tokens` is reset, `rstate` is reset, and — crucially — **the resume
@@ -69,13 +69,13 @@ what the user saw.
 This also explains why the log contains no context-clear command. The wrapper’s
 `/clear` is logged only when sent —
 `"handoff verified; clearing the context with %s" % clear_cmd`
-(claude-retrier.sh:3252) — and only on transition to `CLEARED`, after handoff
+(agent-retrier.sh:3252) — and only on transition to `CLEARED`, after handoff
 verification. Here the restart aborted in `handoff_sent`, before verification,
 so that line was never reached. `Context compacted` in the codex transcript is
-not a wrapper command: claude-retrier sends nothing to compact codex; it only
+not a wrapper command: agent-retrier sends nothing to compact codex; it only
 detects the already completed event by reading the `"compacted"` record from
 the rollout file (see `if rec.get("type") == "compacted"` in
-claude-retrier.sh). The log line `codex compacted the thread on its own before
+agent-retrier.sh). The log line `codex compacted the thread on its own before
 the restart could` is only a post-factum record, not an outgoing action.
 
 ### Finding 2: the threshold did not trigger in time, leaving almost no headroom before codex’s cap
@@ -166,13 +166,13 @@ Specifically:
   transition to `RESUME_SENT`, and print `CR_RESUME_MSG` (codex already cleared
   context, so only unfold is needed). At minimum make `notify()` more visible
   than a transient line when the log says “restart aborted”.
-- Check `notify()` in claude-retrier.sh: “restart aborted at handoff_sent: ...”
+- Check `notify()` in agent-retrier.sh: “restart aborted at handoff_sent: ...”
   is transient by design and immediately redrawn by the codex TUI. This likely
   explains the missing screenshot warning; consider a persistent badge or log.
 
 ## Where to look in the code
 
-- `claude-retrier.sh`: `Controller._lost_the_race`, `Controller._abort_restart`,
+- `agent-retrier.sh`: `Controller._lost_the_race`, `Controller._abort_restart`,
   `Controller._maybe_interrupt`, `Controller.note_growth`, `notify()` (pty launch block).
 - `docs/context-restart.md` — standard four-step flow (fold → check → `/clear`
   → unfold) and “Caveats”.

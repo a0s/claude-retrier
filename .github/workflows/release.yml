@@ -4,7 +4,7 @@ name: release
 # of the tag message, so what GitHub shows and what the repository says are the
 # same text by construction.
 #
-#   git tag -a v1.2.0 -m 'claude-retrier 1.2.0' && git push origin v1.2.0
+#   git tag -a v1.2.0 -m 'agent-retrier 1.2.0' && git push origin v1.2.0
 #
 # `workflow_dispatch` backfills a tag that was pushed before this workflow
 # existed: the checkout is the default branch (which is where the changelog and
@@ -46,8 +46,8 @@ jobs:
         run: |
           set -eu
           mkdir -p dist
-          git show '${{ steps.v.outputs.tag }}:claude-retrier.sh' >dist/claude-retrier.sh
-          chmod +x dist/claude-retrier.sh
+          git show '${{ steps.v.outputs.tag }}:agent-retrier.sh' >dist/agent-retrier.sh
+          chmod +x dist/agent-retrier.sh
 
       # A tag that disagrees with the script or the changelog would ship a
       # release whose notes describe a different version than the file inside it.
@@ -55,7 +55,7 @@ jobs:
         run: |
           set -eu
           version='${{ steps.v.outputs.version }}'
-          in_script=$(./dist/claude-retrier.sh --cr-version | awk '{print $2}')
+          in_script=$(./dist/agent-retrier.sh --cr-version | awk '{print $2}')
           echo "tag=$version script=$in_script"
           [ "$version" = "$in_script" ] || { echo "::error::tag $version != CR_VERSION $in_script"; exit 1; }
           grep -q "^## \[$version\]" CHANGELOG.md || {
@@ -82,8 +82,8 @@ jobs:
             echo "---"
             echo "One file, no build step:"
             echo '```sh'
-            echo "curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${{ steps.v.outputs.tag }}/claude-retrier.sh"
-            echo "chmod +x claude-retrier.sh"
+            echo "curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${{ steps.v.outputs.tag }}/agent-retrier.sh"
+            echo "chmod +x agent-retrier.sh"
             echo '```'
           } >>notes.md
           cat notes.md
@@ -95,15 +95,15 @@ jobs:
         run: |
           set -eu
           tag='${{ steps.v.outputs.tag }}'
-          title='claude-retrier ${{ steps.v.outputs.version }}'
+          title='agent-retrier ${{ steps.v.outputs.version }}'
           # gh marks whatever it publishes last as "Latest", so backfilling an
           # old tag would otherwise present 1.0.0 as the current version.
           latest='--latest'
           [ -z '${{ github.event.inputs.tag }}' ] || latest='--latest=false'
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release edit "$tag" --title "$title" --notes-file notes.md $latest
-            gh release upload "$tag" dist/claude-retrier.sh --clobber
+            gh release upload "$tag" dist/agent-retrier.sh --clobber
           else
-            gh release create "$tag" dist/claude-retrier.sh --title "$title" \
+            gh release create "$tag" dist/agent-retrier.sh --title "$title" \
               --notes-file notes.md $latest
           fi

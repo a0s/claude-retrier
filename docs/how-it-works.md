@@ -16,7 +16,7 @@ check, requirements and tests.
 
 ## One pty instead of tmux
 
-`claude-retrier.sh` runs your claude on a pty it owns, so it can read the output
+`agent-retrier.sh` runs your claude on a pty it owns, so it can read the output
 and write input at the same time. That single fact removes the need for tmux
 (`capture-pane` plus `send-keys`), a detached monitor process, event marker
 files, and a launchd or systemd reconciler.
@@ -109,9 +109,9 @@ and it comes back a moment later: about forty bytes, a few times a second at
 most, and never a byte into the session itself.
 
 ```sh
-CR_BADGE=0 claude-retrier                  # off
-CR_BADGE_POS=top-right claude-retrier      # any of the four corners
-CR_BADGE_LABEL=retrier claude-retrier      # your own word next to the mark
+CR_BADGE=0 agent-retrier                  # off
+CR_BADGE_POS=top-right agent-retrier      # any of the four corners
+CR_BADGE_LABEL=retrier agent-retrier      # your own word next to the mark
 ```
 
 The picture above is not a mockup. `python3 docs/badge-shot.py` runs the real
@@ -125,8 +125,8 @@ It checks once a day whether there is a newer release, and says so in two dim
 lines before the session starts:
 
 ```
-[claude-retrier] claude-retrier 1.9.0 → 1.10.0 is out
-                 brew upgrade a0s/claude-retrier/claude-retrier
+[agent-retrier] agent-retrier 1.9.0 → 1.10.0 is out
+                 brew upgrade a0s/agent-retrier/agent-retrier
 ```
 
 The command is the one that updates the copy you are running — `brew upgrade`

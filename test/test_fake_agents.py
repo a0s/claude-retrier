@@ -46,7 +46,7 @@ class TestFakeClaudeScript(TwoWrappersTestCase):
     def test_dropfirstfold_swallows_exactly_one_attempt(self):
         a, _b = self.two({"agent": "claude", "FAKE_SCRIPT": "dropfirstfold"})
         self.assertTrue(a.read_until("ready"))
-        fold = ("handoff to `.claude-retrier/handoff.md` — the reply must be "
+        fold = ("handoff to `.agent-retrier/handoff.md` — the reply must be "
                 "exactly HANDOFF and nothing else")
         a.send(fold + "\r")
         time.sleep(0.5)

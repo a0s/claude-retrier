@@ -3,20 +3,20 @@
        alt="A laptop at night showing 'limit reached - resets 3pm', and below it the wrapper typing 'continue'">
 </p>
 
-# claude-retrier
+# agent-retrier
 
-[![test](https://github.com/a0s/claude-retrier/actions/workflows/test.yml/badge.svg)](https://github.com/a0s/claude-retrier/actions/workflows/test.yml)
+[![test](https://github.com/a0s/agent-retrier/actions/workflows/test.yml/badge.svg)](https://github.com/a0s/agent-retrier/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Keep a **Claude Code** or **codex** session going when it stops — for a usage
 limit, or for a server that refused the turn — and restart it before it runs out
-of context. `claude-retrier` wraps claude, `codex-retrier` wraps codex, and
+of context. `agent-retrier` wraps claude, `codex-retrier` wraps codex, and
 neither is an afterthought: both agents get the same features, each driven the
 way it actually works. One shell script, with no tmux and no daemon behind it.
 
 ```sh
-brew install a0s/claude-retrier/claude-retrier
-claude-retrier                       # instead of: claude
+brew install a0s/agent-retrier/agent-retrier
+agent-retrier                       # instead of: claude
 codex-retrier                        # instead of: codex
 ```
 
@@ -25,15 +25,15 @@ codex-retrier                        # instead of: codex
 Homebrew, on macOS and Linux:
 
 ```sh
-brew install a0s/claude-retrier/claude-retrier
+brew install a0s/agent-retrier/agent-retrier
 ```
 
 Or take the file. It is self contained and there is no build step:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/a0s/claude-retrier/main/claude-retrier.sh
-chmod +x claude-retrier.sh
-ln -s claude-retrier.sh codex-retrier            # optional: the codex name
+curl -fsSLO https://raw.githubusercontent.com/a0s/agent-retrier/main/agent-retrier.sh
+chmod +x agent-retrier.sh
+ln -s agent-retrier.sh codex-retrier            # optional: the codex name
 ```
 
 Both names are installed whichever agents you have. `codex-retrier` is the same
@@ -41,22 +41,40 @@ file with codex as its default, and on a machine without codex all it does is
 say so — which also means installing codex later needs nothing reinstalled.
 
 Every version is also attached to a
-[release](https://github.com/a0s/claude-retrier/releases), with the notes for it
+[release](https://github.com/a0s/agent-retrier/releases), with the notes for it
 in [CHANGELOG.md](CHANGELOG.md).
 
-Uninstall is `brew uninstall claude-retrier`, or deleting the file. Nothing else
+Uninstall is `brew uninstall agent-retrier`, or deleting the file. Nothing else
 was touched: no shell rc edits, no launch agents, no background process.
 
 Needs `bash` and `python3` 3.9+ ([details](docs/how-it-works.md#requirements)).
+
+### Upgrading from the old name
+
+Before 3.0.0 this project was called `claude-retrier`. Homebrew does not follow
+the rename by itself, so remove the old formula and tap first:
+
+```sh
+brew uninstall claude-retrier 2>/dev/null
+brew untap a0s/claude-retrier
+brew install a0s/agent-retrier/agent-retrier
+```
+
+Then replace `claude-retrier` with `agent-retrier` in your aliases, and, to keep
+the old log and fold history, move the state directory:
+
+```sh
+mv ~/.claude-retrier ~/.agent-retrier
+```
 
 ## Quick start
 
 Run it wherever you would have run `claude` or `codex`:
 
 ```sh
-claude-retrier                                   # instead of: claude
-claude-retrier --resume 5e7a1c02-1a4b-4d99-b2f7  # any claude flag works
-claude-retrier --cmd 'claude --model opus'       # or your own claude command
+agent-retrier                                   # instead of: claude
+agent-retrier --resume 5e7a1c02-1a4b-4d99-b2f7  # any claude flag works
+agent-retrier --cmd 'claude --model opus'       # or your own claude command
 codex-retrier                                    # instead of: codex
 codex-retrier resume --last                      # any codex arguments too
 ```
@@ -70,7 +88,7 @@ should get that by accident. Two lines turn it on for **both** agents:
 
 ```sh
 export CR_CONTEXT_RESTART=1                                # arm it
-export CR_HANDOFF_FILE='.claude-retrier/handoff-{id}.md'   # one file per session
+export CR_HANDOFF_FILE='.agent-retrier/handoff-{id}.md'   # one file per session
 ```
 
 No number to pick: each agent restarts at its own point — 51% of the window for
@@ -78,7 +96,7 @@ claude, the hard cap minus a 64k reserve for codex — because the right number
 is genuinely not the same on both. `--cr-models` prints the table resolved
 against your machine. `{id}` gives every session a handoff file of its own, so
 a claude and a codex session running side by side in one repo can never write
-over each other. Then `.gitignore` the `.claude-retrier/` directory and you are
+over each other. Then `.gitignore` the `.agent-retrier/` directory and you are
 done. → [minimal configs](docs/configuration.md#minimal-configs),
 [context restart](docs/context-restart.md)
 
@@ -88,7 +106,7 @@ The session fills up, the wrapper asks for a handoff file, checks it really was
 written, sends `/clear`, and points the fresh session at the file. Four typed
 steps, each announced in the terminal before it happens.
 
-![a claude-retrier context restart](docs/demo/claude-restart.gif)
+![a agent-retrier context restart](docs/demo/claude-restart.gif)
 
 A real session with the threshold turned down so the whole sequence fits in a
 few seconds; nothing in it is staged. The [`docs/demo/`](docs/demo/) directory
@@ -131,7 +149,7 @@ pretending they are the same:
 
 | | Claude Code | codex |
 |---|---|---|
-| wrapper name | `claude-retrier` | `codex-retrier` (same file) |
+| wrapper name | `agent-retrier` | `codex-retrier` (same file) |
 | command setting | `CR_CLAUDE_CMD` / `--cmd` | `CR_CODEX_CMD` / `--cmd` |
 | which session is mine | `~/.claude/sessions/<pid>.json`, read outright | the fold phrase's nonce, echoed into the rollout |
 | context window | the model profile table, corrected by claude's own statusline | stated in every rollout row |
@@ -157,7 +175,7 @@ pretending they are the same:
 
 ## Troubleshooting
 
-Start with `~/.claude-retrier/log`, then see
+Start with `~/.agent-retrier/log`, then see
 [troubleshooting.md](docs/troubleshooting.md).
 
 ## License

@@ -1,4 +1,4 @@
-"""Record a real claude-retrier / codex-retrier session as an asciicast v2 file.
+"""Record a real agent-retrier / codex-retrier session as an asciicast v2 file.
 
 This drives a LIVE agent (it spends quota) on its own pty, with the context
 restart armed at an artificially low threshold so the whole fold → verify →
@@ -33,7 +33,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-WRAP = os.path.join(ROOT, "claude-retrier.sh")
+WRAP = os.path.join(ROOT, "agent-retrier.sh")
 
 ROWS, COLS = 28, 100
 
@@ -96,7 +96,7 @@ def build_env(agent, project, threshold, config_home):
     """A clean environment: whatever wraps THIS shell must not leak in.
 
     A session started from inside a wrapped one already carries
-    CLAUDE_RETRIER_ACTIVE, and the wrapper degrades to a plain exec when it
+    AGENT_RETRIER_ACTIVE, and the wrapper degrades to a plain exec when it
     sees it (project memory: wrapped-session-env) — which would record a
     session with no restart in it at all.
 
@@ -111,7 +111,7 @@ def build_env(agent, project, threshold, config_home):
     """
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("CR_") and not k.startswith("CLAUDE_CODE_")
-           and k != "CLAUDE_RETRIER_ACTIVE"}
+           and k != "AGENT_RETRIER_ACTIVE"}
     env.update({
         "TERM": "xterm-256color",
         "COLUMNS": str(COLS),

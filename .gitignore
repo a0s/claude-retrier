@@ -2,6 +2,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .envrc
-.claude-retrier/
+.agent-retrier/
 .codegraph/
 .codegraph-src/

@@ -44,7 +44,7 @@ def main():
     # inherits the messaging socket/session id does not start clean.
     env = {k: v for k, v in os.environ.items()
            if not k.startswith("CLAUDE_CODE_") and not k.startswith("CR_")
-           and k != "CLAUDE_RETRIER_ACTIVE"}
+           and k != "AGENT_RETRIER_ACTIVE"}
     env["TERM"] = "xterm-256color"
     env["COLUMNS"] = str(COLS)
     env["LINES"] = str(ROWS)

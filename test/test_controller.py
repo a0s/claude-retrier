@@ -2329,7 +2329,7 @@ class TestTheIdPlaceholder(unittest.TestCase):
 
 
 class TestHandoffRegistry(unittest.TestCase):
-    """`{id}`-free paths rely on `~/.claude-retrier/sessions/<pid>.json`
+    """`{id}`-free paths rely on `~/.agent-retrier/sessions/<pid>.json`
     (`CR_HANDOFF_REGISTRY_DIR`) to notice a live collision and move aside."""
 
     def setUp(self):

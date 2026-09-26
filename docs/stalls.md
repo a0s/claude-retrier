@@ -30,7 +30,7 @@ unsent draft in the prompt box.
 ## Detection patterns
 
 Detection patterns for a refused turn live in `CR_STALL_PATTERNS`, next to the
-other pattern arrays at the top of `claude-retrier.sh`. That array is kept
+other pattern arrays at the top of `agent-retrier.sh`. That array is kept
 narrow on purpose: a wrong stall is a message typed into a live session for no
 reason.
 

@@ -9,7 +9,7 @@
 set -eu
 cd "$(dirname "$0")/.." || exit 1
 
-IMAGE=${CR_TEST_IMAGE:-claude-retrier-test}
+IMAGE=${CR_TEST_IMAGE:-agent-retrier-test}
 
 if ! command -v docker >/dev/null 2>&1; then
   echo "run-docker.sh: docker is not installed" >&2

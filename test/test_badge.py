@@ -49,8 +49,8 @@ class TestText(unittest.TestCase):
         self.assertIn("31", sgr)                   # red
 
     def test_the_label_is_configurable(self):
-        text, _ = badge(badge_label="claude-retrier").frame(cr.IDLE, 0, 0, 3, 0)
-        self.assertEqual(text, "◆ claude-retrier")
+        text, _ = badge(badge_label="agent-retrier").frame(cr.IDLE, 0, 0, 3, 0)
+        self.assertEqual(text, "◆ agent-retrier")
 
     def test_the_context_percentage_shows(self):
         text, _ = badge().frame(cr.IDLE, 0, 0, 3, 0, context=47.0)

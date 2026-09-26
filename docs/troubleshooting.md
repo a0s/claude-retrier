@@ -7,7 +7,7 @@ limitations.
 
 ## Start with the log
 
-`~/.claude-retrier/log` (or `CR_LOG`) has the whole story with numbers. It is
+`~/.agent-retrier/log` (or `CR_LOG`) has the whole story with numbers. It is
 the only file the wrapper writes under your home directory.
 
 ## How to read the log by pid
@@ -57,7 +57,7 @@ for the full unfold sequence and why giving up looks the way it does.
 - **The badge says `unfold failed`.** See
   [Unfold failed — what to do](#unfold-failed-what-to-do).
 - **The wrong command runs, or an alias is not found.**
-  `claude-retrier --cmd X --cr-dump-argv` prints exactly what will be executed.
+  `agent-retrier --cmd X --cr-dump-argv` prints exactly what will be executed.
   See [custom-command.md](custom-command.md).
 - **codex is not being wrapped.** `codex exec`, `codex login`, `codex mcp` and
   the rest run untouched on purpose; only sessions (plain `codex`,

@@ -4,8 +4,24 @@ Every released version, newest first. The section for a tag is what GitHub shows
 as that release's notes — `.github/workflows/release.yml` reads it straight out
 of this file, so a release cannot describe itself differently from here.
 
-The version in `claude-retrier.sh` (`CR_VERSION`) must match the newest entry
+The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
+
+## [3.0.0] - 2026-09-26
+
+### Changed
+- **Renamed to agent-retrier.** The project has wrapped codex as well as
+  Claude Code for a while, so the name now says so. Everything that carried
+  the old name moved with it:
+  - the command is `agent-retrier` (`codex-retrier` is unchanged), and the
+    script is `agent-retrier.sh`;
+  - the repository is `github.com/a0s/agent-retrier`, the Homebrew tap is
+    `a0s/agent-retrier` (formula `agent-retrier`);
+  - the state directory is `~/.agent-retrier/` (log, sessions, status, folds);
+    the per-project handoff files live in `.agent-retrier/`;
+  - the nesting guard is `AGENT_RETRIER_ACTIVE`.
+- Upgrading from the old name: see "Upgrading from the old name" in the
+  README.
 
 ## [2.0.2] - 2026-09-23
 
@@ -31,7 +47,7 @@ below; the test suite checks it.
 ## [2.0.1] - 2026-09-20
 
 ### Fixed
-- `claude-retrier attach <id>` could start a new prompt instead of attaching
+- `agent-retrier attach <id>` could start a new prompt instead of attaching
   to the named background session whenever context restart was armed. The
   statusline proxy added `--settings` before `attach`, but current Claude Code
   only recognizes that subcommand as the first token. Attach launches now keep
@@ -173,7 +189,7 @@ running and costing.
 - `CR_CODEX_INTERRUPT_AFTER_SEC` interrupts a codex turn that has simply sat
   past the ordinary threshold too long, instead of only ever restarting at
   the hard cap-minus-reserve line. Fold cost is now logged and accumulated
-  (`~/.claude-retrier/folds.json`), and `CR_CODEX_RESERVE_ADAPT=1` raises the
+  (`~/.agent-retrier/folds.json`), and `CR_CODEX_RESERVE_ADAPT=1` raises the
   effective reserve to 1.25x the largest observed cost.
 - The badge now ranks its warnings by severity — an unfold failure or a
   restart switched off for the session stays on screen (repeating every
@@ -203,7 +219,7 @@ running and costing.
 
 The context restart never once worked on codex, and now does — with a threshold
 of its own, and ahead of codex's own compaction rather than behind it. And
-`codex-retrier` is `claude-retrier` with codex as the default.
+`codex-retrier` is `agent-retrier` with codex as the default.
 
 ### Fixed
 - The context restart on codex asked for a handoff, got a good one, and then
@@ -238,7 +254,7 @@ of its own, and ahead of codex's own compaction rather than behind it. And
   halves off; a compaction that happens anyway is logged.
 - `codex-retrier`: the same file under a second name, with codex as its default
   — `CR_CODEX_CMD` or plain `codex`, never the `CR_CLAUDE_CMD` meant for claude.
-  Installed alongside `claude-retrier` whatever agents the machine has; without
+  Installed alongside `agent-retrier` whatever agents the machine has; without
   codex it says `codex not found on PATH` and exits 127.
 - codex has context thresholds of its own: `CR_CODEX_CONTEXT_PCT` and
   `CR_CODEX_CONTEXT_TOKENS`. The percentage defaults to claude's; the absolute
@@ -327,7 +343,7 @@ A second agent, and a second way a session stops without being finished.
 ### Added
 - **codex support.** `--agent codex` (or `CR_AGENT=codex`) wraps `codex`
   instead of `claude`; left on `auto`, the default, the wrapper works out
-  which one from the command it is given, so `claude-retrier --cmd codex`
+  which one from the command it is given, so `agent-retrier --cmd codex`
   needs nothing else. `--cr-agent` is the same flag under the prefix the
   other wrapper options carry.
 
@@ -554,7 +570,7 @@ terminal too literally.
 
 ### Fixed
 - The suite no longer measures the caller's session: `CR_*` and
-  `CLAUDE_RETRIER_ACTIVE` are stripped from the environment before each wrapper
+  `AGENT_RETRIER_ACTIVE` are stripped from the environment before each wrapper
   under test is started. Running `./test/run.sh` from inside a wrapped session
   used to make every wrapper degrade to a plain exec and the tests pass or fail
   for the wrong reason.
@@ -584,6 +600,6 @@ terminal too literally.
   screen (fallback), waits out the stated reset, and types `continue` once the
   session is idle and the human is not mid-sentence.
 
-[1.2.0]: https://github.com/a0s/claude-retrier/releases/tag/v1.2.0
-[1.1.0]: https://github.com/a0s/claude-retrier/releases/tag/v1.1.0
-[1.0.0]: https://github.com/a0s/claude-retrier/releases/tag/v1.0.0
+[1.2.0]: https://github.com/a0s/agent-retrier/releases/tag/v1.2.0
+[1.1.0]: https://github.com/a0s/agent-retrier/releases/tag/v1.1.0
+[1.0.0]: https://github.com/a0s/agent-retrier/releases/tag/v1.0.0

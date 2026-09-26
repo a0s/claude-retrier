@@ -187,7 +187,7 @@ class TestStatusPoller(unittest.TestCase):
 
 class TestClaudeLaunchArgsAddTheStatuslineProxy(unittest.TestCase):
     def setUp(self):
-        os.environ["CR_SELF"] = "/opt/bin/claude-retrier.sh"
+        os.environ["CR_SELF"] = "/opt/bin/agent-retrier.sh"
         self.addCleanup(os.environ.pop, "CR_SELF", None)
 
     def cfg(self, **over):
@@ -202,7 +202,7 @@ class TestClaudeLaunchArgsAddTheStatuslineProxy(unittest.TestCase):
         payload = json.loads(args[1])
         self.assertEqual(payload["statusLine"]["type"], "command")
         self.assertIn("--cr-statusline", payload["statusLine"]["command"])
-        self.assertIn("/opt/bin/claude-retrier.sh", payload["statusLine"]["command"])
+        self.assertIn("/opt/bin/agent-retrier.sh", payload["statusLine"]["command"])
 
     def test_never_for_codex(self):
         self.assertEqual(cr.claude_launch_args(self.cfg(), "codex", []), [])

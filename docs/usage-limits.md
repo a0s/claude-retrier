@@ -51,18 +51,18 @@ banners included — past the same scraper. A wait the screen did schedule stays
 open to it: a banner stating an earlier reset takes over, so a wrong one cannot
 hold the session past the moment it could have gone back to work.
 
-Detection patterns live in one array at the top of `claude-retrier.sh`. Add a
+Detection patterns live in one array at the top of `agent-retrier.sh`. Add a
 wording and nothing else changes.
 
 ## Resuming a session
 
 Claude's own flags pass straight through, so whatever you would type after
-`claude` you type after `claude-retrier` instead:
+`claude` you type after `agent-retrier` instead:
 
 ```sh
-claude-retrier --resume deb786e8-3006-4edf-b5e6-2ca73e25620e   # claude --resume <id>
-claude-retrier --continue                                      # the last session here
-claude-retrier --cmd claude-work --resume deb786e8-3006-4edf-b5e6-2ca73e25620e
+agent-retrier --resume deb786e8-3006-4edf-b5e6-2ca73e25620e   # claude --resume <id>
+agent-retrier --continue                                      # the last session here
+agent-retrier --cmd claude-work --resume deb786e8-3006-4edf-b5e6-2ca73e25620e
 ```
 
 A resumed session is watched exactly like a fresh one. The wrapper follows the

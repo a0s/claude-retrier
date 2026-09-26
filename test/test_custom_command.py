@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_pty import PtyTestCase, FAKE          # noqa: E402  (pty harness, reused)
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WRAP = os.path.join(ROOT, "claude-retrier.sh")
+WRAP = os.path.join(ROOT, "agent-retrier.sh")
 
 
 def has(shell):
@@ -82,10 +82,10 @@ class Rig:
 
 
 def run(args, env, timeout=30):
-    # CR_* and CLAUDE_RETRIER_ACTIVE from a wrapped caller would configure the
+    # CR_* and AGENT_RETRIER_ACTIVE from a wrapped caller would configure the
     # very wrapper under test; start from a clean environment.
     full = {k: v for k, v in os.environ.items()
-            if not k.startswith("CR_") and k != "CLAUDE_RETRIER_ACTIVE"}
+            if not k.startswith("CR_") and k != "AGENT_RETRIER_ACTIVE"}
     full.update(env)
     return subprocess.run([WRAP, *args], env=full, stdin=subprocess.DEVNULL,
                           capture_output=True, text=True, timeout=timeout)
@@ -259,7 +259,7 @@ class CommandShapes(unittest.TestCase):
 
     @unittest.skipUnless(has("zsh"), "no zsh")
     def test_an_alias_pointing_back_at_the_wrapper_is_stopped(self):
-        # The same loop by another route: `alias claude='claude-retrier.sh …'`,
+        # The same loop by another route: `alias claude='agent-retrier.sh …'`,
         # which is exactly how someone would wire this into their rc file.
         with open(os.path.join(self.rig.zdotdir, ".zshrc"), "w") as fh:
             fh.write("alias claude='%s --cmd claude'\n" % WRAP)

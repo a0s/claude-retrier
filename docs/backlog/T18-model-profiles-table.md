@@ -58,7 +58,7 @@ the wrapper should restart. There is no command to inspect this.
       reports 258 400 → threshold 194 400; with `model_context_window=872000` in
       the rollout → the profile threshold is not applied, but
       `CR_CODEX_CONTEXT_PCT`/reserve is (describe the expected number in the test).
-- [ ] `./claude-retrier.sh --cr-models` prints a table; a test in
+- [ ] `./agent-retrier.sh --cr-models` prints a table; a test in
       `test_degrade.py` checks for `claude-opus-5` and `gpt-5.6-sol`.
 - [ ] All existing `test_models.py` tests are green (`model_window` behavior
       for point releases is preserved).

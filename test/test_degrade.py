@@ -13,7 +13,7 @@ import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-WRAP = os.path.join(ROOT, "claude-retrier.sh")
+WRAP = os.path.join(ROOT, "agent-retrier.sh")
 FAKE_SRC = os.path.join(ROOT, "test", "fake_claude.py")
 
 
@@ -28,15 +28,15 @@ def launcher(dirpath, body=None):
 def clean_env():
     """os.environ minus anything a wrapped session would have exported.
 
-    Running the suite from inside a claude-retrier session leaves
-    CLAUDE_RETRIER_ACTIVE=1 in the environment, which is a legitimate instruction
+    Running the suite from inside a agent-retrier session leaves
+    AGENT_RETRIER_ACTIVE=1 in the environment, which is a legitimate instruction
     to the wrapper — degrade, do not stack a second supervisor. Every wrapper
     started here would obey it, and the tests would be measuring the caller's
     session instead of the code.
     """
     return {k: v for k, v in os.environ.items()
             if not k.startswith("CR_")
-            and k not in ("CLAUDE_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+            and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
 
 
 def run(args=(), env=None, stdin=subprocess.DEVNULL, timeout=30):
@@ -49,7 +49,7 @@ def run(args=(), env=None, stdin=subprocess.DEVNULL, timeout=30):
 
 class TestCli(unittest.TestCase):
     def test_version(self):
-        self.assertIn("claude-retrier", run(["--cr-version"]).stdout)
+        self.assertIn("agent-retrier", run(["--cr-version"]).stdout)
 
     def test_dump_python_is_valid_python(self):
         src = run(["--cr-dump-python"]).stdout
@@ -103,7 +103,7 @@ class TestTheRemovedPercentSettingsRefuseToStart(unittest.TestCase):
     def test_an_empty_value_is_not_considered_set(self):
         r = run(["--cr-version"], env={"CR_CONTEXT_PCT": ""})
         self.assertEqual(r.returncode, 0)
-        self.assertIn("claude-retrier", r.stdout)
+        self.assertIn("agent-retrier", r.stdout)
 
 
 class TestDegradation(unittest.TestCase):
@@ -140,7 +140,7 @@ class TestDegradation(unittest.TestCase):
     def test_recursion_is_refused(self):
         # If a wrapped session somehow invokes `claude` again, the inner call
         # must not stack a second pty supervisor on top of the first.
-        r = run(env=self.env(CLAUDE_RETRIER_ACTIVE="1"), timeout=20)
+        r = run(env=self.env(AGENT_RETRIER_ACTIVE="1"), timeout=20)
         self.assertIn("fake-claude ready", r.stdout)
         self.assertFalse(self.supervised())
 
@@ -256,9 +256,9 @@ class TestHowTheSupervisorIsHandedOver(unittest.TestCase):
         self.assertTrue(started, r.stderr)
 
     def test_the_temp_file_does_not_outlive_the_exec(self):
-        before = set(glob.glob(os.path.join(tempfile.gettempdir(), "claude-retrier.*")))
+        before = set(glob.glob(os.path.join(tempfile.gettempdir(), "agent-retrier.*")))
         self.supervised("tmp")
-        after = set(glob.glob(os.path.join(tempfile.gettempdir(), "claude-retrier.*")))
+        after = set(glob.glob(os.path.join(tempfile.gettempdir(), "agent-retrier.*")))
         self.assertEqual(after - before, set())
 
 

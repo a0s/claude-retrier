@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-retrier — keep a Claude Code or codex session going, without tmux.
+# agent-retrier — keep a Claude Code or codex session going, without tmux.
 #
 # One file. Wraps the agent in a PTY it owns, so it can BOTH see everything the
 # session prints AND type into it — the two capabilities that forced the tmux
@@ -7,14 +7,14 @@
 # monitor, event markers, launchd/systemd reconcilers, shell-function installer)
 # falls out as unnecessary.
 #
-# Usage:  claude-retrier.sh [claude args...]
-#         claude-retrier.sh --cmd <your-claude> [claude args...]
-#         claude-retrier.sh --agent codex --cmd codex [codex args...]
+# Usage:  agent-retrier.sh [claude args...]
+#         agent-retrier.sh --cmd <your-claude> [claude args...]
+#         agent-retrier.sh --agent codex --cmd codex [codex args...]
 #         codex-retrier [codex args...]          # the same file, codex by default
-#         claude-retrier.sh --cr-dump-python      # print the embedded Python (used by tests)
-#         claude-retrier.sh --cr-models           # print the model profile table (T18)
-#         claude-retrier.sh --cr-statusline <path> # statusline proxy (used via --settings, T20)
-#         claude-retrier.sh --cr-version
+#         agent-retrier.sh --cr-dump-python      # print the embedded Python (used by tests)
+#         agent-retrier.sh --cr-models           # print the model profile table (T18)
+#         agent-retrier.sh --cr-statusline <path> # statusline proxy (used via --settings, T20)
+#         agent-retrier.sh --cr-version
 #
 # `--cmd` (or CR_CLAUDE_CMD) is whatever YOU type to start the agent: a binary, a
 # script, a name on PATH, an alias or shell function from your ~/.zshrc, or a whole
@@ -79,7 +79,7 @@
 
 set -u
 
-CR_VERSION="2.0.2"
+CR_VERSION="3.0.0"
 # Which copy of this file is running. The update notice prints the command
 # that updates THIS one, and `brew upgrade` at someone running a git clone
 # would be advice that does nothing.
@@ -233,7 +233,7 @@ CR_IGNORE_PATTERNS=(
   "temporarily limiting requests"
   "approaching (your )?.{0,16}limit"           # the 90%-warning banner: not a stop
   "you are nearing"
-  "claude-retrier|claude-auto-retry|CR_LIMIT_PATTERNS|CR_RESET_PATTERNS|CR_STALL_PATTERNS"
+  "agent-retrier|claude-auto-retry|CR_LIMIT_PATTERNS|CR_RESET_PATTERNS|CR_STALL_PATTERNS"
   "^\\s*[#>]\\s"                               # markdown quote / comment in a rendered doc
 )
 
@@ -302,7 +302,7 @@ CR_AGENTS_PANEL_ROW_PATTERNS=(
 : "${CR_RESUME_SEC:=15}"               # claude working this long during a wait => limit is gone
 : "${CR_VERIFY_SEC:=60}"               # how long to watch for the retry taking hold
 : "${CR_SCRAPE:=auto}"                 # auto | always | never  (screen-scrape fallback)
-: "${CR_LOG:=$HOME/.claude-retrier/log}"
+: "${CR_LOG:=$HOME/.agent-retrier/log}"
 : "${CR_LOG_MAX_BYTES:=5M}"            # rotate the shared log once it passes this size
 : "${CR_LOG_KEEP:=2}"                  # how many rotated copies (log.1, log.2, ...) to keep
 : "${CR_NOTIFY:=1}"                    # print a one-line status note into the terminal
@@ -365,7 +365,7 @@ for cr_gone in CR_CONTEXT_PCT CR_CODEX_CONTEXT_PCT; do
   eval "cr_gone_val=\${$cr_gone:-}"
   [ -n "$cr_gone_val" ] || continue
   printf '%s\n' \
-    "claude-retrier: $cr_gone was removed in 2.0 and is no longer read." \
+    "agent-retrier: $cr_gone was removed in 2.0 and is no longer read." \
     "  Unset it, then arm the restart one of these ways:" \
     "    CR_CONTEXT_RESTART=1          # each model's own row (--cr-models)" \
     "    CR_CONTEXT_TOKENS=510k        # one absolute number" \
@@ -403,7 +403,7 @@ done
 # when it was asked for) is logged and accumulated here after every codex fold,
 # so CR_CODEX_RESERVE_TOKENS can be judged against real folds instead of the one
 # incident it was picked from (T22).
-: "${CR_CODEX_FOLDS_FILE:=$HOME/.claude-retrier/folds.json}"
+: "${CR_CODEX_FOLDS_FILE:=$HOME/.agent-retrier/folds.json}"
 # 1 = once an observed fold cost outgrows CR_CODEX_RESERVE_TOKENS, use
 # 1.25x the largest one seen (from CR_CODEX_FOLDS_FILE) as the effective reserve
 # from then on, instead of only recommending the change in the log.
@@ -421,23 +421,23 @@ done
 # fetch never blocks a session: what is printed at startup comes from the cache
 # the previous run left, and the refresh happens in the background afterwards.
 : "${CR_UPDATE_CHECK:=1}"              # 0 = never look, never mention it
-: "${CR_UPDATE_REPO:=a0s/claude-retrier}"
+: "${CR_UPDATE_REPO:=a0s/agent-retrier}"
 : "${CR_UPDATE_URL:=}"                 # overrides the repo's releases feed
-: "${CR_UPDATE_BREW_FORMULA:=a0s/claude-retrier/claude-retrier}"
-: "${CR_UPDATE_CACHE:=$HOME/.claude-retrier/update.json}"
+: "${CR_UPDATE_BREW_FORMULA:=a0s/agent-retrier/agent-retrier}"
+: "${CR_UPDATE_CACHE:=$HOME/.agent-retrier/update.json}"
 : "${CR_UPDATE_TTL_SEC:=86400}"        # a day between checks
 : "${CR_UPDATE_TIMEOUT_SEC:=10}"
 : "${CR_UPDATE_NOTICE_SEC:=2}"         # how long the notice stays before claude starts
 
 : "${CR_MODEL_LOOKUP:=1}"              # 0 = never ask anything over the network
 : "${CR_MODEL_LOOKUP_TIMEOUT_SEC:=10}" # per request, and it is never waited on
-: "${CR_MODEL_CACHE:=$HOME/.claude-retrier/windows.json}"
+: "${CR_MODEL_CACHE:=$HOME/.agent-retrier/windows.json}"
 : "${CR_MODEL_CACHE_TTL_SEC:=604800}"  # a week
 : "${CR_MODELS_DOC_URL:=https://platform.claude.com/docs/en/models/overview.md}"
 : "${CR_MODELS_API_URL:=https://api.anthropic.com/v1/models}"
-: "${CR_HANDOFF_FILE:=.claude-retrier/handoff.md}"   # relative to cwd — .gitignore it
+: "${CR_HANDOFF_FILE:=.agent-retrier/handoff.md}"   # relative to cwd — .gitignore it
                                         # supports {id}, a short id unique per session (T05)
-: "${CR_HANDOFF_REGISTRY_DIR:=$HOME/.claude-retrier/sessions}"
+: "${CR_HANDOFF_REGISTRY_DIR:=$HOME/.agent-retrier/sessions}"
                                         # where wrapper instances claim their handoff path
 : "${CR_HANDOFF_MARKER:=HANDOFF}"      # a nonce is appended; must end the file
 : "${CR_HANDOFF_MIN_BYTES:=200}"       # anything shorter is not a handoff
@@ -514,7 +514,7 @@ CR_CANCEL_MSG_DEFAULT='The context restart was cancelled — the handoff is not 
 # SECTION 3 — argument handling / degradation
 # =============================================================================
 case "${1:-}" in
-  --cr-version) echo "claude-retrier $CR_VERSION"; exit 0 ;;
+  --cr-version) echo "agent-retrier $CR_VERSION"; exit 0 ;;
   --cr-help|-h|--help-retrier)
     sed -n '2,73p' "$0" | sed 's/^# \{0,1\}//'
     exit 0 ;;
@@ -523,7 +523,7 @@ esac
 # `--cmd <command>` — the user's own way of starting Claude. Leading position
 # only: everything after it belongs to claude, and claude takes a bare prompt as
 # its first argument, so a positional guess would eat the prompt of anyone typing
-# `claude-retrier.sh "fix the bug"`.
+# `agent-retrier.sh "fix the bug"`.
 #
 # `--cr-cmd` is the same flag under the prefix every other wrapper option carries.
 # It stays because it is the unambiguous spelling: should claude ever grow a
@@ -534,7 +534,7 @@ CR_CMD_SPEC="$CR_CLAUDE_CMD"
 # copy under that name — it is the same wrapper with codex as the default: its
 # command is CR_CODEX_CMD or plain `codex`, never the CR_CLAUDE_CMD a claude user
 # keeps in their rc file. `--cmd` and `--agent` still win.
-CR_PROG=claude-retrier
+CR_PROG=agent-retrier
 CR_CMD_DEFAULTED=0
 case "${CR_SELF##*/}" in
   codex-retrier|codex-retrier.sh)
@@ -552,7 +552,7 @@ while [ "$#" -gt 0 ]; do
     --cmd=*) CR_CMD_SPEC="${1#--cmd=}"; CR_CMD_DEFAULTED=0; shift ;;
     --cr-cmd=*) CR_CMD_SPEC="${1#--cr-cmd=}"; CR_CMD_DEFAULTED=0; shift ;;
     --agent|--cr-agent)
-      [ "$#" -ge 2 ] || { echo "claude-retrier: $1 needs claude or codex" >&2; exit 2; }
+      [ "$#" -ge 2 ] || { echo "agent-retrier: $1 needs claude or codex" >&2; exit 2; }
       CR_AGENT="$2"; shift 2 ;;
     --agent=*) CR_AGENT="${1#--agent=}"; shift ;;
     --cr-agent=*) CR_AGENT="${1#--cr-agent=}"; shift ;;
@@ -562,7 +562,7 @@ done
 
 case "$CR_AGENT" in
   auto|claude|codex) ;;
-  *) echo "claude-retrier: unknown agent '$CR_AGENT' — expected claude or codex" >&2; exit 2 ;;
+  *) echo "agent-retrier: unknown agent '$CR_AGENT' — expected claude or codex" >&2; exit 2 ;;
 esac
 
 # A user command that resolves back to this script would fork-bomb the machine.
@@ -571,7 +571,7 @@ esac
 CR_DEPTH=$(( ${CR_DEPTH:-0} + 1 ))
 export CR_DEPTH
 if [ "$CR_DEPTH" -gt 3 ]; then
-  echo "claude-retrier: refusing to recurse — does your claude command point back at claude-retrier?" >&2
+  echo "agent-retrier: refusing to recurse — does your claude command point back at agent-retrier?" >&2
   exit 1
 fi
 
@@ -795,7 +795,7 @@ cr_find_python() {
 # SECTION 4 — the wrapper itself
 # =============================================================================
 IFS= read -r -d '' CR_PY <<'CR_PYTHON_EOF' || true
-"""claude-retrier PTY supervisor.
+"""agent-retrier PTY supervisor.
 
 Runs claude on a pty we own, forwards bytes both ways untouched, and watches two
 independent channels for "the session stopped because the quota ran out":
@@ -892,7 +892,7 @@ CFG = dict(
     resume=_env("CR_RESUME_SEC", 15, float),
     verify=_env("CR_VERIFY_SEC", 60, float),
     scrape=_env("CR_SCRAPE", "auto"),
-    log=_env("CR_LOG", os.path.expanduser("~/.claude-retrier/log")),
+    log=_env("CR_LOG", os.path.expanduser("~/.agent-retrier/log")),
     log_max_bytes=parse_tokens(os.environ.get("CR_LOG_MAX_BYTES") or "5M") or 5_000_000,
     log_keep=_env("CR_LOG_KEEP", 2, int),
     notify=_env("CR_NOTIFY", "1") == "1",
@@ -927,11 +927,11 @@ CFG = dict(
     codex_interrupt_after_sec=_env("CR_CODEX_INTERRUPT_AFTER_SEC", 0.0, float),
     codex_reserve_adapt=_env("CR_CODEX_RESERVE_ADAPT", "0") == "1",
     codex_folds_file=_env("CR_CODEX_FOLDS_FILE",
-                          os.path.expanduser("~/.claude-retrier/folds.json")),
+                          os.path.expanduser("~/.agent-retrier/folds.json")),
     codex_logs_db=_env("CR_CODEX_LOGS_DB", ""),
-    handoff_file=_env("CR_HANDOFF_FILE", ".claude-retrier/handoff.md"),
+    handoff_file=_env("CR_HANDOFF_FILE", ".agent-retrier/handoff.md"),
     handoff_registry_dir=_env("CR_HANDOFF_REGISTRY_DIR",
-                              os.path.expanduser("~/.claude-retrier/sessions")),
+                              os.path.expanduser("~/.agent-retrier/sessions")),
     handoff_marker=_env("CR_HANDOFF_MARKER", "HANDOFF"),
     handoff_min_bytes=_env("CR_HANDOFF_MIN_BYTES", 200, int),
     handoff_attempts=_env("CR_HANDOFF_ATTEMPTS", 2, int),
@@ -956,11 +956,11 @@ CFG = dict(
     # wrapper starts claude itself, so whatever narrows its window narrows ours.
     # -- a newer release of the wrapper itself --
     update_check=_env("CR_UPDATE_CHECK", "1") == "1",
-    update_repo=_env("CR_UPDATE_REPO", "a0s/claude-retrier"),
+    update_repo=_env("CR_UPDATE_REPO", "a0s/agent-retrier"),
     update_url=_env("CR_UPDATE_URL", ""),
-    update_formula=_env("CR_UPDATE_BREW_FORMULA", "a0s/claude-retrier/claude-retrier"),
+    update_formula=_env("CR_UPDATE_BREW_FORMULA", "a0s/agent-retrier/agent-retrier"),
     update_cache=_env("CR_UPDATE_CACHE",
-                      os.path.expanduser("~/.claude-retrier/update.json")),
+                      os.path.expanduser("~/.agent-retrier/update.json")),
     update_ttl=_env("CR_UPDATE_TTL_SEC", 86400.0, float),
     update_timeout=_env("CR_UPDATE_TIMEOUT_SEC", 10.0, float),
     update_notice=_env("CR_UPDATE_NOTICE_SEC", 2.0, float),
@@ -969,7 +969,7 @@ CFG = dict(
     model_lookup=_env("CR_MODEL_LOOKUP", "1") == "1",
     model_lookup_timeout=_env("CR_MODEL_LOOKUP_TIMEOUT_SEC", 10.0, float),
     model_cache=_env("CR_MODEL_CACHE",
-                     os.path.expanduser("~/.claude-retrier/windows.json")),
+                     os.path.expanduser("~/.agent-retrier/windows.json")),
     model_cache_ttl=_env("CR_MODEL_CACHE_TTL_SEC", 604800.0, float),
     models_doc_url=_env("CR_MODELS_DOC_URL",
                         "https://platform.claude.com/docs/en/models/overview.md"),
@@ -978,7 +978,7 @@ CFG = dict(
     context_no_1m=_env("CLAUDE_CODE_DISABLE_1M_CONTEXT", "0") not in ("0", "false", "no"),
     # -- claude's own statusline, relayed by --cr-statusline (T20) --
     statusline_proxy=_env("CR_STATUSLINE_PROXY", "1") == "1",
-    status_dir=_env("CR_STATUS_DIR", os.path.expanduser("~/.claude-retrier/status")),
+    status_dir=_env("CR_STATUS_DIR", os.path.expanduser("~/.agent-retrier/status")),
 )
 
 
@@ -2103,7 +2103,7 @@ def pick_agent(name, launch):
     """Which of the two we are wrapping: what was asked for, or what was run.
 
     Only the launch vector is read, never the arguments meant for the agent. A
-    prompt is one of those — `claude-retrier "fix the codex build"` starts
+    prompt is one of those — `agent-retrier "fix the codex build"` starts
     claude, and reading the sentence would have it looking for a rollout file
     that will never be written.
     """
@@ -2547,7 +2547,7 @@ def claude_launch_args(cfg, agent, argv, pid=None):
         # semantics is more important than observing its status line.
         return []
     raw_self = os.environ.get("CR_SELF") or ""
-    self_path = os.path.realpath(raw_self) if raw_self else "claude-retrier"
+    self_path = os.path.realpath(raw_self) if raw_self else "agent-retrier"
     status_path = os.path.join(cfg["status_dir"],
                                "%d.json" % (pid if pid is not None else os.getpid()))
     command = "%s --cr-statusline %s" % (shlex.quote(self_path), shlex.quote(status_path))
@@ -2808,7 +2808,7 @@ def _compaction_reserve(agent):
     base = parse_tokens(os.environ.get("CR_CODEX_RESERVE_TOKENS") or "64k") or 0
     if _env("CR_CODEX_RESERVE_ADAPT", "0") != "1":
         return base
-    path = os.path.expanduser(_env("CR_CODEX_FOLDS_FILE", "~/.claude-retrier/folds.json"))
+    path = os.path.expanduser(_env("CR_CODEX_FOLDS_FILE", "~/.agent-retrier/folds.json"))
     return max(base, int(1.25 * _fold_history_max(path)))
 
 
@@ -2943,7 +2943,7 @@ MAX_FETCH = 1 << 20            # the docs page is ~20KB; this is a sanity bound
 # urllib's default agent string ("Python-urllib/3.x") is refused outright by the
 # CDN in front of the docs — a 403, measured. Saying who is actually asking is
 # both what gets through and the honest thing to send.
-USER_AGENT = "claude-retrier (+https://github.com/a0s/claude-retrier)"
+USER_AGENT = "agent-retrier (+https://github.com/a0s/agent-retrier)"
 # The slug is read out of a JSON file and then pasted into a URL, so it is held
 # to what a model name can actually look like. A name with a slash or a query in
 # it is not a model this wrapper has anything to ask about.
@@ -3083,7 +3083,7 @@ class WindowLookup:
         self._store(slug, window, source)
         self.log("%s: a %s context window per %s — this build's table does not know "
                  "that slug, so the figure came off the network; update "
-                 "claude-retrier and it will not have to ask again"
+                 "agent-retrier and it will not have to ask again"
                  % (slug, human_tokens(window), source))
         self._finish(slug, window, source)
 
@@ -3192,7 +3192,7 @@ class UpdateCheck:
         have, latest = parse_version(current), parse_version(self._cached())
         if not have or not latest or latest <= have:
             return None
-        return ("claude-retrier %s \u2192 %s is out"
+        return ("agent-retrier %s \u2192 %s is out"
                 % (".".join(str(n) for n in have), ".".join(str(n) for n in latest)),
                 self.upgrade_command(self_path))
 
@@ -3332,7 +3332,7 @@ CONTEXT_DEFAULTS = dict(
     stall_wait=60.0, stall_backoff=2.0, stall_max_wait=600.0, stall_max_attempts=8,
     context_tokens=0, context_window="auto",
     context_env_max=0, context_no_1m=False,
-    handoff_file=".claude-retrier/handoff.md", handoff_marker="HANDOFF",
+    handoff_file=".agent-retrier/handoff.md", handoff_marker="HANDOFF",
     handoff_min_bytes=200, handoff_attempts=2, resume_attempts=5, handoff_msg="",
     clear_cmd="/clear", resume_msg="Read `{file}` and continue from it.",
     cancel_msg="The context restart was cancelled — the handoff is not needed "
@@ -3341,13 +3341,13 @@ CONTEXT_DEFAULTS = dict(
     context_cooldown=600.0, context_max_cycles=0,
     context_min_headroom=80000, context_max_per_hour=3, notify_repeat=300.0,
     model_lookup=False, model_lookup_timeout=10.0,
-    model_cache=os.path.expanduser("~/.claude-retrier/windows.json"),
+    model_cache=os.path.expanduser("~/.agent-retrier/windows.json"),
     model_cache_ttl=604800.0, models_doc_url="", models_api_url="",
 )
 
 
 class HandoffRegistry:
-    """Where claude-retrier's own wrapper instances announce their handoff path.
+    """Where agent-retrier's own wrapper instances announce their handoff path.
 
     Two sessions in the same project dir defaulting to the same
     `CR_HANDOFF_FILE` would otherwise overwrite each other's fold (T05); this
@@ -3356,7 +3356,7 @@ class HandoffRegistry:
     """
 
     def __init__(self, directory=None):
-        self.dir = directory or os.path.expanduser("~/.claude-retrier/sessions")
+        self.dir = directory or os.path.expanduser("~/.agent-retrier/sessions")
 
     def _entries(self):
         """`(pid, record)` for every live registration, pruning dead ones."""
@@ -4374,7 +4374,7 @@ class Controller:
 
     def _folds_path(self):
         return self.cfg.get("codex_folds_file") or os.path.expanduser(
-            "~/.claude-retrier/folds.json")
+            "~/.agent-retrier/folds.json")
 
     def _effective_codex_reserve(self):
         """CR_CODEX_RESERVE_TOKENS, or more once CR_CODEX_RESERVE_ADAPT=1 and an
@@ -6125,7 +6125,7 @@ class SubagentRegistry:
 
 class StatusPoller:
     """Reads back what `--cr-statusline`'s proxy mode last wrote for THIS
-    session (T20): `~/.claude-retrier/status/<pid>.json`, one file per
+    session (T20): `~/.agent-retrier/status/<pid>.json`, one file per
     wrapper pid, written atomically every time Claude Code invokes the
     statusline command. Polled by mtime, no more often than `poll` seconds --
     the same idiom `SubagentRegistry`/`TranscriptWatcher` already use.
@@ -6448,7 +6448,7 @@ def main(argv):
         if notice:
             headline, how = notice
             os.write(stdout_fd,
-                     ("\x1b[2m[claude-retrier] %s\n"
+                     ("\x1b[2m[agent-retrier] %s\n"
                       "                 %s\x1b[0m\n" % (headline, how)).encode())
             log("%s — %s" % (headline, how))
             time.sleep(max(0.0, CFG["update_notice"]))
@@ -6489,7 +6489,7 @@ def main(argv):
         try:
             os.execvp(launch[0], launch + extra + argv)
         except Exception as exc:
-            sys.stderr.write("claude-retrier: cannot exec %s: %s\n" % (claude, exc))
+            sys.stderr.write("agent-retrier: cannot exec %s: %s\n" % (claude, exc))
             os._exit(127)
 
     old_attr = None
@@ -6606,7 +6606,7 @@ def main(argv):
         if not CFG["notify"] or not interactive:
             return
         try:
-            os.write(stdout_fd, ("\r\x1b[2m[claude-retrier] %s\x1b[0m\r\n" % msg).encode())
+            os.write(stdout_fd, ("\r\x1b[2m[agent-retrier] %s\x1b[0m\r\n" % msg).encode())
         except Exception:
             pass
         badge.pending = True       # the line just scrolled the badge away
@@ -7016,11 +7016,11 @@ case "${1:-}" in
     # this. Whatever CR_* the caller already exported reaches python exactly
     # as it would for a real run: nothing here needs re-exporting.
     CR_PYTHON_BIN=$(cr_find_python) || {
-      echo "claude-retrier: no usable python3 found" >&2
+      echo "agent-retrier: no usable python3 found" >&2
       exit 1
     }
-    CR_MODELS_TMP=$(mktemp "${TMPDIR:-/tmp}/claude-retrier.XXXXXX") || {
-      echo "claude-retrier: cannot write a temporary file" >&2
+    CR_MODELS_TMP=$(mktemp "${TMPDIR:-/tmp}/agent-retrier.XXXXXX") || {
+      echo "agent-retrier: cannot write a temporary file" >&2
       exit 1
     }
     printf '%s' "$CR_PY" >"$CR_MODELS_TMP"
@@ -7035,11 +7035,11 @@ case "${1:-}" in
     # arrives on the former and the user's own statusline output has to leave
     # on the latter.
     CR_PYTHON_BIN=$(cr_find_python) || {
-      echo "claude-retrier: no usable python3 found" >&2
+      echo "agent-retrier: no usable python3 found" >&2
       exit 1
     }
-    CR_STATUSLINE_TMP=$(mktemp "${TMPDIR:-/tmp}/claude-retrier.XXXXXX") || {
-      echo "claude-retrier: cannot write a temporary file" >&2
+    CR_STATUSLINE_TMP=$(mktemp "${TMPDIR:-/tmp}/agent-retrier.XXXXXX") || {
+      echo "agent-retrier: cannot write a temporary file" >&2
       exit 1
     }
     printf '%s' "$CR_PY" >"$CR_STATUSLINE_TMP"
@@ -7052,7 +7052,7 @@ esac
 # ---- degrade paths: any of these and we run claude untouched -----------------
 cr_resolve_cmd "$CR_CMD_SPEC" || {
   if [ "$CR_RESOLVE_ERR" = "timeout" ]; then
-    echo "claude-retrier: your shell did not answer within ${CR_PROBE_TIMEOUT_SEC}s when asked" >&2
+    echo "agent-retrier: your shell did not answer within ${CR_PROBE_TIMEOUT_SEC}s when asked" >&2
     echo "about '$CR_CMD_SPEC'. An rc file that prompts (zsh's compinit asks about insecure" >&2
     echo "directories) will do that. Name a path or a full command line instead, or raise" >&2
     echo "CR_PROBE_TIMEOUT_SEC." >&2
@@ -7064,7 +7064,7 @@ cr_resolve_cmd "$CR_CMD_SPEC" || {
     echo "$CR_PROG: cannot run '$CR_CMD_SPEC' — not a runnable file, and your" >&2
     echo "shell does not know it as a command, alias or function" >&2
   else
-    echo "claude-retrier: claude not found on PATH" >&2
+    echo "agent-retrier: claude not found on PATH" >&2
   fi
   exit 127
 }
@@ -7079,7 +7079,7 @@ case "${1:-}" in
     exit 0 ;;
 esac
 
-if [ "${CR_DISABLE:-0}" = "1" ] || [ "${CLAUDE_RETRIER_ACTIVE:-0}" = "1" ]; then
+if [ "${CR_DISABLE:-0}" = "1" ] || [ "${AGENT_RETRIER_ACTIVE:-0}" = "1" ]; then
   exec "${CR_ARGV[@]}" "$@"
 fi
 
@@ -7151,7 +7151,7 @@ fi
 # \037 (unit separator) rather than a newline: it cannot occur in a path, a
 # command name, or anything a shell would accept as one.
 CR_CLAUDE_ARGV=$(printf '%s\037' "${CR_ARGV[@]}")
-export CR_CLAUDE_RESOLVED CR_CLAUDE_ARGV CLAUDE_RETRIER_ACTIVE=1
+export CR_CLAUDE_RESOLVED CR_CLAUDE_ARGV AGENT_RETRIER_ACTIVE=1
 export CR_MESSAGE CR_MARGIN_SEC CR_MAX_ATTEMPTS CR_FALLBACK_WAIT_SEC CR_MAX_WAIT_SEC
 export CR_USER_IDLE_SEC CR_BUSY_IDLE_SEC CR_VERIFY_SEC CR_SCRAPE CR_LOG CR_LOG_MAX_BYTES CR_LOG_KEEP CR_NOTIFY
 export CR_RESUME_SEC
@@ -7199,8 +7199,8 @@ if [ "$CR_PY_VIA" != "tmp" ] && [ -d /dev/fd ]; then
   exec "$CR_PYTHON_BIN" /dev/fd/3 "$@" 3< <(printf '%s' "$CR_PY")
 fi
 
-CR_PY_TMP=$(mktemp "${TMPDIR:-/tmp}/claude-retrier.XXXXXX") || {
-  echo "claude-retrier: cannot write a temporary file; running claude unwrapped" >&2
+CR_PY_TMP=$(mktemp "${TMPDIR:-/tmp}/agent-retrier.XXXXXX") || {
+  echo "agent-retrier: cannot write a temporary file; running claude unwrapped" >&2
   exec "${CR_ARGV[@]}" "$@"
 }
 printf '%s' "$CR_PY" >"$CR_PY_TMP"

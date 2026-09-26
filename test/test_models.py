@@ -148,7 +148,7 @@ class TestWhereTheAnswerComesFrom(LookupTestCase):
     def test_the_log_says_the_build_is_the_thing_that_is_out_of_date(self):
         look = self.lookup()
         look._work("claude-fable-5-1")
-        self.assertTrue(any("update claude-retrier" in line for line in self.logs))
+        self.assertTrue(any("update agent-retrier" in line for line in self.logs))
 
 
 class TestAskingOnlyOnce(LookupTestCase):

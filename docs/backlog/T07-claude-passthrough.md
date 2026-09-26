@@ -4,7 +4,7 @@ Priority: P2 · Epic: A · Depends on: — · Size: S
 
 ## Problem
 
-For codex, a list of non-session subcommands exists (claude-retrier.sh:4378),
+For codex, a list of non-session subcommands exists (agent-retrier.sh:4378),
 while for claude there is only `-p/--print`. `claude stop <id>`, `claude mcp
 list`, `claude update`, etc. are launched under the pty supervisor: they sleep
 for `CR_UPDATE_NOTICE_SEC`, write `start:/exit:` to the log, and while this is
@@ -32,11 +32,11 @@ Log: `start: /opt/homebrew/bin/claude stop 8a2e968f (agent: claude)`,
 
 ## Acceptance criteria
 
-- [ ] `claude-retrier.sh stop abc` and `claude-retrier.sh mcp list` do not
+- [ ] `agent-retrier.sh stop abc` and `agent-retrier.sh mcp list` do not
       create `start:` lines in the log (exec directly).
-- [ ] `claude-retrier.sh attach abc` and `claude-retrier.sh agents` are still
+- [ ] `agent-retrier.sh attach abc` and `agent-retrier.sh agents` are still
       wrapped.
-- [ ] `claude-retrier.sh "fix the stop command"` (prompt) is wrapped.
+- [ ] `agent-retrier.sh "fix the stop command"` (prompt) is wrapped.
 - [ ] `./test/run.sh` passes.
 
 ## Where in the code

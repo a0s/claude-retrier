@@ -24,7 +24,7 @@ codex-retrier resume --last                      # any codex arguments work
 CR_CODEX_CMD='codex --model gpt-5.6-sol' codex-retrier
 ```
 
-It is `claude-retrier` under another name: a symlink the install puts next to
+It is `agent-retrier` under another name: a symlink the install puts next to
 it, which runs the same file with codex as the default. Its command is
 `CR_CODEX_CMD`, or plain `codex` — never `CR_CLAUDE_CMD`, so a claude command in
 your rc file stays claude's. `--cmd` and `--agent` still work and still win.
@@ -38,12 +38,12 @@ needs nothing reinstalled. See [Install](../README.md#install).
 The long way round is the same thing:
 
 ```sh
-claude-retrier --cmd codex
-claude-retrier --agent codex --cmd 'codex --model gpt-5.6-sol'
+agent-retrier --cmd codex
+agent-retrier --agent codex --cmd 'codex --model gpt-5.6-sol'
 ```
 
 `--agent` (or `CR_AGENT`) says which one you are running; the default, `auto`,
-works it out from the command, so `claude-retrier --cmd codex` needs nothing
+works it out from the command, so `agent-retrier --cmd codex` needs nothing
 else. `--cr-agent` is the same flag under the prefix the other wrapper options
 carry. `claude` and `codex` are the only two values.
 
@@ -141,7 +141,7 @@ The [context restart](context-restart.md) works on codex the same way it does
 on claude, with a threshold of its own:
 
 ```sh
-CR_CONTEXT_RESTART=1 claude-retrier --cmd codex
+CR_CONTEXT_RESTART=1 agent-retrier --cmd codex
 ```
 
 Codex restarts against a hard cap under `CR_CODEX_RESERVE_TOKENS` — a number
@@ -258,7 +258,7 @@ above is the only restart that actually happens. `CR_CODEX_INTERRUPT_AFTER_SEC`
 for that line, once it has sat past the ordinary threshold this many seconds:
 
 ```sh
-CR_CODEX_INTERRUPT_AFTER_SEC=1800 claude-retrier --cmd codex
+CR_CODEX_INTERRUPT_AFTER_SEC=1800 agent-retrier --cmd codex
 ```
 
 ### If codex still gets there first
@@ -278,7 +278,7 @@ lower `CR_CODEX_CONTEXT_TOKENS` gives the next one more room either way.
 across many. The wrapper already knows what a fold costs — tokens when the
 handoff is accepted minus tokens when it was asked for — so after every codex
 fold it logs that number and appends `{agent, cwd, cost, date}` to
-`CR_CODEX_FOLDS_FILE` (default `~/.claude-retrier/folds.json`):
+`CR_CODEX_FOLDS_FILE` (default `~/.agent-retrier/folds.json`):
 
 ```
 the fold cost 31k tokens (reserve 64k)

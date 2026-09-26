@@ -72,6 +72,6 @@ non-negotiable — codex silently drops an unrecognized `/NAME` (inline
 
 ## Where in the code
 
-`SKILL_PLACEHOLDER`/`expand_skill` (claude-retrier.sh 2439–2452),
+`SKILL_PLACEHOLDER`/`expand_skill` (agent-retrier.sh 2439–2452),
 `agent_cfg` (2455–2477, the `{skill:…}` loop at 2468–2470),
 `--cr-help` header text (49–57), `test_codex.py`'s `TestSkillPlaceholder`.

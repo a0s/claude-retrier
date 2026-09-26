@@ -114,7 +114,7 @@ the original hypothesis, and one incident along the way:
   (see the top-level instruction: "decide based on what the capture shows, not by
   guessing in advance").
 
-Implementation: `find_panel_agent_rows(screen)` (claude-retrier.sh) — a separate
+Implementation: `find_panel_agent_rows(screen)` (agent-retrier.sh) — a separate
 function, not a second pattern inside `find_agent_rows`, because the capture
 groups (label / state) do not have the same semantics as the old pattern
 (glyph / label). The `CR_AGENTS_PANEL_ROW_PATTERNS` → `CR_PAT_AGENTS_PANEL_ROW`
@@ -145,7 +145,7 @@ concatenation without deduplication is safe.
 
 ## Where in the code
 
-`find_agent_rows`, `find_panel_agent_rows` (claude-retrier.sh, adjacent);
+`find_agent_rows`, `find_panel_agent_rows` (agent-retrier.sh, adjacent);
 `CR_AGENT_ROW_PATTERNS`, `CR_AGENTS_PANEL_ROW_PATTERNS` (bash arrays alongside
 `CR_ROSTER_PATTERNS`); `AgentOverlay.paint`/`_paint_row` (unchanged — accepts
 the combined list of rows from both row-finding functions);

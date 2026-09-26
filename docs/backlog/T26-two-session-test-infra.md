@@ -62,7 +62,7 @@ new rollout, `$skill …`/`@file …`/Cyrillic delivered verbatim into the
 rollout, and an unrecognized `/name` rejected inline and never sent.
 
 Two choices worth recording. First, codex runs **under the wrapper**
-(`claude-retrier.sh --agent codex`, `CR_CLAUDE_BIN` pointed at the real
+(`agent-retrier.sh --agent codex`, `CR_CLAUDE_BIN` pointed at the real
 binary), not bare as in the T15 capture: what needs re-verifying each release
 is that the supervisor's pty relay leaves those recipes intact, and the run
 also asserts its own `[cr <pid> …] start: … (agent: codex)` line (T01).

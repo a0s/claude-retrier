@@ -20,7 +20,7 @@ with HANDOFF-081d06b8`.
    `os.urandom(4).hex()` at wrapper startup, the same one as in the log tag after T01,
    if it is decided to include it there). Example: `scratchpad/RESUME-{id}.md`.
 2. Without `{id}` in the path: the wrapper registers itself in
-   `~/.claude-retrier/sessions/<pid>.json` (`cwd`, `handoff_path`, `agent`,
+   `~/.agent-retrier/sessions/<pid>.json` (`cwd`, `handoff_path`, `agent`,
    `started`). At startup it reads other entries; if a live process (live pid)
    with the same `handoff_path` already exists, its own path is automatically changed to
    `<stem>-<id><ext>` (`scratchpad/RESUME-3f9a1c2b.md`), and the log records

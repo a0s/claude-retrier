@@ -30,7 +30,7 @@ with `Esc`) — unlike the fleeting inline tree in
 Live investigation established that the footer hint `← for agents` (in both
 the normal and `manual` permission modes) opens a COMPLETELY DIFFERENT screen
 — an inter-session roster (a list of other, unrelated sessions on the
-machine) — the very one that `CR_ROSTER_PATTERNS` in `claude-retrier.sh`
+machine) — the very one that `CR_ROSTER_PATTERNS` in `agent-retrier.sh`
 deliberately never scrapes. The first capture attempt did briefly show other
 people's content (emails, insurance, etc.); those bytes were never saved to
 disk or committed. `/tasks` is the confirmed safe way to reach the panel for

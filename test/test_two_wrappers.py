@@ -1,4 +1,4 @@
-"""The T26 test infrastructure itself: two claude-retrier.sh wrappers alive
+"""The T26 test infrastructure itself: two agent-retrier.sh wrappers alive
 over one project dir at once — the shape every "wrong session's numbers" bug
 (T02, T04, T05) needs to reproduce, and that no single-`Session` pty test
 (test_pty.py) can show.

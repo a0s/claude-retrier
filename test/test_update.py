@@ -18,7 +18,7 @@ from helper import load
 cr = load()
 
 FEED = json.dumps({"tag_name": "v1.11.0",
-                   "html_url": "https://github.com/a0s/claude-retrier/releases/tag/v1.11.0"})
+                   "html_url": "https://github.com/a0s/agent-retrier/releases/tag/v1.11.0"})
 
 
 class TestVersions(unittest.TestCase):
@@ -45,8 +45,8 @@ class UpdateTestCase(unittest.TestCase):
         self.logs = []
         self.now = 5000.0
         self.cfg = dict(
-            update_check=True, update_repo="a0s/claude-retrier", update_url="",
-            update_formula="a0s/claude-retrier/claude-retrier",
+            update_check=True, update_repo="a0s/agent-retrier", update_url="",
+            update_formula="a0s/agent-retrier/agent-retrier",
             update_cache=os.path.join(self.dir, "update.json"),
             update_ttl=86400.0, update_timeout=1.0, update_notice=0.0,
         )
@@ -99,28 +99,28 @@ class TestWhatIsSaid(UpdateTestCase):
 
 class TestHowToUpgrade(UpdateTestCase):
     def test_a_cellar_copy_is_a_brew_upgrade(self):
-        path = os.path.join(self.dir, "Cellar", "claude-retrier", "1.9.0", "bin", "cr")
+        path = os.path.join(self.dir, "Cellar", "agent-retrier", "1.9.0", "bin", "cr")
         os.makedirs(os.path.dirname(path))
         open(path, "w").close()
         self.assertEqual(self.checker().upgrade_command(path),
-                         "brew upgrade a0s/claude-retrier/claude-retrier")
+                         "brew upgrade a0s/agent-retrier/agent-retrier")
 
     def test_a_clone_is_a_git_pull_of_that_clone(self):
         os.makedirs(os.path.join(self.dir, ".git"))
-        path = os.path.join(self.dir, "claude-retrier.sh")
+        path = os.path.join(self.dir, "agent-retrier.sh")
         open(path, "w").close()
         self.assertEqual(self.checker().upgrade_command(path),
                          "git -C %s pull" % self.dir)
 
     def test_anything_else_gets_the_releases_page(self):
-        path = os.path.join(self.dir, "claude-retrier.sh")
+        path = os.path.join(self.dir, "agent-retrier.sh")
         open(path, "w").close()
         self.assertEqual(self.checker().upgrade_command(path),
-                         "https://github.com/a0s/claude-retrier/releases/latest")
+                         "https://github.com/a0s/agent-retrier/releases/latest")
 
     def test_the_running_copy_is_found_without_being_handed_over(self):
         os.makedirs(os.path.join(self.dir, ".git"))
-        os.environ["CR_SELF"] = os.path.join(self.dir, "claude-retrier.sh")
+        os.environ["CR_SELF"] = os.path.join(self.dir, "agent-retrier.sh")
         self.addCleanup(os.environ.pop, "CR_SELF", None)
         self.assertEqual(self.checker().upgrade_command(),
                          "git -C %s pull" % self.dir)
@@ -132,7 +132,7 @@ class TestTheCheckItself(UpdateTestCase):
         self.assertEqual(json.load(open(self.cfg["update_cache"]))["version"], "v1.11.0")
         self.assertEqual(
             self.calls,
-            ["https://api.github.com/repos/a0s/claude-retrier/releases/latest"])
+            ["https://api.github.com/repos/a0s/agent-retrier/releases/latest"])
 
     def test_it_is_asked_once_a_day_not_once_a_session(self):
         self.cached("v1.11.0")
