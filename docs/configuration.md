@@ -58,7 +58,7 @@ resolves, so you never have to guess one.
 
 ## Minimal configs
 
-**Nothing at all** is a working config: `agent-retrier` and `codex-retrier`
+**Nothing at all** is a working config: `agent-retrier-claude` and `agent-retrier-codex`
 wait out usage limits and nudge refused turns out of the box. The context
 restart is the one feature that is off until you ask for it, because it clears
 a session's history.
@@ -105,7 +105,7 @@ More in [custom-command.md](custom-command.md) and [codex.md](codex.md).
 | variable | default | applies to | |
 |---|---|---|---|
 | `CR_CLAUDE_CMD` | | claude | your claude command (same as `--cmd`) |
-| `CR_CODEX_CMD` | `codex` | codex | the command `codex-retrier` runs; never borrowed from `CR_CLAUDE_CMD` |
+| `CR_CODEX_CMD` | `codex` | codex | the command `agent-retrier --codex` runs; never borrowed from `CR_CLAUDE_CMD` |
 | `CR_AGENT` | `auto` | both | `auto` \| `claude` \| `codex` — which one you are running (same as `--agent`) |
 | `CR_SHELL` | `$SHELL` | both | shell that knows your aliases |
 | `CR_CLAUDE_BIN` | | claude | skip resolution and run exactly this executable |

@@ -169,6 +169,39 @@ class TestSyncFrameAndPrivateModes(unittest.TestCase):
         s.feed("\x1b[?25l\x1b[?25h")
         self.assertEqual(s.text(), before)
 
+    def test_keyboard_setup_is_not_read_as_cursor_or_colour_moves(self):
+        # Claude Code's startup: modifyOtherKeys (`>4;2m`), kitty keyboard
+        # push/pop/query (`>5u`, `<u`, `?u`), XTVERSION (`>0q`), a cursor
+        # style with an intermediate (` q`). None of them is an SGR or a
+        # cursor restore.
+        s = Screen(3, 10)
+        s.feed("\x1b[1;1Hab\x1b7\x1b[2;5H")
+        s.feed("\x1b[>4;2m\x1b[>5u\x1b[<u\x1b[?u\x1b[>0q\x1b[2 q")
+        self.assertEqual(s.cursor(), (2, 5))
+        s.feed("x")
+        self.assertEqual(s.line(2), "    x")
+
+    def test_an_escape_cut_between_two_reads_is_not_printed(self):
+        s = Screen(3, 20)
+        for part in ("ab\x1b", "[38;2;153;", "153;153mcd\x1b]0;ti", "tle\x07e"):
+            s.feed(part)
+        self.assertEqual(s.line(1), "abcde")
+
+    def test_scroll_up_and_down_move_the_text_not_the_cursor(self):
+        s = Screen(3, 5)
+        s.feed("\x1b[1;1Ha\x1b[2;1Hb\x1b[3;1Hc\x1b[2;2H")
+        s.feed("\x1b[2S")
+        self.assertEqual([s.line(1), s.line(2), s.line(3)], ["c", "", ""])
+        self.assertEqual(s.cursor(), (2, 2))
+        s.feed("\x1b[T")
+        self.assertEqual([s.line(1), s.line(2)], ["", "c"])
+
+    def test_a_charset_select_prints_nothing(self):
+        s = Screen(3, 20)
+        s.feed("a\x1b(Bb\x1b")
+        s.feed("(0c")
+        self.assertEqual(s.line(1), "abc")
+
 
 if __name__ == "__main__":
     unittest.main()

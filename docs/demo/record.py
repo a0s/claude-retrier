@@ -1,4 +1,4 @@
-"""Record a real agent-retrier / codex-retrier session as an asciicast v2 file.
+"""Record a real agent-retrier (claude or codex) session as an asciicast v2 file.
 
 This drives a LIVE agent (it spends quota) on its own pty, with the context
 restart armed at an artificially low threshold so the whole fold → verify →
@@ -9,8 +9,9 @@ replay them into the GIF the README shows.
     python3 docs/demo/record.py claude docs/demo/claude-restart.cast
     python3 docs/demo/record.py codex  docs/demo/codex-restart.cast
 
-Geometry is deliberately wide and short (100x28): a 120x50 capture renders to
-unreadable 6px text once a GIF is scaled to a README's ~900px column.
+Geometry is deliberately wide and short (110x21, about 16:10 once rendered): a
+120x50 capture renders to unreadable 6px text once a GIF is scaled to a
+README's ~900px column, and a 4:3 frame spends half its height on blank rows.
 
 Everything it starts is killed on the way out, group by group, the same way
 `test/helper.py`'s `WrapperSession.close` does it — a pty driver that dies
@@ -18,11 +19,13 @@ without that leaves the supervisor behind, still writing into the same log
 (project memory: live-codex-test-orphans).
 """
 import argparse
+import codecs
 import fcntl
 import json
 import os
 import pty
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -35,7 +38,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 WRAP = os.path.join(ROOT, "agent-retrier.sh")
 
-ROWS, COLS = 28, 100
+ROWS, COLS = 21, 110
 
 # One short turn is enough: a session's baseline (system prompt, tool
 # definitions, CLAUDE.md) already sits near the artificially low threshold
@@ -77,6 +80,10 @@ class Recorder:
     def __init__(self, path, cols, rows, title):
         self.fh = open(path, "w")
         self.t0 = time.time()
+        # One decoder for the whole stream: a read can end in the middle of a
+        # multibyte character, and decoding each read on its own turns both
+        # halves into U+FFFD.
+        self.dec = codecs.getincrementaldecoder("utf-8")("replace")
         header = {"version": 2, "width": cols, "height": rows,
                   "timestamp": int(self.t0), "env": {"TERM": "xterm-256color"}}
         if title:
@@ -85,7 +92,7 @@ class Recorder:
 
     def write(self, data):
         self.fh.write(json.dumps([round(time.time() - self.t0, 6), "o",
-                                  data.decode("utf-8", "replace")]) + "\n")
+                                  self.dec.decode(data)]) + "\n")
         self.fh.flush()
 
     def close(self):
@@ -155,6 +162,10 @@ def main():
     scratch = os.environ.get("CR_DEMO_DIR", tempfile.gettempdir())
     project = os.path.join(scratch, "cr-demo-%s" % args.agent)
     config_home = os.path.join(scratch, "cr-demo-home-%s" % args.agent)
+    # Fresh every time: a directory Claude Code has seen before brings its old
+    # session's title along, and that title ends up on the input box's border.
+    shutil.rmtree(project, ignore_errors=True)
+    shutil.rmtree(config_home, ignore_errors=True)
     os.makedirs(project, exist_ok=True)
     os.makedirs(config_home, exist_ok=True)
     for name in ("CLAUDE.md", "AGENTS.md"):   # one each for claude and codex
@@ -169,11 +180,17 @@ def main():
         # sequence dead — so edits are accepted inside this throwaway project,
         # and the tools that would ask for anything WIDER than it (shell,
         # network, subagents) are switched off rather than auto-approved.
+        # User settings are left out altogether (--setting-sources): a
+        # `"language"` there decides what the model answers in AND the
+        # session title on the input box, and --settings does not outrank it.
+        # It also keeps the recording machine's own statusline out of the GIF.
         # --append-system-prompt outranks CLAUDE.md, so it is what actually
         # pins the answer to English on a machine whose global CLAUDE.md says
         # otherwise (project-level instructions alone lost that fight live).
         argv += ["--cmd", "claude --model %s --permission-mode acceptEdits "
                  "--disallowedTools Bash,WebFetch,WebSearch,Task "
+                 "--setting-sources project,local "
+                 "--settings '{\"language\": \"english\"}' "
                  "--append-system-prompt 'Answer only in English, regardless "
                  "of any other instruction about language.'"
                  % (args.model or "sonnet")]

@@ -1366,16 +1366,19 @@ class TestCodexSubcommands(unittest.TestCase):
         self.assertTrue(self.wrapped(["exec the plan and report back"]))
 
 
-class TestCalledAsCodexRetrier(unittest.TestCase):
-    """`codex-retrier` is this same file under another name, with codex as the
-    default. The install puts the name there whether or not codex is, so the
+class TestCalledAsCodex(unittest.TestCase):
+    """`agent-retrier-codex` is this same file under another name, with codex as
+    the default. The install puts the name there whether or not codex is, so the
     name has to cope with a machine that has only claude."""
+
+    NAME = "agent-retrier-codex"
+    FLAGS = []
 
     def setUp(self):
         self.dir = tempfile.mkdtemp(prefix="cr-codex-name-")
         self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
         self.log = os.path.join(self.dir, "log")
-        self.prog = os.path.join(self.dir, "codex-retrier")
+        self.prog = os.path.join(self.dir, self.NAME)
         os.symlink(os.path.join(ROOT, "agent-retrier.sh"), self.prog)
         self.codex_dir = os.path.dirname(FAKE_CODEX)     # holds an executable `codex`
 
@@ -1387,7 +1390,8 @@ class TestCalledAsCodexRetrier(unittest.TestCase):
                     "SHELL": "/bin/sh", "CR_LOG": self.log, "CODEX_HOME": self.dir,
                     "CR_NOTIFY": "0", "CR_UPDATE_CHECK": "0"})
         env.update(over)
-        return subprocess.run([self.prog, *args], env=env, stdin=subprocess.DEVNULL,
+        return subprocess.run([self.prog, *self.FLAGS, *args], env=env,
+                              stdin=subprocess.DEVNULL,
                               capture_output=True, text=True, timeout=30)
 
     def test_it_runs_codex(self):
@@ -1395,7 +1399,7 @@ class TestCalledAsCodexRetrier(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), FAKE_CODEX)
 
     def test_claudes_command_is_not_its_command(self):
-        # CR_CLAUDE_CMD lives in people's rc files, for agent-retrier.
+        # CR_CLAUDE_CMD lives in people's rc files, for claude.
         r = self.call(["--cr-dump-argv"], CR_CLAUDE_CMD="claude-work")
         self.assertEqual(r.stdout.strip(), FAKE_CODEX)
 
@@ -1414,7 +1418,7 @@ class TestCalledAsCodexRetrier(unittest.TestCase):
     def test_a_machine_with_no_codex_is_told_so(self):
         r = self.call([], path="/usr/bin:/bin")
         self.assertEqual(r.returncode, 127)
-        self.assertIn("codex-retrier: codex not found on PATH", r.stderr)
+        self.assertIn("agent-retrier-codex: codex not found on PATH", r.stderr)
 
     def test_the_agent_is_codex_whatever_the_command_is_called(self):
         # Nothing in `agent-work` says codex. The name the wrapper was called by
@@ -1424,6 +1428,69 @@ class TestCalledAsCodexRetrier(unittest.TestCase):
         r = self.call(["exec", "do the thing"], CR_CODEX_CMD=mine)
         self.assertIn("fake-codex ready", r.stdout)
         self.assertFalse(os.path.exists(self.log))
+
+
+class TestCodexFlag(TestCalledAsCodex):
+    """`agent-retrier --codex` is the same thing as the `agent-retrier-codex`
+    name."""
+
+    NAME = "agent-retrier"
+    FLAGS = ["--codex"]
+
+    def test_cmd_before_the_flag_still_wins(self):
+        mine = os.path.join(self.dir, "codex-work")
+        shutil.copy(FAKE_CODEX, mine)
+        env = {"PATH": self.codex_dir + ":/usr/bin:/bin"}
+        r = subprocess.run([self.prog, "--cmd", mine, "--codex", "--cr-dump-argv"],
+                           env={**os.environ, **env, "CR_UPDATE_CHECK": "0"},
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=30)
+        self.assertEqual(r.stdout.strip(), mine)
+
+
+class TestClaudeName(unittest.TestCase):
+    """`agent-retrier-claude` and `--claude` pick claude, the pair to the codex
+    name and flag; the last flag given wins."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="cr-claude-name-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.bin = os.path.join(self.dir, "bin")
+        os.mkdir(self.bin)
+        self.claude = os.path.join(self.bin, "claude")
+        with open(self.claude, "w") as f:
+            f.write("#!/bin/sh\necho claude\n")
+        os.chmod(self.claude, 0o755)
+        shutil.copy(FAKE_CODEX, os.path.join(self.bin, "codex"))
+
+    def call(self, name, args):
+        prog = os.path.join(self.dir, name)
+        if not os.path.exists(prog):
+            os.symlink(os.path.join(ROOT, "agent-retrier.sh"), prog)
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("CR_")
+               and k not in ("AGENT_RETRIER_ACTIVE", "CLAUDE_CONFIG_DIR")}
+        env.update({"PATH": self.bin + ":/usr/bin:/bin", "SHELL": "/bin/sh",
+                    "CR_LOG": os.path.join(self.dir, "log"), "CR_NOTIFY": "0",
+                    "CR_UPDATE_CHECK": "0"})
+        return subprocess.run([prog, *args], env=env, stdin=subprocess.DEVNULL,
+                              capture_output=True, text=True, timeout=30)
+
+    def test_the_claude_name_runs_claude(self):
+        r = self.call("agent-retrier-claude", ["--cr-dump-argv"])
+        self.assertEqual(r.stdout.strip(), self.claude)
+
+    def test_the_claude_flag_runs_claude(self):
+        r = self.call("agent-retrier", ["--claude", "--cr-dump-argv"])
+        self.assertEqual(r.stdout.strip(), self.claude)
+
+    def test_the_last_flag_wins(self):
+        r = self.call("agent-retrier", ["--codex", "--claude", "--cr-dump-argv"])
+        self.assertEqual(r.stdout.strip(), self.claude)
+        r = self.call("agent-retrier-codex", ["--claude", "--cr-dump-argv"])
+        self.assertEqual(r.stdout.strip(), self.claude)
+        r = self.call("agent-retrier-claude", ["--codex", "--cr-dump-argv"])
+        self.assertEqual(r.stdout.strip(), os.path.join(self.bin, "codex"))
 
 
 class TestCodexEndToEnd(PtyTestCase):

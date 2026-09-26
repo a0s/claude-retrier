@@ -17,7 +17,7 @@ Recommended recording geometry: something WIDE and SHORT, e.g. 100 columns x
 renders an embedded GIF at ~900px wide; at that width a 120-column recording
 needs a font too small to read the box-drawing glyphs agent-retrier's own
 badge/overlay draw, while a tall recording either gets letterboxed or forces
-the whole GIF down to keep width sane. 100x28 at the default --font-size 20
+the whole GIF down to keep width sane. 110x21 at the default --font-size 20
 lands close to 900px wide without downscaling.
 
 CLI:
@@ -298,6 +298,29 @@ def load_font(path, size, bold):
     return ImageFont.load_default()
 
 
+_FALLBACK = {}
+_MISSING = {}
+
+
+def _ink(font, ch):
+    im = Image.new("L", (font.size * 2, font.size * 2))
+    ImageDraw.Draw(im).text((0, 0), ch, font=font, fill=255)
+    return im.tobytes()
+
+
+def glyph_font(font, ch):
+    """`font`, or a fallback that actually has `ch`. The primary font has no
+    Cyrillic, for one, and FreeType would paint its .notdef box instead."""
+    key = (id(font), ch)
+    if key not in _MISSING:
+        _MISSING[key] = _ink(font, ch) == _ink(font, "\U0010fffd")
+    if not _MISSING[key]:
+        return font
+    if font.size not in _FALLBACK:
+        _FALLBACK[font.size] = load_font("/System/Library/Fonts/Menlo.ttc", font.size, False)
+    return _FALLBACK[font.size]
+
+
 def measure_cell(font):
     # A genuinely monospace font has one advance width for every glyph -
     # "M" is as good a sample as any. Row height follows the font's own
@@ -380,22 +403,16 @@ def render_frame(grid, attrs, cursor, draw_cursor, font_regular, font_bold,
             if bgc != bg_color:
                 draw.rectangle([x0, ry0, x1, ry1], fill=bgc)
             font = font_bold if bold else font_regular
-            seg_start, buf = c, []
-            for i in range(c, c2):          # flush plain text in batches; peel out vector glyphs
+            # One glyph per cell, at the cell's own x: a batch drawn at the
+            # font's advance drifts off the grid wherever that advance is not
+            # exactly cell_w, and the next batch lands on top of it.
+            for i in range(c, c2):
                 ch = row_cells[i]
+                x = PADDING + i * cell_w
                 if ch in VECTOR_GLYPHS:
-                    if buf:
-                        draw.text((PADDING + seg_start * cell_w, ry0), "".join(buf),
-                                   font=font, fill=fgc)
-                        buf = []
-                    draw_vector_glyph(draw, ch, PADDING + i * cell_w, ry0, cell_w, cell_h, fgc)
-                    seg_start = i + 1
-                else:
-                    if not buf:
-                        seg_start = i
-                    buf.append(ch)
-            if buf and "".join(buf).strip():
-                draw.text((PADDING + seg_start * cell_w, ry0), "".join(buf), font=font, fill=fgc)
+                    draw_vector_glyph(draw, ch, x, ry0, cell_w, cell_h, fgc)
+                elif ch.strip():
+                    draw.text((x, ry0), ch, font=glyph_font(font, ch), fill=fgc)
             c = c2
 
     if draw_cursor:

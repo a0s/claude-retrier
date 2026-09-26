@@ -7,6 +7,29 @@ of this file, so a release cannot describe itself differently from here.
 The version in `agent-retrier.sh` (`CR_VERSION`) must match the newest entry
 below; the test suite checks it.
 
+## [4.0.0] - 2026-09-26
+
+### Changed
+- One name, a flag per agent. `agent-retrier --claude` and
+  `agent-retrier --codex` pick the agent (claude when neither is given), and
+  `agent-retrier-claude` / `agent-retrier-codex` are the same file with the
+  flag built into the name — the install puts both next to `agent-retrier`.
+  An explicit `--cmd` or `--agent` still wins, in any order; of `--claude` and
+  `--codex`, the last one given wins.
+
+### Removed
+- The `codex-retrier` name: use `agent-retrier-codex` or `agent-retrier --codex`.
+
+### Fixed
+- The screen model the wrapper keeps of the session (what it reads prompts,
+  menus and the badge's corner from) went wrong on output Claude Code really
+  sends: an escape sequence split across two reads was printed as text
+  (`38;2;153;153;153m`), `ESC ( B` left a stray `B`, `CSI S`/`CSI T` scrolls
+  were ignored, and Claude Code's keyboard setup (`CSI > 4;2 m`,
+  `CSI < u`) was taken for a colour change and a cursor restore.
+- The README's demo GIF is re-recorded: English throughout, 16:10, and
+  rendered glyph by glyph on the cell grid with a fallback font.
+
 ## [3.0.0] - 2026-09-26
 
 ### Changed

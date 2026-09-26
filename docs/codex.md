@@ -1,6 +1,6 @@
 # codex
 
-Wrapping codex: `codex-retrier`, which rollout the wrapper reads, which
+Wrapping codex: `agent-retrier-codex` (or `agent-retrier --codex`), which rollout the wrapper reads, which
 subcommands are wrapped, and the codex context-restart threshold.
 
 [← back to README](../README.md)
@@ -16,12 +16,13 @@ subcommands are wrapped, and the codex context-restart threshold.
 
 ## Running it
 
-Run `codex-retrier` where you would have run `codex`:
+Run `agent-retrier-codex` (or `agent-retrier --codex`) where you would have run `codex`:
 
 ```sh
-codex-retrier                                    # instead of: codex
-codex-retrier resume --last                      # any codex arguments work
-CR_CODEX_CMD='codex --model gpt-5.6-sol' codex-retrier
+agent-retrier-codex                              # instead of: codex
+agent-retrier-codex resume --last                # any codex arguments work
+agent-retrier --codex resume --last              # the same, through the flag
+CR_CODEX_CMD='codex --model gpt-5.6-sol' agent-retrier-codex
 ```
 
 It is `agent-retrier` under another name: a symlink the install puts next to
@@ -30,7 +31,7 @@ it, which runs the same file with codex as the default. Its command is
 your rc file stays claude's. `--cmd` and `--agent` still work and still win.
 
 Both names are installed whichever agents you have. On a machine without codex
-all `codex-retrier` does is say so — which also means installing codex later
+all `agent-retrier-codex` does is say so — which also means installing codex later
 needs nothing reinstalled. See [Install](../README.md#install).
 
 ## Which agent: `--agent`

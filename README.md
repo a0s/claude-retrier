@@ -10,14 +10,14 @@
 
 Keep a **Claude Code** or **codex** session going when it stops — for a usage
 limit, or for a server that refused the turn — and restart it before it runs out
-of context. `agent-retrier` wraps claude, `codex-retrier` wraps codex, and
+of context. `agent-retrier --claude` wraps claude, `agent-retrier --codex` wraps codex, and
 neither is an afterthought: both agents get the same features, each driven the
 way it actually works. One shell script, with no tmux and no daemon behind it.
 
 ```sh
 brew install a0s/agent-retrier/agent-retrier
-agent-retrier                       # instead of: claude
-codex-retrier                        # instead of: codex
+agent-retrier-claude                # instead of: claude
+agent-retrier-codex                 # instead of: codex
 ```
 
 ## Install
@@ -33,12 +33,15 @@ Or take the file. It is self contained and there is no build step:
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/a0s/agent-retrier/main/agent-retrier.sh
 chmod +x agent-retrier.sh
-ln -s agent-retrier.sh codex-retrier            # optional: the codex name
+ln -s agent-retrier.sh agent-retrier-claude     # optional: short names,
+ln -s agent-retrier.sh agent-retrier-codex      # one per agent
 ```
 
-Both names are installed whichever agents you have. `codex-retrier` is the same
-file with codex as its default, and on a machine without codex all it does is
-say so — which also means installing codex later needs nothing reinstalled.
+One file, three names. `agent-retrier` takes `--claude` or `--codex` (claude
+when neither is given); `agent-retrier-claude` and `agent-retrier-codex` are the
+same file with the flag built into the name. Both names are installed whichever
+agents you have: on a machine without codex, `agent-retrier-codex` just says so,
+which also means installing codex later needs nothing reinstalled.
 
 Every version is also attached to a
 [release](https://github.com/a0s/agent-retrier/releases), with the notes for it
@@ -60,7 +63,8 @@ brew untap a0s/claude-retrier
 brew install a0s/agent-retrier/agent-retrier
 ```
 
-Then replace `claude-retrier` with `agent-retrier` in your aliases, and, to keep
+Then, in your aliases, replace `claude-retrier` with `agent-retrier-claude` and
+`codex-retrier` with `agent-retrier-codex`, and, to keep
 the old log and fold history, move the state directory:
 
 ```sh
@@ -75,8 +79,8 @@ Run it wherever you would have run `claude` or `codex`:
 agent-retrier                                   # instead of: claude
 agent-retrier --resume 5e7a1c02-1a4b-4d99-b2f7  # any claude flag works
 agent-retrier --cmd 'claude --model opus'       # or your own claude command
-codex-retrier                                    # instead of: codex
-codex-retrier resume --last                      # any codex arguments too
+agent-retrier-codex                              # instead of: codex
+agent-retrier-codex resume --last                # any codex arguments too
 ```
 
 That is the whole setup for the usage-limit half. Start a session and forget
@@ -149,7 +153,7 @@ pretending they are the same:
 
 | | Claude Code | codex |
 |---|---|---|
-| wrapper name | `agent-retrier` | `codex-retrier` (same file) |
+| wrapper name | `agent-retrier-claude` / `agent-retrier --claude` | `agent-retrier-codex` / `agent-retrier --codex` |
 | command setting | `CR_CLAUDE_CMD` / `--cmd` | `CR_CODEX_CMD` / `--cmd` |
 | which session is mine | `~/.claude/sessions/<pid>.json`, read outright | the fold phrase's nonce, echoed into the rollout |
 | context window | the model profile table, corrected by claude's own statusline | stated in every rollout row |
@@ -166,7 +170,7 @@ pretending they are the same:
 |---|---|
 | [Configuration](docs/configuration.md) | every setting, grouped by feature — which are shared, which are per-agent, which are per-model, and the minimal configs |
 | [Context restart](docs/context-restart.md) | turning it on, what you see, the design, custom phrases, choosing a threshold, when nothing happens |
-| [codex](docs/codex.md) | `codex-retrier`, rollouts, subcommands, codex context thresholds, staying ahead of its compaction |
+| [codex](docs/codex.md) | `agent-retrier-codex`, rollouts, subcommands, codex context thresholds, staying ahead of its compaction |
 | [Usage limits](docs/usage-limits.md) | waiting out a limit, early lifts, how a limit is detected, resuming a session |
 | [Stalls](docs/stalls.md) | refused turns and the capacity nudge |
 | [Custom command](docs/custom-command.md) | `--cmd`, `CR_CLAUDE_CMD`, aliases and functions |

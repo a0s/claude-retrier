@@ -10,7 +10,8 @@
 # Usage:  agent-retrier.sh [claude args...]
 #         agent-retrier.sh --cmd <your-claude> [claude args...]
 #         agent-retrier.sh --agent codex --cmd codex [codex args...]
-#         codex-retrier [codex args...]          # the same file, codex by default
+#         agent-retrier.sh --codex [codex args...]   # codex instead of claude
+#         agent-retrier-codex / agent-retrier-claude  # the same file; the name picks the agent
 #         agent-retrier.sh --cr-dump-python      # print the embedded Python (used by tests)
 #         agent-retrier.sh --cr-models           # print the model profile table (T18)
 #         agent-retrier.sh --cr-statusline <path> # statusline proxy (used via --settings, T20)
@@ -79,7 +80,7 @@
 
 set -u
 
-CR_VERSION="3.0.0"
+CR_VERSION="4.0.0"
 # Which copy of this file is running. The update notice prints the command
 # that updates THIS one, and `brew upgrade` at someone running a git clone
 # would be advice that does nothing.
@@ -289,7 +290,7 @@ CR_AGENTS_PANEL_ROW_PATTERNS=(
 # SECTION 2 — configuration (all overridable from the environment)
 # =============================================================================
 : "${CR_AGENT:=auto}"                  # auto | claude | codex — whose session this is
-: "${CR_CODEX_CMD:=}"                  # codex-retrier's command (default: codex)
+: "${CR_CODEX_CMD:=}"                  # --codex's command (default: codex)
 : "${CR_MESSAGE:=continue}"            # what to type when the limit lifts
 : "${CR_MARGIN_SEC:=45}"               # extra wait past the stated reset time
 : "${CR_MAX_ATTEMPTS:=3}"              # sends per incident before giving up
@@ -530,35 +531,52 @@ esac
 # `--cmd` of its own, that one is still reachable through the prefixed form.
 CR_CMD_SPEC="$CR_CLAUDE_CMD"
 
-# Called as `codex-retrier` — the symlink an install puts next to this file, or a
-# copy under that name — it is the same wrapper with codex as the default: its
-# command is CR_CODEX_CMD or plain `codex`, never the CR_CLAUDE_CMD a claude user
-# keeps in their rc file. `--cmd` and `--agent` still win.
+# Which agent to wrap: `--claude` / `--codex`, or the name this file is called
+# by — `agent-retrier-claude` / `agent-retrier-codex` are the symlinks an install
+# puts next to it. Plain `agent-retrier` means claude. In codex mode the command
+# is CR_CODEX_CMD or plain `codex`, never the CR_CLAUDE_CMD a claude user keeps
+# in their rc file. An explicit `--cmd` or `--agent` still wins, whichever order
+# the flags come in.
 CR_PROG=agent-retrier
-CR_CMD_DEFAULTED=0
+CR_MODE=
 case "${CR_SELF##*/}" in
-  codex-retrier|codex-retrier.sh)
-    CR_PROG=codex-retrier
-    CR_CMD_SPEC="${CR_CODEX_CMD:-codex}"
-    [ -n "${CR_CODEX_CMD:-}" ] || CR_CMD_DEFAULTED=1
-    [ "$CR_AGENT" != auto ] || CR_AGENT=codex ;;
+  agent-retrier-codex|agent-retrier-codex.sh) CR_MODE=codex ;;
+  agent-retrier-claude|agent-retrier-claude.sh) CR_MODE=claude ;;
 esac
 
+CR_CMD_EXPLICIT=0
+CR_AGENT_EXPLICIT=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --codex|--cr-codex) CR_MODE=codex; shift ;;
+    --claude|--cr-claude) CR_MODE=claude; shift ;;
     --cmd|--cr-cmd)
-      [ "$#" -ge 2 ] || { echo "$CR_PROG: $1 needs a command" >&2; exit 2; }
-      CR_CMD_SPEC="$2"; CR_CMD_DEFAULTED=0; shift 2 ;;
-    --cmd=*) CR_CMD_SPEC="${1#--cmd=}"; CR_CMD_DEFAULTED=0; shift ;;
-    --cr-cmd=*) CR_CMD_SPEC="${1#--cr-cmd=}"; CR_CMD_DEFAULTED=0; shift ;;
+      [ "$#" -ge 2 ] || { echo "agent-retrier: $1 needs a command" >&2; exit 2; }
+      CR_CMD_SPEC="$2"; CR_CMD_EXPLICIT=1; shift 2 ;;
+    --cmd=*) CR_CMD_SPEC="${1#--cmd=}"; CR_CMD_EXPLICIT=1; shift ;;
+    --cr-cmd=*) CR_CMD_SPEC="${1#--cr-cmd=}"; CR_CMD_EXPLICIT=1; shift ;;
     --agent|--cr-agent)
       [ "$#" -ge 2 ] || { echo "agent-retrier: $1 needs claude or codex" >&2; exit 2; }
-      CR_AGENT="$2"; shift 2 ;;
-    --agent=*) CR_AGENT="${1#--agent=}"; shift ;;
-    --cr-agent=*) CR_AGENT="${1#--cr-agent=}"; shift ;;
+      CR_AGENT="$2"; CR_AGENT_EXPLICIT=1; shift 2 ;;
+    --agent=*) CR_AGENT="${1#--agent=}"; CR_AGENT_EXPLICIT=1; shift ;;
+    --cr-agent=*) CR_AGENT="${1#--cr-agent=}"; CR_AGENT_EXPLICIT=1; shift ;;
     *) break ;;
   esac
 done
+
+CR_CMD_DEFAULTED=0
+case "$CR_MODE" in
+  codex)
+    CR_PROG=agent-retrier-codex
+    if [ "$CR_CMD_EXPLICIT" = 0 ]; then
+      CR_CMD_SPEC="${CR_CODEX_CMD:-codex}"
+      [ -n "${CR_CODEX_CMD:-}" ] || CR_CMD_DEFAULTED=1
+    fi
+    [ "$CR_AGENT_EXPLICIT" = 1 ] || [ "$CR_AGENT" != auto ] || CR_AGENT=codex ;;
+  claude)
+    CR_PROG=agent-retrier-claude
+    [ "$CR_AGENT_EXPLICIT" = 1 ] || [ "$CR_AGENT" != auto ] || CR_AGENT=claude ;;
+esac
 
 case "$CR_AGENT" in
   auto|claude|codex) ;;
@@ -5691,6 +5709,22 @@ def get_winsize(fd):
 # --------------------------------------------------------------------------- #
 _SCREEN_CSI = re.compile(r"\x1b\[([\x30-\x3f]*)([\x20-\x2f]*)([\x40-\x7e])")
 _SCREEN_OSC = re.compile(r"\x1b\][\s\S]*?(?:\x07|\x1b\\)")
+_SCREEN_CSI_PREFIX = re.compile(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*\Z")
+
+
+def _screen_escape_unfinished(rest):
+    """True when `rest` (starting at ESC) is the beginning of an escape
+    sequence whose end has not arrived yet. An OSC that never ends is let go
+    after 4 KB, so a stray `ESC ]` cannot swallow the screen for good."""
+    if rest == "\x1b":
+        return True
+    if rest.startswith("\x1b["):
+        return bool(_SCREEN_CSI_PREFIX.match(rest))
+    if rest[1:] in ("(", ")", "*", "+"):
+        return True
+    if rest.startswith("\x1b]"):
+        return len(rest) < 4096 and not _SCREEN_OSC.match(rest)
+    return False
 
 
 class Screen:
@@ -5719,6 +5753,7 @@ class Screen:
         self.wrap_pending = False
         self.saved = (0, 0, "")
         self.scrolled = 0            # how many times the screen scrolled up
+        self.pending = ""            # an escape sequence cut off by the last read
         self.top, self.bottom = 0, rows - 1   # scroll region, 0-based inclusive
 
     # -- reading it back ---------------------------------------------------- #
@@ -5738,10 +5773,18 @@ class Screen:
 
     # -- writing to it ------------------------------------------------------ #
     def feed(self, data):
+        # A pty read ends wherever it ends, often in the middle of an escape
+        # sequence; its tail is kept for the next feed instead of being
+        # printed as text (`38;2;153;153;153m` on screen).
+        if self.pending:
+            data, self.pending = self.pending + data, ""
         i, n = 0, len(data)
         while i < n:
             ch = data[i]
             if ch == "\x1b":
+                if _screen_escape_unfinished(data[i:]):
+                    self.pending = data[i:]
+                    break
                 i += self._escape(data, i)
                 continue
             i += 1
@@ -5804,7 +5847,8 @@ class Screen:
             return m.end()
         m = _SCREEN_CSI.match(rest)
         if m:
-            self._csi(m.group(1), m.group(3))
+            if not m.group(2):              # an intermediate (DECSCUSR's " q"
+                self._csi(m.group(1), m.group(3))   # and kin) never moves anything
             return m.end()
         if len(rest) >= 2:
             nxt = rest[1]
@@ -5820,6 +5864,8 @@ class Screen:
             elif nxt == "E":                 # NEL
                 self.col = 0
                 self._newline()
+            elif nxt in "()*+" and len(rest) >= 3:
+                return 3                     # SCS: `ESC ( B` picks a charset, prints nothing
             return 2
         return 1
 
@@ -5830,10 +5876,12 @@ class Screen:
             self.row = max(0, self.row - 1)
 
     def _csi(self, params, final):
-        priv = params.startswith("?")
-        if priv:
-            # DEC private modes: ?25 (cursor visibility), ?2026 (synchronized
-            # update) and the rest move no cursor and print no text here.
+        if params[:1] in ("?", "<", ">", "="):
+            # Private parameter prefixes: DEC modes (?25 cursor visibility,
+            # ?2026 synchronized update), and Claude Code's keyboard setup at
+            # startup -- `>4;2m` (modifyOtherKeys, not an SGR), `<u` / `>5u`
+            # (kitty keyboard flags, not a cursor restore), `>0q`. None of
+            # them moves the cursor or prints anything.
             return
         nums = [int(p) if p.isdigit() else 0 for p in params.split(";")] if params else []
 
@@ -5862,6 +5910,10 @@ class Screen:
             self._scroll_down(self.row, self.bottom, arg(0))
         elif final == "M":                       # DL: delete lines at the cursor
             self._scroll_up(self.row, self.bottom, arg(0))
+        elif final == "S":                       # SU: scroll the region up
+            self._scroll_up(self.top, self.bottom, arg(0))
+        elif final == "T":                       # SD: scroll the region down
+            self._scroll_down(self.top, self.bottom, arg(0))
         elif final == "@":                       # ICH
             self._insert_chars(arg(0))
         elif final == "P":                       # DCH
@@ -7057,8 +7109,8 @@ cr_resolve_cmd "$CR_CMD_SPEC" || {
     echo "directories) will do that. Name a path or a full command line instead, or raise" >&2
     echo "CR_PROBE_TIMEOUT_SEC." >&2
   elif [ "$CR_CMD_DEFAULTED" = 1 ]; then
-    # The one failure a codex-retrier installed on a machine with no codex has.
-    echo "codex-retrier: codex not found on PATH — install it, or name yours with" >&2
+    # The one failure agent-retrier --codex has on a machine with no codex.
+    echo "$CR_PROG: codex not found on PATH — install it, or name yours with" >&2
     echo "--cmd (or CR_CODEX_CMD)" >&2
   elif [ -n "$CR_CMD_SPEC" ]; then
     echo "$CR_PROG: cannot run '$CR_CMD_SPEC' — not a runnable file, and your" >&2

@@ -34,8 +34,8 @@ should get that by accident. One variable. It is off until you set it, and
 nothing below happens without it:
 
 ```sh
-CR_CONTEXT_RESTART=1 agent-retrier       # restart where this model's own row says
-CR_CONTEXT_RESTART=1 codex-retrier        # ... which is a different point on codex
+CR_CONTEXT_RESTART=1 agent-retrier-claude  # restart where this model's own row says
+CR_CONTEXT_RESTART=1 agent-retrier-codex   # ... which is a different point on codex
 CR_CONTEXT_TOKENS=500k agent-retrier     # or: restart at this many tokens, exactly
 ```
 

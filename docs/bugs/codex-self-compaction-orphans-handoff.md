@@ -12,7 +12,7 @@ under “Not checked”, have not been addressed yet.
 
 ## What the user observed
 
-The `codex-retrier` session in project `openhopper.app` (worktree
+The `agent-retrier-codex` session in project `openhopper.app` (worktree
 `feat/moldshell-extractor-phase-r1`). Screenshots are in the conversation from
 2026-09-15 ~03:2x (the incident itself occurred earlier; see the log below).
 
@@ -181,7 +181,7 @@ Specifically:
 
 ## How to reproduce (hypothesis, not checked)
 
-1. Start codex-retrier with `CR_CONTEXT_PCT` around 50% on a long session.
+1. Start agent-retrier-codex with `CR_CONTEXT_PCT` around 50% on a long session.
 2. Trigger very large tool output (for example, reading a huge file or log) so
    the counter jumps from below threshold into the final ~10% before codex’s
    `CR_CODEX_HOLD_COMPACT` cap.

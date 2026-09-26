@@ -20,7 +20,7 @@ python3 docs/demo/record.py codex  docs/demo/codex-restart.cast
 
 # 2. cut the waiting out and render
 python3 docs/demo/cast2gif.py docs/demo/claude-restart.cast \
-        docs/demo/claude-restart.gif --title 'agent-retrier: context restart' --trim 0:138.7
+        docs/demo/claude-restart.gif --title 'agent-retrier: context restart' --trim 0:149.9
 ```
 
 **codex-restart.gif is not recorded yet.** `record.py codex` was written
@@ -31,7 +31,7 @@ updated here) and the directory-trust prompt's wording/default changed (also
 updated), but the recording still exits a few seconds after the fold is
 armed, before ever asking for a handoff — not yet root-caused.
 
-`record.py` drives `agent-retrier.sh` on its own 100x28 pty and writes
+`record.py` drives `agent-retrier.sh` on its own 110x21 pty and writes
 [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/) — a JSON
 header plus one `[time, "o", bytes]` line per write, so no `asciinema` binary
 is needed to make or to read one.
@@ -45,7 +45,7 @@ rest.
 
 Things worth knowing if you re-record these:
 
-- **Geometry: wide and short.** 100x28, not a terminal's default 120x50. A
+- **Geometry: wide and short.** 110x21 (about 16:10 once rendered), not a terminal's default 120x50. A
   README renders a GIF at about 900px wide; at that width 120 columns need a
   font too small to read, and the extra rows only get letterboxed.
 - **The demo project is a throwaway directory**, with a `CLAUDE.md`/`AGENTS.md`
